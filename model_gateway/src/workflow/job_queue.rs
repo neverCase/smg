@@ -494,7 +494,8 @@ impl JobQueue {
                     }
                     RoutingMode::OpenAI { worker_urls }
                     | RoutingMode::Anthropic { worker_urls }
-                    | RoutingMode::Gemini { worker_urls } => {
+                    | RoutingMode::Gemini { worker_urls }
+                    | RoutingMode::Cohere { worker_urls } => {
                         let provider_name = router_config.mode_type();
                         return submit_external_worker_jobs(
                             worker_urls,
@@ -757,6 +758,13 @@ fn build_external_worker_config(
     let mut spec = WorkerSpec::new(url);
     spec.runtime_type = RuntimeType::External;
     spec.api_key = api_key;
+    spec.provider = match &router_config.mode {
+        RoutingMode::OpenAI { .. } => Some(openai_protocol::worker::ProviderType::OpenAI),
+        RoutingMode::Anthropic { .. } => Some(openai_protocol::worker::ProviderType::Anthropic),
+        RoutingMode::Gemini { .. } => Some(openai_protocol::worker::ProviderType::Gemini),
+        RoutingMode::Cohere { .. } => Some(openai_protocol::worker::ProviderType::Cohere),
+        _ => None,
+    };
     // Health config is resolved at worker build time from router
     // defaults + per-worker overrides (spec.health). No need to
     // set spec.health here since these workers have no overrides.

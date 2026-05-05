@@ -9,6 +9,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use cohere::CohereChatRequest;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
@@ -29,6 +30,7 @@ use openai_protocol::{
 use crate::middleware::TenantRequestMeta;
 
 pub mod anthropic;
+pub mod cohere;
 pub mod common;
 pub mod conversations;
 pub mod error;
@@ -233,6 +235,21 @@ pub trait RouterTrait: Send + Sync + Debug {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Messages API not yet implemented for this router",
+        )
+            .into_response()
+    }
+
+    /// Route native Cohere Chat API requests (/v1/chat and /v2/chat).
+    async fn route_cohere_chat(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _body: &CohereChatRequest,
+        _model_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Cohere Chat API not implemented for this router",
         )
             .into_response()
     }

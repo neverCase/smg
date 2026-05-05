@@ -44,6 +44,7 @@ use crate::{
     config::RoutingMode,
     middleware::TenantRequestMeta,
     routers::{
+        cohere::CohereChatRequest,
         common::{
             header_utils::apply_provider_headers,
             skill_resolution::{resolve_messages_skill_manifest, resolve_responses_skill_manifest},
@@ -160,9 +161,11 @@ impl RouterManager {
             (ConnectionMode::Grpc, RoutingMode::Regular { .. }) => router_ids::GRPC_REGULAR,
             (ConnectionMode::Grpc, RoutingMode::PrefillDecode { .. }) => router_ids::GRPC_PD,
             (ConnectionMode::Http, RoutingMode::Gemini { .. }) => router_ids::HTTP_GEMINI,
+            (ConnectionMode::Http, RoutingMode::Cohere { .. }) => router_ids::HTTP_COHERE,
             (ConnectionMode::Grpc, RoutingMode::OpenAI { .. }) => router_ids::GRPC_REGULAR,
             (ConnectionMode::Grpc, RoutingMode::Anthropic { .. }) => router_ids::GRPC_REGULAR,
             (ConnectionMode::Grpc, RoutingMode::Gemini { .. }) => router_ids::GRPC_REGULAR,
+            (ConnectionMode::Grpc, RoutingMode::Cohere { .. }) => router_ids::GRPC_REGULAR,
         }
     }
 
@@ -199,7 +202,7 @@ impl RouterManager {
         let workers = self.worker_registry.get_by_model(model_id);
 
         // Find the best router ID based on worker capabilities
-        // Priority: external (provider-specific) > grpc-pd > http-pd > grpc-regular > http-regular
+        // Priority: provider-specific > external-default > grpc-pd > http-pd > grpc-regular > http-regular
         let best_router_id = workers
             .iter()
             .map(|w| {
@@ -207,13 +210,13 @@ impl RouterManager {
                 let is_grpc = matches!(w.connection_mode(), ConnectionMode::Grpc);
                 let is_external = matches!(w.metadata().spec.runtime_type, RuntimeType::External);
 
+                if let Some(router_id) = Self::provider_router_id(w.provider_for_model(model_id)) {
+                    return (5, router_id);
+                }
+
                 if is_external {
-                    // Route external workers to the correct provider-specific router
-                    let router_id = match w.provider_for_model(model_id) {
-                        Some(ProviderType::Gemini) => &router_ids::HTTP_GEMINI,
-                        Some(ProviderType::Anthropic) => &router_ids::HTTP_ANTHROPIC,
-                        _ => &router_ids::HTTP_OPENAI,
-                    };
+                    // Unknown external providers default to OpenAI-compatible routing.
+                    let router_id = &router_ids::HTTP_OPENAI;
                     return (4, router_id);
                 }
 
@@ -242,6 +245,17 @@ impl RouterManager {
             self.routers.get(default_id).map(|r| r.clone())
         } else {
             None
+        }
+    }
+
+    /// Map model provider capability to the matching HTTP provider router.
+    fn provider_router_id(provider: Option<&ProviderType>) -> Option<&'static RouterId> {
+        match provider {
+            Some(ProviderType::OpenAI | ProviderType::XAI) => Some(&router_ids::HTTP_OPENAI),
+            Some(ProviderType::Anthropic) => Some(&router_ids::HTTP_ANTHROPIC),
+            Some(ProviderType::Gemini) => Some(&router_ids::HTTP_GEMINI),
+            Some(ProviderType::Cohere) => Some(&router_ids::HTTP_COHERE),
+            Some(ProviderType::Custom(_)) | None => None,
         }
     }
 
@@ -613,6 +627,28 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_cohere_chat(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        body: &CohereChatRequest,
+        model_id: &str,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, Some(model_id));
+
+        if let Some(router) = router {
+            router
+                .route_cohere_chat(headers, tenant_meta, body, model_id)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model()),
             )
                 .into_response()
         }

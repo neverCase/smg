@@ -267,6 +267,9 @@ pub enum ProviderType {
     /// Google Gemini — special logprobs handling.
     #[serde(alias = "gemini", alias = "google")]
     Gemini,
+    /// Cohere native APIs — raw request/response passthrough.
+    #[serde(alias = "cohere")]
+    Cohere,
     /// Custom provider with string identifier.
     #[serde(untagged)]
     Custom(String),
@@ -280,6 +283,7 @@ impl ProviderType {
             Self::XAI => "xai",
             Self::Anthropic => "anthropic",
             Self::Gemini => "gemini",
+            Self::Cohere => "cohere",
             Self::Custom(s) => s.as_str(),
         }
     }
@@ -297,6 +301,8 @@ impl ProviderType {
             Some(Self::Anthropic)
         } else if host.ends_with("googleapis.com") {
             Some(Self::Gemini)
+        } else if host.ends_with("cohere.ai") || host.ends_with("cohere.com") {
+            Some(Self::Cohere)
         } else {
             None
         }
@@ -310,6 +316,7 @@ impl ProviderType {
             Self::XAI => Some("XAI_ADMIN_KEY"),
             Self::Anthropic => Some("ANTHROPIC_ADMIN_KEY"),
             Self::Gemini => Some("GEMINI_ADMIN_KEY"),
+            Self::Cohere => Some("COHERE_ADMIN_KEY"),
             Self::Custom(_) => None,
         }
     }
@@ -329,6 +336,11 @@ impl ProviderType {
             Some(Self::Gemini)
         } else if model_lower.starts_with("claude") {
             Some(Self::Anthropic)
+        } else if model_lower.starts_with("command")
+            || model_lower.starts_with("c4ai-command")
+            || model_lower.starts_with("cohere")
+        {
+            Some(Self::Cohere)
         } else if model_lower.starts_with("gpt")
             || model_lower.starts_with("o1")
             || model_lower.starts_with("o3")
@@ -343,6 +355,49 @@ impl ProviderType {
 impl std::fmt::Display for ProviderType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProviderType;
+
+    #[test]
+    fn provider_type_cohere_serializes_as_lowercase() {
+        let json = serde_json::to_string(&ProviderType::Cohere).expect("serialize provider");
+        assert_eq!(json, "\"cohere\"");
+
+        let parsed: ProviderType = serde_json::from_str("\"cohere\"").expect("parse provider");
+        assert_eq!(parsed, ProviderType::Cohere);
+    }
+
+    #[test]
+    fn provider_type_detects_cohere_urls_and_models() {
+        assert_eq!(
+            ProviderType::from_url("https://api.cohere.ai"),
+            Some(ProviderType::Cohere)
+        );
+        assert_eq!(
+            ProviderType::from_url("https://dashboard.cohere.com"),
+            Some(ProviderType::Cohere)
+        );
+        assert_eq!(
+            ProviderType::from_model_name("command-r-plus"),
+            Some(ProviderType::Cohere)
+        );
+        assert_eq!(
+            ProviderType::from_model_name("c4ai-command-r-v01"),
+            Some(ProviderType::Cohere)
+        );
+    }
+
+    #[test]
+    fn provider_type_cohere_uses_bearer_auth_discovery_key() {
+        assert_eq!(
+            ProviderType::Cohere.admin_key_env_var(),
+            Some("COHERE_ADMIN_KEY")
+        );
+        assert!(!ProviderType::Cohere.uses_x_api_key());
     }
 }
 

@@ -461,6 +461,8 @@ pub enum RoutingMode {
     Anthropic { worker_urls: Vec<String> },
     #[serde(rename = "gemini")]
     Gemini { worker_urls: Vec<String> },
+    #[serde(rename = "cohere")]
+    Cohere { worker_urls: Vec<String> },
 }
 
 impl RoutingMode {
@@ -479,6 +481,7 @@ impl RoutingMode {
             RoutingMode::OpenAI { worker_urls } => worker_urls.len(),
             RoutingMode::Anthropic { worker_urls } => worker_urls.len(),
             RoutingMode::Gemini { worker_urls } => worker_urls.len(),
+            RoutingMode::Cohere { worker_urls } => worker_urls.len(),
         }
     }
 
@@ -883,6 +886,7 @@ impl RouterConfig {
             RoutingMode::OpenAI { .. } => "openai",
             RoutingMode::Anthropic { .. } => "anthropic",
             RoutingMode::Gemini { .. } => "gemini",
+            RoutingMode::Cohere { .. } => "cohere",
         }
     }
 
@@ -1271,6 +1275,23 @@ stream_retention_secs: 3600
             worker_urls: vec![],
         };
         assert_eq!(empty_regular.worker_count(), 0);
+    }
+
+    #[test]
+    fn test_cohere_routing_mode_round_trips() {
+        let json = r#"{"type":"cohere","worker_urls":["http://cohere-worker:8000"]}"#;
+        let mode: RoutingMode = serde_json::from_str(json).expect("parse cohere mode");
+
+        match &mode {
+            RoutingMode::Cohere { worker_urls } => {
+                assert_eq!(worker_urls, &vec!["http://cohere-worker:8000".to_string()]);
+            }
+            other => panic!("expected Cohere mode, got {other:?}"),
+        }
+
+        assert_eq!(mode.worker_count(), 1);
+        let config = RouterConfig::new(mode, PolicyConfig::Random);
+        assert_eq!(config.mode_type(), "cohere");
     }
 
     #[test]

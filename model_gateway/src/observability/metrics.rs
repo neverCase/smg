@@ -363,6 +363,7 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
 pub mod metrics_labels {
     // Router types
     pub const ROUTER_OPENAI: &str = "openai";
+    pub const ROUTER_COHERE: &str = "cohere";
     pub const ROUTER_HTTP: &str = "http";
     pub const ROUTER_GRPC: &str = "grpc";
 
@@ -385,6 +386,8 @@ pub mod metrics_labels {
     pub const ENDPOINT_EMBEDDINGS: &str = "embeddings";
     pub const ENDPOINT_CLASSIFY: &str = "classify";
     pub const ENDPOINT_MESSAGES: &str = "messages";
+    pub const ENDPOINT_COHERE_CHAT_V1: &str = "cohere_chat_v1";
+    pub const ENDPOINT_COHERE_CHAT_V2: &str = "cohere_chat_v2";
     pub const ENDPOINT_REALTIME: &str = "realtime";
     pub const ENDPOINT_REALTIME_SESSIONS: &str = "realtime_sessions";
     pub const ENDPOINT_REALTIME_CLIENT_SECRETS: &str = "realtime_client_secrets";

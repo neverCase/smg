@@ -136,6 +136,7 @@ pub enum ApiProvider {
     Xai,
     OpenAi,
     Gemini,
+    Cohere,
     Generic,
 }
 
@@ -150,6 +151,8 @@ impl ApiProvider {
             ApiProvider::OpenAi
         } else if url.contains("googleapis.com") {
             ApiProvider::Gemini
+        } else if url.contains("cohere.ai") || url.contains("cohere.com") {
+            ApiProvider::Cohere
         } else {
             ApiProvider::Generic
         }
@@ -241,7 +244,7 @@ impl ApiProvider {
                     }
                 }
             }
-            ApiProvider::Xai | ApiProvider::OpenAi | ApiProvider::Generic => {
+            ApiProvider::Xai | ApiProvider::OpenAi | ApiProvider::Cohere | ApiProvider::Generic => {
                 if let Some(auth) = auth_header {
                     req = req.header("Authorization", auth);
                 }

@@ -115,6 +115,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
             if let Some(ref api_key) = config.api_key {
                 builder = builder.api_key(api_key.clone());
             }
+            if let Some(provider) = config.provider.clone() {
+                builder = builder.provider(provider);
+            }
 
             if !labels.is_empty() {
                 builder = builder.labels(labels.clone());
@@ -151,6 +154,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
 
             if let Some(ref api_key) = config.api_key {
                 builder = builder.api_key(api_key.clone());
+            }
+            if let Some(provider) = config.provider.clone() {
+                builder = builder.provider(provider);
             }
 
             if !labels.is_empty() {

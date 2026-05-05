@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use arc_swap::ArcSwap;
 use openai_protocol::{
     model_card::ModelCard,
-    worker::{HealthCheckConfig, WorkerModels, WorkerSpec, WorkerStatus},
+    worker::{HealthCheckConfig, ProviderType, WorkerModels, WorkerSpec, WorkerStatus},
 };
 
 use super::{
@@ -111,6 +111,12 @@ impl BasicWorkerBuilder {
     /// Set the runtime type (SGLang or vLLM)
     pub fn runtime_type(mut self, runtime_type: RuntimeType) -> Self {
         self.spec.runtime_type = runtime_type;
+        self
+    }
+
+    /// Set the provider capability for all models on this worker.
+    pub fn provider(mut self, provider: ProviderType) -> Self {
+        self.spec.provider = Some(provider);
         self
     }
 

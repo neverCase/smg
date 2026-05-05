@@ -96,6 +96,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Configure native Cohere chat routing mode.
+    pub fn cohere_mode(mut self, worker_urls: Vec<String>) -> Self {
+        self.config.mode = RoutingMode::Cohere { worker_urls };
+        self
+    }
+
     pub fn mode(mut self, mode: RoutingMode) -> Self {
         self.config.mode = mode;
         self

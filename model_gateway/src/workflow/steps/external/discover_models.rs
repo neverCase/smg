@@ -177,6 +177,14 @@ fn infer_provider_from_id(id: &str) -> Option<ProviderType> {
         return Some(ProviderType::Gemini);
     }
 
+    // Cohere Command models
+    if id_lower.starts_with("command")
+        || id_lower.starts_with("c4ai-command")
+        || id_lower.starts_with("cohere")
+    {
+        return Some(ProviderType::Cohere);
+    }
+
     None
 }
 
@@ -271,7 +279,10 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverModelsStep {
         }
 
         let config = &context.data.config;
-        let provider = ProviderType::from_url(&config.url);
+        let provider = config
+            .provider
+            .clone()
+            .or_else(|| ProviderType::from_url(&config.url));
 
         // Resolve discovery API key: env var admin key > config.api_key > None (wildcard)
         let discovery_key =

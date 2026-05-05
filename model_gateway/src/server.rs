@@ -7,6 +7,7 @@ use std::{
 };
 
 use axum::{
+    body::Bytes,
     extract::{multipart::MultipartError, Extension, Multipart, Path, Query, Request, State},
     http::{header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -58,7 +59,8 @@ use crate::{
         otel_trace,
     },
     routers::{
-        conversations,
+        cohere::{CohereChatEndpoint, CohereChatRequest},
+        conversations, error,
         mesh::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
             get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
@@ -132,6 +134,7 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
             RoutingMode::OpenAI { .. } => !healthy_workers.is_empty(),
             RoutingMode::Anthropic { .. } => !healthy_workers.is_empty(),
             RoutingMode::Gemini { .. } => !healthy_workers.is_empty(),
+            RoutingMode::Cohere { .. } => !healthy_workers.is_empty(),
         }
     };
 
@@ -204,6 +207,45 @@ async fn v1_chat_completions(
     state
         .router
         .route_chat(Some(&headers), &tenant_meta, &body, &body.model)
+        .await
+}
+
+/// Accept Cohere v1 chat requests while preserving the raw body for routing.
+async fn v1_cohere_chat(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    body: Bytes,
+) -> Response {
+    cohere_chat(state, headers, tenant_meta, CohereChatEndpoint::V1, body).await
+}
+
+/// Accept Cohere v2 chat requests while preserving the raw body for routing.
+async fn v2_cohere_chat(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    body: Bytes,
+) -> Response {
+    cohere_chat(state, headers, tenant_meta, CohereChatEndpoint::V2, body).await
+}
+
+/// Route a raw native Cohere chat request after extracting routing metadata.
+async fn cohere_chat(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    tenant_meta: middleware::TenantRequestMeta,
+    endpoint: CohereChatEndpoint,
+    body: Bytes,
+) -> Response {
+    let request = match CohereChatRequest::from_bytes(endpoint, body) {
+        Ok(request) => request,
+        Err(err) => return error::bad_request("invalid_request", err.to_string()),
+    };
+
+    state
+        .router
+        .route_cohere_chat(Some(&headers), &tenant_meta, &request, request.model())
         .await
 }
 
@@ -316,7 +358,7 @@ async fn v1_audio_transcriptions(
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     mut multipart: Multipart,
 ) -> Response {
-    let mut file_bytes: Option<bytes::Bytes> = None;
+    let mut file_bytes: Option<Bytes> = None;
     let mut file_name: Option<String> = None;
     let mut file_content_type: Option<String> = None;
     let mut req = TranscriptionRequest::default();
@@ -956,6 +998,8 @@ pub fn build_app(
             middleware::storage_context_middleware,
         ))
         .route("/generate", post(generate))
+        .route("/v1/chat", post(v1_cohere_chat))
+        .route("/v2/chat", post(v2_cohere_chat))
         .route("/v1/chat/completions", post(v1_chat_completions))
         .route("/v1/completions", post(v1_completions))
         .route("/rerank", post(rerank))

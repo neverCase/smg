@@ -244,6 +244,17 @@ mod tests {
     }
 
     #[test]
+    fn forwarding_request_accepts_cohere_chat_paths_and_raw_body() {
+        for path in ["/v1/chat", "/v2/chat"] {
+            let body = br#"{"model":"command-r","cohere_only":true}"#.to_vec();
+            let request = ForwardingRequest::new(path, body.clone()).expect("path should parse");
+
+            assert_eq!(request.existing_smg_path().as_str(), path);
+            assert_eq!(request.body(), body.as_slice());
+        }
+    }
+
+    #[test]
     fn forwarding_target_debug_hides_joined_path() {
         let peer = RegionPeer::new(
             "us-chicago-1",
