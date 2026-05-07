@@ -49,6 +49,10 @@ use wfaas::LoggingSubscriber;
 use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
+    cross_region::{
+        headers::REQUEST_MODE_HEADER, CrossRegionError, CrossRegionHeaders, SettledRequestContext,
+        UnresolvedRequestContext,
+    },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
         logging::{self, LoggingConfig},
@@ -87,6 +91,92 @@ pub struct AppState {
     pub concurrency_queue_tx: Option<mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestListener {
+    Local,
+    Forwarding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InferenceRequestDispatch {
+    Local,
+    Unresolved(UnresolvedRequestContext),
+    Settled(SettledRequestContext),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InferenceDispatchError {
+    status: StatusCode,
+    message: String,
+}
+
+impl InferenceDispatchError {
+    /// Build an inference dispatch error with the response status and message.
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    /// Return the HTTP status for this dispatch error.
+    fn status(&self) -> StatusCode {
+        self.status
+    }
+}
+
+impl From<CrossRegionError> for InferenceDispatchError {
+    /// Convert cross-region parsing errors into dispatch errors.
+    fn from(error: CrossRegionError) -> Self {
+        Self::new(error.http_status(), error.to_string())
+    }
+}
+
+impl IntoResponse for InferenceDispatchError {
+    /// Convert the dispatch error into a plain HTTP response.
+    fn into_response(self) -> Response {
+        (self.status(), self.message).into_response()
+    }
+}
+
+/// Classify an inference request before it enters local worker routing.
+fn classify_inference_request(
+    headers: &HeaderMap,
+    listener: RequestListener,
+    platform_max_retry: u32,
+) -> Result<InferenceRequestDispatch, InferenceDispatchError> {
+    if !headers.contains_key(REQUEST_MODE_HEADER) {
+        if listener == RequestListener::Forwarding {
+            return Err(InferenceDispatchError::new(
+                StatusCode::FORBIDDEN,
+                "forwarded inference requests must use SETTLED request mode",
+            ));
+        }
+        return Ok(InferenceRequestDispatch::Local);
+    }
+
+    match CrossRegionHeaders::parse(headers, platform_max_retry)? {
+        CrossRegionHeaders::Unresolved(context) => {
+            if listener == RequestListener::Forwarding {
+                return Err(InferenceDispatchError::new(
+                    StatusCode::FORBIDDEN,
+                    "forwarded inference requests must use SETTLED request mode",
+                ));
+            }
+            Ok(InferenceRequestDispatch::Unresolved(context))
+        }
+        CrossRegionHeaders::Settled(context) => {
+            if listener != RequestListener::Forwarding {
+                return Err(InferenceDispatchError::new(
+                    StatusCode::FORBIDDEN,
+                    "SETTLED cross-region requests must arrive on the trusted request-forwarding listener",
+                ));
+            }
+            Ok(InferenceRequestDispatch::Settled(context))
+        }
+    }
 }
 
 async fn parse_function_call(
@@ -201,10 +291,65 @@ async fn v1_chat_completions(
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
-    state
-        .router
-        .route_chat(Some(&headers), &tenant_meta, &body, &body.model)
+    route_chat_completion_for_listener(state, headers, tenant_meta, body, RequestListener::Local)
         .await
+}
+
+async fn v1_chat_completions_forwarded(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+) -> Response {
+    route_chat_completion_for_listener(
+        state,
+        headers,
+        tenant_meta,
+        body,
+        RequestListener::Forwarding,
+    )
+    .await
+}
+
+/// Dispatch chat-completions by cross-region request mode before local routing.
+async fn route_chat_completion_for_listener(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    tenant_meta: middleware::TenantRequestMeta,
+    body: ChatCompletionRequest,
+    listener: RequestListener,
+) -> Response {
+    let max_retry = state
+        .context
+        .router_config
+        .cross_region
+        .request_plane
+        .max_platform_retries;
+    match classify_inference_request(&headers, listener, max_retry) {
+        Ok(InferenceRequestDispatch::Local) => {
+            state
+                .router
+                .route_chat(Some(&headers), &tenant_meta, &body, &body.model)
+                .await
+        }
+        Ok(InferenceRequestDispatch::Settled(context)) => {
+            debug!(
+                route_id = %context.route.route_id,
+                target_region = %context.route.target_region,
+                "executing settled cross-region chat request locally"
+            );
+            state
+                .router
+                .route_chat(Some(&headers), &tenant_meta, &body, &body.model)
+                .await
+        }
+        Ok(InferenceRequestDispatch::Unresolved(context)) => unresolved_request_plane_response(
+            &state,
+            "/v1/chat/completions",
+            context.common.opc_request_id.as_str(),
+        ),
+        Err(error) => error.into_response(),
+    }
 }
 
 async fn v1_completions(
@@ -255,10 +400,94 @@ async fn v1_responses(
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
-    state
-        .router
-        .route_responses(Some(&headers), &tenant_meta, &body, &body.model)
-        .await
+    route_responses_for_listener(state, headers, tenant_meta, body, RequestListener::Local).await
+}
+
+async fn v1_responses_forwarded(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    ValidatedJson(body): ValidatedJson<ResponsesRequest>,
+) -> Response {
+    route_responses_for_listener(
+        state,
+        headers,
+        tenant_meta,
+        body,
+        RequestListener::Forwarding,
+    )
+    .await
+}
+
+/// Dispatch responses requests by cross-region request mode before local routing.
+async fn route_responses_for_listener(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    tenant_meta: middleware::TenantRequestMeta,
+    body: ResponsesRequest,
+    listener: RequestListener,
+) -> Response {
+    let max_retry = state
+        .context
+        .router_config
+        .cross_region
+        .request_plane
+        .max_platform_retries;
+    match classify_inference_request(&headers, listener, max_retry) {
+        Ok(InferenceRequestDispatch::Local) => {
+            state
+                .router
+                .route_responses(Some(&headers), &tenant_meta, &body, &body.model)
+                .await
+        }
+        Ok(InferenceRequestDispatch::Settled(context)) => {
+            debug!(
+                route_id = %context.route.route_id,
+                target_region = %context.route.target_region,
+                "executing settled cross-region responses request locally"
+            );
+            state
+                .router
+                .route_responses(Some(&headers), &tenant_meta, &body, &body.model)
+                .await
+        }
+        Ok(InferenceRequestDispatch::Unresolved(context)) => unresolved_request_plane_response(
+            &state,
+            "/v1/responses",
+            context.common.opc_request_id.as_str(),
+        ),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// Return the explicit request-plane stub response for unresolved requests.
+fn unresolved_request_plane_response(
+    state: &AppState,
+    path: &'static str,
+    opc_request_id: &str,
+) -> Response {
+    if !state.context.router_config.cross_region.enabled
+        || !state
+            .context
+            .router_config
+            .cross_region
+            .request_plane
+            .enabled
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cross-region request plane is disabled",
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        format!(
+            "cross-region request plane dispatch for {path} is not implemented yet; opc_request_id={opc_request_id}"
+        ),
+    )
+        .into_response()
 }
 
 async fn v1_interactions(
@@ -1164,6 +1393,67 @@ pub fn build_app(
         .with_state(app_state))
 }
 
+/// Build the request-forwarding listener app with only forwarded inference paths.
+pub fn build_request_forwarding_app(
+    app_state: Arc<AppState>,
+    auth_config: AuthConfig,
+    max_payload_size: usize,
+    request_id_headers: Vec<String>,
+    cors_allowed_origins: Vec<String>,
+) -> Result<Router, InvalidHeaderName> {
+    let tenant_resolution_state =
+        middleware::TenantResolutionState::new(&app_state.context.router_config)?
+            .with_tenant_alias_store(
+                app_state
+                    .context
+                    .skill_service
+                    .as_ref()
+                    .and_then(|skill_service| skill_service.tenant_alias_store()),
+            );
+
+    let responses_routes = Router::new()
+        .route("/v1/responses", post(v1_responses_forwarded))
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::storage_context_middleware,
+        ));
+
+    let forwarding_routes = Router::new()
+        .merge(responses_routes)
+        .route("/v1/chat/completions", post(v1_chat_completions_forwarded))
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::concurrency_limit_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            tenant_resolution_state,
+            middleware::route_request_meta_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config,
+            middleware::auth_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::wasm_middleware,
+        ));
+
+    Ok(Router::new()
+        .merge(forwarding_routes)
+        .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            max_payload_size,
+        ))
+        .layer(middleware::create_logging_layer())
+        .layer(middleware::HttpMetricsLayer::new(
+            app_state.context.inflight_tracker.clone(),
+        ))
+        .layer(middleware::RequestIdLayer::new(request_id_headers))
+        .layer(create_cors_layer(cors_allowed_origins))
+        .fallback(sink_handler)
+        .with_state(app_state))
+}
+
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -1552,6 +1842,20 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let control_plane_auth_state =
         smg_auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
 
+    let forwarding_app = if config.router_config.cross_region.enabled
+        && config.router_config.cross_region.request_plane.enabled
+    {
+        Some(build_request_forwarding_app(
+            app_state.clone(),
+            auth_config.clone(),
+            config.max_payload_size,
+            request_id_headers.clone(),
+            config.router_config.cors_allowed_origins.clone(),
+        )?)
+    } else {
+        None
+    };
+
     let app = build_app(
         app_state,
         auth_config,
@@ -1572,6 +1876,42 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let handle = axum_server::Handle::new();
     let handle_clone = handle.clone();
+    let forwarding_handle = if let Some(forwarding_app) = forwarding_app {
+        let forwarding_bind_addr = format!(
+            "{}:{}",
+            config.host, config.router_config.cross_region.request_plane.listen_port
+        );
+        let forwarding_addr: std::net::SocketAddr = forwarding_bind_addr
+            .parse()
+            .map_err(|e| format!("Invalid request-forwarding address: {e}"))?;
+        let listener = std::net::TcpListener::bind(forwarding_addr)
+            .map_err(|e| format!("Failed to bind request-forwarding listener: {e}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("Failed to set request-forwarding listener nonblocking: {e}"))?;
+        let forwarding_handle = axum_server::Handle::new();
+        let server_handle = forwarding_handle.clone();
+        let forwarding_server = axum_server::from_tcp(listener)
+            .map_err(|e| format!("Failed to create request-forwarding listener: {e}"))?
+            .handle(server_handle)
+            .serve(forwarding_app.into_make_service_with_connect_info::<std::net::SocketAddr>());
+        info!(
+            "Starting cross-region request-forwarding listener on {}",
+            forwarding_bind_addr
+        );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "request-forwarding listener runs for the lifetime of the server"
+        )]
+        spawn(async move {
+            if let Err(error) = forwarding_server.await {
+                error!("Cross-region request-forwarding listener failed: {}", error);
+            }
+        });
+        Some(forwarding_handle)
+    } else {
+        None
+    };
     let inflight_tracker = app_context.inflight_tracker.clone();
     let drain_timeout = Duration::from_secs(config.shutdown_grace_period_secs);
     #[expect(
@@ -1588,6 +1928,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         );
         inflight_tracker.begin_drain();
         handle_clone.graceful_shutdown(Some(drain_timeout));
+        if let Some(handle) = forwarding_handle {
+            handle.graceful_shutdown(Some(drain_timeout));
+        }
 
         // Phase 2: Drain — wait for in-flight requests to complete
         // Re-check after gating to catch requests that arrived between the
@@ -1707,4 +2050,464 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     };
 
     cors.max_age(Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, OnceLock,
+        },
+    };
+
+    use async_trait::async_trait;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request as HttpRequest,
+    };
+    use http::HeaderValue;
+    use llm_tokenizer::registry::TokenizerRegistry;
+    use openai_protocol::{
+        chat::ChatCompletionRequest, responses::ResponsesRequest, validated::ValidatedJson,
+    };
+    use smg_data_connector::{
+        current_request_context, MemoryConversationItemStorage, MemoryConversationStorage,
+        MemoryResponseStorage, NoOpConversationMemoryWriter,
+    };
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::{
+        cross_region::headers::{
+            ALLOWED_MODELS_HEADER, ALLOWED_REGIONS_HEADER, ATTEMPT_HEADER, CONTRACT_VERSION_HEADER,
+            ENTRY_REGION_HEADER, FAILOVER_MODE_HEADER, MAX_RETRY_HEADER, OPC_REQUEST_ID_HEADER,
+            REQUEST_MODE_HEADER, REQUEST_MODE_SETTLED, REQUEST_MODE_UNRESOLVED, ROUTE_ID_HEADER,
+            SOURCE_SERVICE_HEADER, TARGET_REGION_HEADER,
+        },
+        policies::PolicyRegistry,
+        tenant::{canonical_tenant_key, TenantIdentity},
+        worker::WorkerRegistry,
+    };
+
+    #[derive(Debug, Default)]
+    struct DispatchSpyRouter {
+        chat_calls: AtomicUsize,
+        responses_calls: AtomicUsize,
+        response_storage_context_hits: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RouterTrait for DispatchSpyRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn route_chat(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &middleware::TenantRequestMeta,
+            _body: &ChatCompletionRequest,
+            _model_id: &str,
+        ) -> Response {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            (StatusCode::OK, "local chat").into_response()
+        }
+
+        async fn route_responses(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &middleware::TenantRequestMeta,
+            _body: &ResponsesRequest,
+            _model_id: &str,
+        ) -> Response {
+            self.responses_calls.fetch_add(1, Ordering::SeqCst);
+            if current_request_context()
+                .and_then(|context| {
+                    context
+                        .get("tenant_id")
+                        .map(|tenant_id| tenant_id == "tenant-abc")
+                })
+                .unwrap_or(false)
+            {
+                self.response_storage_context_hits
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            (StatusCode::OK, "local responses").into_response()
+        }
+
+        fn router_type(&self) -> &'static str {
+            "dispatch-spy"
+        }
+    }
+
+    /// Build a minimal app state for request-mode dispatch tests.
+    fn test_state(router: Arc<DispatchSpyRouter>) -> Arc<AppState> {
+        test_state_with_router_config(router, |_| {})
+    }
+
+    /// Build a minimal app state after applying test-specific router config.
+    fn test_state_with_router_config(
+        router: Arc<DispatchSpyRouter>,
+        configure: impl FnOnce(&mut RouterConfig),
+    ) -> Arc<AppState> {
+        let mut router_config = RouterConfig::default();
+        router_config.cross_region.enabled = true;
+        router_config.cross_region.region_id = Some("us-ashburn-1".to_string());
+        router_config.cross_region.request_plane.enabled = true;
+        configure(&mut router_config);
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
+
+        let context = Arc::new(
+            AppContext::builder()
+                .router_config(router_config)
+                .client(reqwest::Client::new())
+                .rate_limiter(None)
+                .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
+                .reasoning_parser_factory(None)
+                .tool_parser_factory(None)
+                .worker_registry(worker_registry)
+                .policy_registry(policy_registry)
+                .response_storage(Arc::new(MemoryResponseStorage::new()))
+                .conversation_storage(Arc::new(MemoryConversationStorage::new()))
+                .conversation_item_storage(Arc::new(MemoryConversationItemStorage::new()))
+                .conversation_memory_writer(Arc::new(NoOpConversationMemoryWriter::new()))
+                .worker_monitor(None)
+                .worker_job_queue(Arc::new(OnceLock::new()))
+                .workflow_engines(Arc::new(OnceLock::new()))
+                .mcp_orchestrator(Arc::new(OnceLock::new()))
+                .build()
+                .expect("test app context should build"),
+        );
+
+        let router_trait: Arc<dyn RouterTrait> = router.clone();
+        Arc::new(AppState {
+            router: router_trait,
+            context,
+            concurrency_queue_tx: None,
+            router_manager: None,
+            mesh_handler: None,
+        })
+    }
+
+    /// Build tenant metadata for direct handler calls.
+    fn tenant_meta() -> middleware::TenantRequestMeta {
+        middleware::TenantRequestMeta::new(canonical_tenant_key(TenantIdentity::Anonymous))
+    }
+
+    /// Build a minimal valid chat-completions request.
+    fn chat_request() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "cohere.command-r-plus",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .expect("chat request fixture should deserialize")
+    }
+
+    /// Build a minimal valid responses request.
+    fn responses_request() -> ResponsesRequest {
+        serde_json::from_value(json!({
+            "model": "cohere.command-r-plus",
+            "input": "hello"
+        }))
+        .expect("responses request fixture should deserialize")
+    }
+
+    /// Add a static header value.
+    fn insert(headers: &mut HeaderMap, name: &'static str, value: &'static str) {
+        headers.insert(name, HeaderValue::from_static(value));
+    }
+
+    /// Build valid unresolved cross-region headers.
+    fn unresolved_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        insert(&mut headers, CONTRACT_VERSION_HEADER, "1");
+        insert(&mut headers, REQUEST_MODE_HEADER, REQUEST_MODE_UNRESOLVED);
+        insert(&mut headers, ENTRY_REGION_HEADER, "us-ashburn-1");
+        insert(&mut headers, SOURCE_SERVICE_HEADER, "dp-api");
+        insert(&mut headers, OPC_REQUEST_ID_HEADER, "opc-request-1");
+        insert(
+            &mut headers,
+            ALLOWED_REGIONS_HEADER,
+            "us-ashburn-1, us-chicago-1",
+        );
+        insert(&mut headers, ALLOWED_MODELS_HEADER, "cohere.command-r-plus");
+        insert(&mut headers, FAILOVER_MODE_HEADER, "AUTO");
+        insert(&mut headers, MAX_RETRY_HEADER, "3");
+        headers
+    }
+
+    /// Build valid settled cross-region headers.
+    fn settled_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        insert(&mut headers, CONTRACT_VERSION_HEADER, "1");
+        insert(&mut headers, REQUEST_MODE_HEADER, REQUEST_MODE_SETTLED);
+        insert(&mut headers, ENTRY_REGION_HEADER, "us-ashburn-1");
+        insert(&mut headers, SOURCE_SERVICE_HEADER, "smg");
+        insert(&mut headers, OPC_REQUEST_ID_HEADER, "opc-request-1");
+        insert(&mut headers, TARGET_REGION_HEADER, "us-ashburn-1");
+        insert(&mut headers, ROUTE_ID_HEADER, "route-1");
+        insert(&mut headers, ATTEMPT_HEADER, "1");
+        headers
+    }
+
+    /// Read a response body as UTF-8 text for assertions.
+    async fn body_text(response: Response) -> String {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        String::from_utf8(bytes.to_vec()).expect("response body should be UTF-8")
+    }
+
+    /// Build an HTTP request for exercising the forwarding Axum app.
+    fn forwarded_responses_http_request(headers: HeaderMap) -> HttpRequest<Body> {
+        let mut request = HttpRequest::builder()
+            .method(http::Method::POST)
+            .uri("/v1/responses")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header("x-tenant-id", "tenant-abc")
+            .body(Body::from(
+                r#"{"model":"cohere.command-r-plus","input":"hello"}"#,
+            ))
+            .expect("forwarded responses request should build");
+
+        for (name, value) in &headers {
+            request.headers_mut().insert(name.clone(), value.clone());
+        }
+
+        request
+    }
+
+    #[test]
+    fn request_mode_classifier_handles_ordinary_unresolved_and_settled() {
+        assert!(matches!(
+            classify_inference_request(&HeaderMap::new(), RequestListener::Local, 5),
+            Ok(InferenceRequestDispatch::Local)
+        ));
+        assert!(matches!(
+            classify_inference_request(&unresolved_headers(), RequestListener::Local, 5),
+            Ok(InferenceRequestDispatch::Unresolved(_))
+        ));
+        assert!(matches!(
+            classify_inference_request(&settled_headers(), RequestListener::Forwarding, 5),
+            Ok(InferenceRequestDispatch::Settled(_))
+        ));
+    }
+
+    #[test]
+    fn settled_request_is_rejected_on_local_listener() {
+        let error = classify_inference_request(&settled_headers(), RequestListener::Local, 5)
+            .expect_err("settled request must require forwarding listener");
+
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn forwarding_listener_rejects_missing_and_unresolved_request_mode() {
+        let missing_mode =
+            classify_inference_request(&HeaderMap::new(), RequestListener::Forwarding, 5)
+                .expect_err("forwarding listener must require settled mode");
+        let unresolved =
+            classify_inference_request(&unresolved_headers(), RequestListener::Forwarding, 5)
+                .expect_err("forwarding listener must reject unresolved mode");
+
+        assert_eq!(missing_mode.status(), StatusCode::FORBIDDEN);
+        assert_eq!(unresolved.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn ordinary_chat_request_uses_existing_local_router_path() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router.clone());
+
+        let response = v1_chat_completions(
+            State(state),
+            HeaderMap::new(),
+            Extension(tenant_meta()),
+            ValidatedJson(chat_request()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "local chat");
+        assert_eq!(router.chat_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unresolved_chat_request_enters_cross_region_request_plane_stub() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router.clone());
+
+        let response = v1_chat_completions(
+            State(state),
+            unresolved_headers(),
+            Extension(tenant_meta()),
+            ValidatedJson(chat_request()),
+        )
+        .await;
+        let status = response.status();
+        let body = body_text(response).await;
+
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("cross-region request plane"));
+        assert_eq!(router.chat_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn settled_chat_request_on_local_listener_is_rejected_before_local_router() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router.clone());
+
+        let response = v1_chat_completions(
+            State(state),
+            settled_headers(),
+            Extension(tenant_meta()),
+            ValidatedJson(chat_request()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(router.chat_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn settled_chat_request_on_forwarding_listener_executes_locally() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router.clone());
+
+        let response = v1_chat_completions_forwarded(
+            State(state),
+            settled_headers(),
+            Extension(tenant_meta()),
+            ValidatedJson(chat_request()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "local chat");
+        assert_eq!(router.chat_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_mode_chat_request_on_forwarding_listener_is_rejected() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router.clone());
+
+        let response = v1_chat_completions_forwarded(
+            State(state),
+            HeaderMap::new(),
+            Extension(tenant_meta()),
+            ValidatedJson(chat_request()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(router.chat_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ordinary_responses_request_uses_existing_local_router_path() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router.clone());
+
+        let response = v1_responses(
+            State(state),
+            HeaderMap::new(),
+            Extension(tenant_meta()),
+            ValidatedJson(responses_request()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "local responses");
+        assert_eq!(router.responses_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unresolved_responses_request_enters_cross_region_request_plane_stub() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router.clone());
+
+        let response = v1_responses(
+            State(state),
+            unresolved_headers(),
+            Extension(tenant_meta()),
+            ValidatedJson(responses_request()),
+        )
+        .await;
+        let status = response.status();
+        let body = body_text(response).await;
+
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(body.contains("cross-region request plane"));
+        assert_eq!(router.responses_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn settled_responses_request_on_forwarding_listener_executes_locally() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router.clone());
+
+        let response = v1_responses_forwarded(
+            State(state),
+            settled_headers(),
+            Extension(tenant_meta()),
+            ValidatedJson(responses_request()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "local responses");
+        assert_eq!(router.responses_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_mode_responses_request_on_forwarding_listener_is_rejected() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router.clone());
+
+        let response = v1_responses_forwarded(
+            State(state),
+            HeaderMap::new(),
+            Extension(tenant_meta()),
+            ValidatedJson(responses_request()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(router.responses_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn forwarded_responses_route_preserves_storage_context() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state_with_router_config(router.clone(), |router_config| {
+            router_config.storage_context_headers =
+                HashMap::from([("x-tenant-id".to_string(), "tenant_id".to_string())]);
+        });
+        let app = build_request_forwarding_app(
+            state,
+            AuthConfig::new(None),
+            1024 * 1024,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("forwarding app should build");
+
+        let response = app
+            .oneshot(forwarded_responses_http_request(settled_headers()))
+            .await
+            .expect("forwarded request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "local responses");
+        assert_eq!(router.responses_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            router.response_storage_context_hits.load(Ordering::SeqCst),
+            1
+        );
+    }
 }

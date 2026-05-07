@@ -5,6 +5,10 @@ use super::{
 
 /// Signal events exchanged by the future sync plane.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "sync-plane events are inert placeholders until SMG sync wiring defines the final storage shape"
+)]
 pub enum SyncEvent {
     SmgReadiness(SmgReadinessSignal),
     WorkerHealth(WorkerHealthSignal),
