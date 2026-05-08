@@ -1,4 +1,8 @@
 use std::{
+    future::Future,
+    io,
+    path::PathBuf,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -12,6 +16,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
+};
+use axum_server::{
+    accept::Accept,
+    tls_rustls::{RustlsAcceptor, RustlsConfig},
 };
 use llm_tokenizer::TokenizerRegistry;
 use openai_protocol::{
@@ -41,8 +49,17 @@ use openai_protocol::{
 use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler, WorkerStateSubscriber};
-use tokio::{signal, spawn, sync::mpsc};
+use smg_mesh::{
+    MTLSConfig, MTLSManager, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
+    SpiffeIdentity, WorkerStateSubscriber,
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    signal, spawn,
+    sync::mpsc,
+};
+use tokio_rustls::server::TlsStream;
+use tower::Layer;
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
@@ -51,8 +68,8 @@ use crate::{
     config::{RouterConfig, RoutingMode},
     cross_region::{
         headers::REQUEST_MODE_HEADER, validate_settled_local_execution, AuthenticatedPeerIdentity,
-        CrossRegionError, CrossRegionHeaders, RegionPeer, RegionPeerRegistry,
-        SettledRequestContext, UnresolvedRequestContext,
+        CrossRegionError, CrossRegionHeaders, CrossRegionRuntimeConfig, RegionPeer,
+        RegionPeerRegistry, SettledRequestContext, UnresolvedRequestContext,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -115,6 +132,74 @@ impl RequestListener {
             Self::Forwarding { peer_identity } => peer_identity,
         }
     }
+}
+
+/// Request-forwarding TLS acceptor that injects the authenticated peer identity.
+#[derive(Debug, Clone)]
+struct ForwardingPeerIdentityAcceptor {
+    inner: RustlsAcceptor,
+}
+
+impl ForwardingPeerIdentityAcceptor {
+    /// Create a TLS acceptor for the request-forwarding listener.
+    fn new(config: RustlsConfig) -> Self {
+        Self {
+            inner: RustlsAcceptor::new(config),
+        }
+    }
+}
+
+impl<I, S> Accept<I, S> for ForwardingPeerIdentityAcceptor
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: Send + 'static,
+    <Extension<AuthenticatedPeerIdentity> as Layer<S>>::Service: Send + 'static,
+{
+    type Stream = TlsStream<I>;
+    type Service = <Extension<AuthenticatedPeerIdentity> as Layer<S>>::Service;
+    type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
+
+    fn accept(&self, stream: I, service: S) -> Self::Future {
+        let accept = self.inner.accept(stream, service);
+        Box::pin(async move {
+            let (stream, service) = accept.await?;
+            let peer_identity = authenticated_identity_from_tls_stream(&stream)?;
+            Ok((stream, Extension(peer_identity).layer(service)))
+        })
+    }
+}
+
+/// Extract and validate the peer's SMG SPIFFE identity from a TLS stream.
+fn authenticated_identity_from_tls_stream<I>(
+    stream: &TlsStream<I>,
+) -> io::Result<AuthenticatedPeerIdentity> {
+    let (_, session) = stream.get_ref();
+    let peer_certs = session.peer_certificates().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "request-forwarding mTLS peer certificate is required",
+        )
+    })?;
+    let leaf_cert = peer_certs.first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "request-forwarding mTLS peer certificate chain is empty",
+        )
+    })?;
+    let spiffe_identity =
+        SpiffeIdentity::from_certificate_der(leaf_cert.as_ref()).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("invalid request-forwarding SPIFFE identity: {error}"),
+            )
+        })?;
+
+    AuthenticatedPeerIdentity::from_spiffe_identity(spiffe_identity).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("invalid authenticated forwarding peer identity: {error}"),
+        )
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +315,26 @@ fn settled_peer_registry(config: &RouterConfig) -> Result<RegionPeerRegistry, Cr
         .map(RegionPeer::from_config)
         .collect::<Result<Vec<_>, _>>()?;
     RegionPeerRegistry::new(peers)
+}
+
+/// Build the mTLS manager used by cross-region request-forwarding and sync listeners.
+fn cross_region_mtls_manager(config: &RouterConfig) -> Result<MTLSManager, CrossRegionError> {
+    let Some(runtime_config) = CrossRegionRuntimeConfig::from_router_config(&config.cross_region)?
+    else {
+        return Err(CrossRegionError::InvalidConfig {
+            reason: "cross_region must be enabled for mTLS listener config".to_string(),
+        });
+    };
+    let mtls = runtime_config.mtls;
+    Ok(MTLSManager::new(MTLSConfig {
+        ca_cert_path: PathBuf::from(mtls.ca_cert_path),
+        server_cert_path: PathBuf::from(mtls.server_cert_path),
+        server_key_path: PathBuf::from(mtls.server_key_path),
+        client_cert_path: PathBuf::from(mtls.client_cert_path),
+        client_key_path: PathBuf::from(mtls.client_key_path),
+        require_client_cert: true,
+        ..MTLSConfig::default()
+    }))
 }
 
 /// Validate settled request metadata before local router execution.
@@ -1954,6 +2059,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     } else {
         None
     };
+    let forwarding_mtls_manager = if forwarding_app.is_some() {
+        Some(
+            cross_region_mtls_manager(&config.router_config)
+                .map_err(|error| format!("Invalid request-forwarding mTLS config: {error}"))?,
+        )
+    } else {
+        None
+    };
 
     let app = build_app(
         app_state,
@@ -1976,6 +2089,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let handle = axum_server::Handle::new();
     let handle_clone = handle.clone();
     let forwarding_handle = if let Some(forwarding_app) = forwarding_app {
+        let forwarding_mtls_manager = forwarding_mtls_manager.ok_or_else(|| {
+            "request-forwarding mTLS manager missing for enabled forwarding listener".to_string()
+        })?;
         let forwarding_bind_addr = format!(
             "{}:{}",
             config.host, config.router_config.cross_region.request_plane.listen_port
@@ -1990,8 +2106,18 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .map_err(|e| format!("Failed to set request-forwarding listener nonblocking: {e}"))?;
         let forwarding_handle = axum_server::Handle::new();
         let server_handle = forwarding_handle.clone();
+        let mtls_server_config =
+            forwarding_mtls_manager
+                .load_server_config()
+                .await
+                .map_err(|error| {
+                    format!("Failed to load request-forwarding mTLS server config: {error}")
+                })?;
+        let forwarding_acceptor =
+            ForwardingPeerIdentityAcceptor::new(RustlsConfig::from_config(mtls_server_config));
         let forwarding_server = axum_server::from_tcp(listener)
             .map_err(|e| format!("Failed to create request-forwarding listener: {e}"))?
+            .acceptor(forwarding_acceptor)
             .handle(server_handle)
             .serve(forwarding_app.into_make_service_with_connect_info::<std::net::SocketAddr>());
         info!(
@@ -2058,7 +2184,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .install_default()
             .map_err(|e| format!("Failed to install rustls ring provider: {e:?}"))?;
 
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
+        let tls_config = RustlsConfig::from_pem(cert.clone(), key.clone())
             .await
             .map_err(|e| format!("Failed to create TLS config: {e}"))?;
 

@@ -28,7 +28,7 @@ use super::{
         record_snapshot_duration, record_snapshot_trigger, update_peer_connections,
         ConvergenceTracker,
     },
-    mtls::MTLSManager,
+    mtls::{MTLSManager, SpiffeIdentity},
     node_state_machine::NodeStateMachine,
     partition::PartitionDetector,
     service::{
@@ -368,13 +368,19 @@ impl GossipService {
         signal: F,
     ) -> Result<()> {
         let listen_addr = self.listen_addr;
+        let mtls_manager = self.mtls_manager.clone();
         let service = GossipServer::new(self)
             .max_decoding_message_size(MAX_MESSAGE_SIZE)
             .max_encoding_message_size(MAX_MESSAGE_SIZE)
             .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
             .send_compressed(tonic::codec::CompressionEncoding::Gzip);
 
-        Server::builder()
+        let mut server = Server::builder();
+        if let Some(mtls_manager) = mtls_manager {
+            server = server.tls_config(mtls_manager.load_tonic_server_tls_config().await?)?;
+        }
+
+        server
             .add_service(service)
             .serve_with_shutdown(listen_addr, signal)
             .await?;
@@ -387,12 +393,19 @@ impl GossipService {
         signal: F,
     ) -> Result<()> {
         let incoming = TcpIncoming::from(listener);
+        let mtls_manager = self.mtls_manager.clone();
         let service = GossipServer::new(self)
             .max_decoding_message_size(MAX_MESSAGE_SIZE)
             .max_encoding_message_size(MAX_MESSAGE_SIZE)
             .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
             .send_compressed(tonic::codec::CompressionEncoding::Gzip);
-        Server::builder()
+
+        let mut server = Server::builder();
+        if let Some(mtls_manager) = mtls_manager {
+            server = server.tls_config(mtls_manager.load_tonic_server_tls_config().await?)?;
+        }
+
+        server
             .add_service(service)
             .serve_with_incoming_shutdown(incoming, signal)
             .await?;
@@ -423,6 +436,27 @@ impl GossipService {
     }
 }
 
+/// Validate and parse the SPIFFE URI SAN from an authenticated tonic peer.
+fn validate_peer_spiffe_identity<T>(
+    request: &tonic::Request<T>,
+    mtls_manager: &MTLSManager,
+) -> Result<SpiffeIdentity, Status> {
+    let peer_certs = request
+        .peer_certs()
+        .ok_or_else(|| Status::unauthenticated("mTLS peer certificate is required"))?;
+    let leaf_cert = peer_certs
+        .first()
+        .ok_or_else(|| Status::unauthenticated("mTLS peer certificate chain is empty"))?;
+
+    let identity = SpiffeIdentity::from_certificate_der(leaf_cert.as_ref()).map_err(|error| {
+        Status::unauthenticated(format!("invalid peer certificate SPIFFE identity: {error}"))
+    })?;
+    mtls_manager
+        .validate_allowed_peer_identity(&identity)
+        .map_err(|error| Status::unauthenticated(format!("unauthorized mesh peer: {error}")))?;
+    Ok(identity)
+}
+
 #[tonic::async_trait]
 impl Gossip for GossipService {
     type SyncStreamStream =
@@ -433,6 +467,10 @@ impl Gossip for GossipService {
         &self,
         request: tonic::Request<GossipMessage>,
     ) -> std::result::Result<Response<NodeUpdate>, Status> {
+        if let Some(mtls_manager) = self.mtls_manager.as_ref() {
+            validate_peer_spiffe_identity(&request, mtls_manager)?;
+        }
+
         let message = request.into_inner();
         match message.payload {
             Some(gossip::gossip_message::Payload::Ping(ping)) => {
@@ -469,6 +507,10 @@ impl Gossip for GossipService {
         &self,
         request: tonic::Request<tonic::Streaming<StreamMessage>>,
     ) -> Result<Response<Self::SyncStreamStream>, Status> {
+        if let Some(mtls_manager) = self.mtls_manager.as_ref() {
+            validate_peer_spiffe_identity(&request, mtls_manager)?;
+        }
+
         let mut incoming = request.into_inner();
         let self_name = self.self_name.clone();
         let state = self.state.clone();

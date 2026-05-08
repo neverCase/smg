@@ -1,8 +1,11 @@
+use std::{path::PathBuf, time::Duration};
+
+use smg_mesh::{MTLSConfig, MTLSManager, SpiffeIdentity};
 use url::Url;
 
 use super::{
-    peers::RegionPeerRequestTarget, CrossRegionError, CrossRegionResult, ExecutionTarget,
-    RegionPeerRegistry, RegionRouteDecision,
+    peers::RegionPeerRequestTarget, CrossRegionError, CrossRegionMtlsRuntimeConfig,
+    CrossRegionResult, ExecutionTarget, RegionPeerRegistry, RegionRouteDecision,
 };
 
 /// Existing SMG endpoint path that cannot be an absolute worker URL.
@@ -98,6 +101,43 @@ impl ForwardingTarget {
     }
 }
 
+/// Build a request-forwarding HTTP client with outbound mTLS identity enforcement.
+pub async fn build_request_forwarding_http_client(
+    mtls: &CrossRegionMtlsRuntimeConfig,
+    target: &ForwardingTarget,
+    timeout: Duration,
+) -> CrossRegionResult<reqwest::Client> {
+    let expected_identity = SpiffeIdentity::parse_region_agent(target.expected_mtls_identity())
+        .map_err(|error| CrossRegionError::InvalidForwardingTarget {
+            reason: format!(
+                "peer expected_mtls_identity is not a Region Agent SPIFFE URI: {error}"
+            ),
+        })?;
+    let mtls_manager = MTLSManager::new(MTLSConfig {
+        ca_cert_path: PathBuf::from(&mtls.ca_cert_path),
+        server_cert_path: PathBuf::from(&mtls.server_cert_path),
+        server_key_path: PathBuf::from(&mtls.server_key_path),
+        client_cert_path: PathBuf::from(&mtls.client_cert_path),
+        client_key_path: PathBuf::from(&mtls.client_key_path),
+        require_client_cert: true,
+        ..MTLSConfig::default()
+    });
+    let tls_config = mtls_manager
+        .load_client_config_for_server_identity(&expected_identity)
+        .await
+        .map_err(|error| CrossRegionError::InvalidForwardingTarget {
+            reason: format!("failed to load request-forwarding mTLS client config: {error}"),
+        })?;
+
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .use_preconfigured_tls((*tls_config).clone())
+        .build()
+        .map_err(|error| CrossRegionError::InvalidForwardingTarget {
+            reason: format!("failed to build request-forwarding HTTP client: {error}"),
+        })
+}
+
 impl std::fmt::Debug for ForwardingTarget {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -141,6 +181,17 @@ impl CrossRegionForwarder {
         decision: &RegionRouteDecision,
         request: &ForwardingRequest,
     ) -> CrossRegionResult<ForwardingTarget> {
+        if let ExecutionTarget::RemoteRegion { region_id } = &decision.execution_target {
+            if decision.target_region != *region_id {
+                return Err(CrossRegionError::InvalidForwardingTarget {
+                    reason: format!(
+                        "route target_region '{}' must match execution target region '{}'",
+                        decision.target_region, region_id
+                    ),
+                });
+            }
+        }
+
         let target = self.request_target_for_decision(decision)?;
         let url = target
             .request_url()
@@ -241,6 +292,31 @@ mod tests {
             target.expected_mtls_identity(),
             "spiffe://oraclecorp.com/oci/oc1/prod/region/us-chicago-1/service/smg-region-agent"
         );
+    }
+
+    #[test]
+    fn forwarding_target_rejects_route_target_region_mismatch() {
+        let peer = RegionPeer::new(
+            "us-chicago-1",
+            "https://smg-region-agent.us-chicago-1.internal:8443",
+            "https://smg-region-agent.us-chicago-1.internal:9443",
+            "oc1",
+            "prod",
+            None,
+        )
+        .expect("peer should parse");
+        let registry = RegionPeerRegistry::new(vec![peer]).expect("registry should build");
+        let forwarder = CrossRegionForwarder::new(registry);
+        let mut decision = remote_decision("us-chicago-1");
+        decision.target_region = "us-phoenix-1".to_string();
+        let request = ForwardingRequest::new("/v1/chat/completions", b"{}".to_vec())
+            .expect("path should parse");
+
+        let error = forwarder
+            .forwarding_target_for_decision(&decision, &request)
+            .expect_err("route metadata mismatch should fail");
+
+        assert!(error.to_string().contains("target_region"));
     }
 
     #[test]

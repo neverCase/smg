@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use rand::{distr::Alphanumeric, Rng};
@@ -21,7 +24,7 @@ use smg::{
     worker::ConnectionMode,
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
-use smg_mesh::MeshServerConfig;
+use smg_mesh::{ExpectedPeerTlsIdentity, MTLSConfig, MeshServerConfig, SpiffeIdentity};
 fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
     let args: Vec<String> = std::env::args().collect();
     let mut prefill_entries = Vec::new();
@@ -1115,13 +1118,220 @@ impl CliArgs {
             });
         }
 
+        let cross_region_config = self.build_cross_region_config();
+        let mesh_peer_authorities = peer
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<String>>();
+        let mtls_config = Self::build_cross_region_mesh_mtls_config(
+            &cross_region_config,
+            &mesh_peer_authorities,
+        )?;
+
         Ok(Some(MeshServerConfig {
             self_name,
             bind_addr,
             advertise_addr,
             init_peer: peer,
-            mtls_config: None,
+            mtls_config,
         }))
+    }
+
+    /// Build mesh mTLS config from enabled cross-region certificate paths.
+    fn build_cross_region_mesh_mtls_config(
+        cross_region: &CrossRegionConfig,
+        mesh_peer_authorities: &[String],
+    ) -> ConfigResult<Option<MTLSConfig>> {
+        if !cross_region.enabled {
+            return Ok(None);
+        }
+
+        let mut allowed_peer_identities = Vec::new();
+        let mut expected_peer_tls_by_authority = BTreeMap::new();
+        let mut enabled_peer_tls = Vec::new();
+        for (idx, peer) in cross_region.peers.iter().enumerate() {
+            if !peer.enabled {
+                continue;
+            }
+
+            let identity = Self::cross_region_peer_spiffe_identity(peer, idx)?;
+            let (authority, tls_server_name) = Self::cross_region_peer_sync_tls_target(peer, idx)?;
+            let expected_tls = ExpectedPeerTlsIdentity::new(tls_server_name, identity.clone())
+                .map_err(|e| ConfigError::InvalidValue {
+                    field: format!("cross_region.peers[{idx}].sync_url"),
+                    value: authority.clone(),
+                    reason: e.to_string(),
+                })?;
+            Self::insert_expected_peer_tls(
+                &mut expected_peer_tls_by_authority,
+                authority.clone(),
+                expected_tls.clone(),
+                format!("cross_region.peers[{idx}].sync_url"),
+            )?;
+            allowed_peer_identities.push(identity);
+            enabled_peer_tls.push((idx, expected_tls));
+        }
+
+        for (mesh_authority, (idx, expected_tls)) in
+            mesh_peer_authorities.iter().zip(enabled_peer_tls.iter())
+        {
+            Self::insert_expected_peer_tls(
+                &mut expected_peer_tls_by_authority,
+                mesh_authority.clone(),
+                expected_tls.clone(),
+                format!("mesh_peer_urls for cross_region.peers[{idx}]"),
+            )?;
+        }
+
+        Ok(Some(MTLSConfig {
+            ca_cert_path: PathBuf::from(Self::required_cross_region_mtls_path(
+                "mtls.ca_cert_path",
+                cross_region.mtls.ca_cert_path.as_deref(),
+            )?),
+            server_cert_path: PathBuf::from(Self::required_cross_region_mtls_path(
+                "mtls.server_cert_path",
+                cross_region.mtls.server_cert_path.as_deref(),
+            )?),
+            server_key_path: PathBuf::from(Self::required_cross_region_mtls_path(
+                "mtls.server_key_path",
+                cross_region.mtls.server_key_path.as_deref(),
+            )?),
+            client_cert_path: PathBuf::from(Self::required_cross_region_mtls_path(
+                "mtls.client_cert_path",
+                cross_region.mtls.client_cert_path.as_deref(),
+            )?),
+            client_key_path: PathBuf::from(Self::required_cross_region_mtls_path(
+                "mtls.client_key_path",
+                cross_region.mtls.client_key_path.as_deref(),
+            )?),
+            allowed_peer_identities,
+            expected_peer_tls_by_authority,
+            require_client_cert: true,
+            ..MTLSConfig::default()
+        }))
+    }
+
+    /// Insert an outbound peer TLS target without hiding conflicting authority mappings.
+    fn insert_expected_peer_tls(
+        expected_peer_tls_by_authority: &mut BTreeMap<String, ExpectedPeerTlsIdentity>,
+        authority: String,
+        expected_tls: ExpectedPeerTlsIdentity,
+        field: String,
+    ) -> ConfigResult<()> {
+        if let Some(existing) = expected_peer_tls_by_authority.get(&authority) {
+            if existing == &expected_tls {
+                return Ok(());
+            }
+            return Err(ConfigError::InvalidValue {
+                field,
+                value: authority,
+                reason:
+                    "duplicate outbound mesh authority maps to conflicting mTLS peer identities"
+                        .to_string(),
+            });
+        }
+        expected_peer_tls_by_authority.insert(authority, expected_tls);
+        Ok(())
+    }
+
+    /// Return a required cross-region mTLS path or a config error.
+    fn required_cross_region_mtls_path<'a>(
+        field: &str,
+        value: Option<&'a str>,
+    ) -> ConfigResult<&'a str> {
+        let full_field = format!("cross_region.{field}");
+        let value = value.ok_or_else(|| ConfigError::MissingRequired {
+            field: full_field.clone(),
+        })?;
+        if value.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: full_field,
+                value: value.to_string(),
+                reason: "mTLS path must not be empty".to_string(),
+            });
+        }
+        Ok(value)
+    }
+
+    /// Derive and validate the Region Agent SPIFFE identity for one peer entry.
+    fn cross_region_peer_spiffe_identity(
+        peer: &CrossRegionPeerConfig,
+        idx: usize,
+    ) -> ConfigResult<SpiffeIdentity> {
+        let region_id =
+            Self::required_cross_region_peer_field("region_id", peer.region_id.as_deref(), idx)?;
+        let realm = Self::required_cross_region_peer_field("realm", peer.realm.as_deref(), idx)?;
+        let environment = Self::required_cross_region_peer_field(
+            "environment",
+            peer.environment.as_deref(),
+            idx,
+        )?;
+        let expected = format!(
+            "spiffe://oraclecorp.com/oci/{realm}/{environment}/region/{region_id}/service/smg-region-agent"
+        );
+        let identity = peer
+            .expected_mtls_identity
+            .as_deref()
+            .unwrap_or(expected.as_str());
+        if identity != expected {
+            return Err(ConfigError::InvalidValue {
+                field: format!("cross_region.peers[{idx}].expected_mtls_identity"),
+                value: identity.to_string(),
+                reason: format!("must be {expected}"),
+            });
+        }
+
+        SpiffeIdentity::parse_region_agent(identity).map_err(|e| ConfigError::InvalidValue {
+            field: format!("cross_region.peers[{idx}].expected_mtls_identity"),
+            value: identity.to_string(),
+            reason: e.to_string(),
+        })
+    }
+
+    /// Return the sync URL authority and DNS name used for outbound TLS verification.
+    fn cross_region_peer_sync_tls_target(
+        peer: &CrossRegionPeerConfig,
+        idx: usize,
+    ) -> ConfigResult<(String, String)> {
+        let sync_url =
+            Self::required_cross_region_peer_field("sync_url", peer.sync_url.as_deref(), idx)?;
+        let parsed = url::Url::parse(sync_url).map_err(|e| ConfigError::InvalidValue {
+            field: format!("cross_region.peers[{idx}].sync_url"),
+            value: sync_url.to_string(),
+            reason: format!("invalid URL format: {e}"),
+        })?;
+        let host = parsed.host_str().ok_or_else(|| ConfigError::InvalidValue {
+            field: format!("cross_region.peers[{idx}].sync_url"),
+            value: sync_url.to_string(),
+            reason: "sync_url must include a host".to_string(),
+        })?;
+        let port = parsed.port().ok_or_else(|| ConfigError::InvalidValue {
+            field: format!("cross_region.peers[{idx}].sync_url"),
+            value: sync_url.to_string(),
+            reason: "sync_url must include an explicit port".to_string(),
+        })?;
+
+        Ok((format!("{host}:{port}"), host.to_string()))
+    }
+
+    /// Return a required cross-region peer field or a config error.
+    fn required_cross_region_peer_field<'a>(
+        field: &str,
+        value: Option<&'a str>,
+        idx: usize,
+    ) -> ConfigResult<&'a str> {
+        let full_field = format!("cross_region.peers[{idx}].{field}");
+        let value = value.ok_or_else(|| ConfigError::MissingRequired {
+            field: full_field.clone(),
+        })?;
+        if value.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: full_field,
+                value: value.to_string(),
+                reason: "peer field must not be empty".to_string(),
+            });
+        }
+        Ok(value)
     }
 
     #[expect(
@@ -1777,6 +1987,40 @@ mod tests {
             server_config.router_config.cross_region,
             router_config.cross_region
         );
+    }
+
+    #[test]
+    fn cross_region_peer_identities_flow_to_mesh_mtls_config() {
+        let args = launch_args(&cross_region_launch_args());
+        let router_config = args.to_router_config(Vec::new()).expect("router config");
+        let mesh_peer_authorities = vec!["10.64.20.10:9443".to_string()];
+        let mtls_config = CliArgs::build_cross_region_mesh_mtls_config(
+            &router_config.cross_region,
+            &mesh_peer_authorities,
+        )
+        .expect("mesh mTLS config should build")
+        .expect("cross-region should enable mesh mTLS config");
+        let expected_identity = SpiffeIdentity::parse_region_agent(
+            "spiffe://oraclecorp.com/oci/oc1/prod/region/us-chicago-1/service/smg-region-agent",
+        )
+        .expect("expected peer identity should parse");
+
+        mtls_config
+            .validate_allowed_peer_identity(&expected_identity)
+            .expect("configured peer identity should be accepted");
+        let sync_tls = mtls_config
+            .expected_peer_tls_for_authority("smg-region-agent.us-chicago-1.internal:9443")
+            .expect("sync_url authority should resolve expected TLS target");
+        assert_eq!(
+            sync_tls.tls_server_name(),
+            "smg-region-agent.us-chicago-1.internal"
+        );
+        assert_eq!(sync_tls.spiffe_identity(), &expected_identity);
+
+        let mesh_tls = mtls_config
+            .expected_peer_tls_for_authority("10.64.20.10:9443")
+            .expect("mesh SocketAddr authority should bridge to sync_url TLS target");
+        assert_eq!(mesh_tls, sync_tls);
     }
 
     #[test]

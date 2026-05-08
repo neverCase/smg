@@ -41,7 +41,10 @@ pub use kv::{
     StreamNamespace, StreamRouting, Subscription,
 };
 pub use metrics::init_mesh_metrics;
-pub use mtls::{MTLSConfig, MTLSManager, OptionalMTLSManager};
+pub use mtls::{
+    ExpectedPeerTlsIdentity, MTLSConfig, MTLSManager, OptionalMTLSManager, SpiffeIdentity,
+    REGION_AGENT_SPIFFE_SERVICE,
+};
 pub use partition::PartitionDetector;
 pub use rate_limit_window::RateLimitWindow;
 pub use service::{gossip, ClusterState, MeshServerBuilder, MeshServerConfig, MeshServerHandler};

@@ -9,10 +9,7 @@ use std::{
 use anyhow::Result;
 use parking_lot::RwLock;
 use tokio::sync::watch;
-use tonic::{
-    transport::{ClientTlsConfig, Endpoint},
-    Request,
-};
+use tonic::{transport::Endpoint, Request};
 use tracing as log;
 
 use crate::flow_control::MAX_MESSAGE_SIZE;
@@ -60,6 +57,7 @@ pub struct MeshServerHandler {
     signal_tx: watch::Sender<bool>,
     partition_detector: Option<Arc<PartitionDetector>>,
     state_machine: Option<Arc<NodeStateMachine>>,
+    mtls_manager: Option<Arc<MTLSManager>>,
     rate_limit_task_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Shared with the MeshServer so adapters can subscribe to stream
     /// namespaces (broadcast/targeted) and publish values that reach
@@ -187,6 +185,7 @@ impl MeshServerHandler {
             vec![leaving_node],
             alive_nodes,
             Some(Duration::from_secs(3)),
+            self.mtls_manager.clone(),
         )
         .await;
 
@@ -356,6 +355,7 @@ impl MeshServerBuilder {
                 signal_tx,
                 partition_detector: Some(partition_detector),
                 state_machine: Some(state_machine),
+                mtls_manager: self.mtls_manager.clone(),
                 rate_limit_task_handle: std::sync::Mutex::new(None),
                 mesh_kv,
             },
@@ -518,6 +518,7 @@ pub async fn broadcast_node_states(
     nodes_to_broadcast: Vec<NodeState>,
     target_nodes: Vec<NodeState>,
     timeout: Option<Duration>,
+    mtls_manager: Option<Arc<MTLSManager>>,
 ) -> (usize, usize) {
     if nodes_to_broadcast.is_empty() || target_nodes.is_empty() {
         log::debug!(
@@ -532,6 +533,7 @@ pub async fn broadcast_node_states(
     for target_node in &target_nodes {
         let target_node_clone = target_node.clone();
         let nodes_for_task = nodes_to_broadcast.clone();
+        let mtls_for_task = mtls_manager.clone();
         #[expect(
             clippy::disallowed_methods,
             reason = "broadcast tasks are collected and awaited via join_all with a timeout immediately below"
@@ -543,7 +545,7 @@ pub async fn broadcast_node_states(
             let ping_payload = gossip_message::Payload::Ping(Ping {
                 state_sync: Some(state_sync),
             });
-            match try_ping(&target_node_clone, Some(ping_payload), None).await {
+            match try_ping(&target_node_clone, Some(ping_payload), mtls_for_task).await {
                 Ok(_) => {
                     log::debug!("Successfully broadcasted to {}", target_node_clone.name);
                     Ok(())
@@ -584,6 +586,47 @@ pub async fn broadcast_node_states(
     }
 }
 
+/// Configure an outbound mesh endpoint with mTLS and configured peer identity checks.
+pub(crate) async fn configure_mtls_endpoint_for_peer(
+    endpoint: Endpoint,
+    mtls_manager: Arc<MTLSManager>,
+    peer_name: &str,
+    peer_authority: &str,
+    fallback_tls_domain: String,
+) -> Result<Endpoint> {
+    if let Some(expected_peer) = mtls_manager.expected_peer_tls_for_authority(peer_authority) {
+        let tls_config = mtls_manager
+            .load_tonic_client_identity_tls_config(expected_peer.tls_server_name().to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to configure mTLS client identity: {e}"))?;
+        let verifier = mtls_manager
+            .load_server_verifier_for_identity(expected_peer.spiffe_identity())
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to configure expected mTLS server identity: {e}")
+            })?;
+
+        return endpoint
+            .tls_config_with_verifier(tls_config, verifier)
+            .map_err(|e| anyhow::anyhow!("Failed to configure TLS endpoint: {e}"));
+    }
+
+    if mtls_manager.requires_expected_peer_identity() {
+        return Err(anyhow::anyhow!(
+            "No expected mTLS identity configured for peer {peer_name} at {peer_authority}"
+        ));
+    }
+
+    let tls_config = mtls_manager
+        .load_tonic_client_tls_config(fallback_tls_domain)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to configure mTLS client identity: {e}"))?;
+
+    endpoint
+        .tls_config(tls_config)
+        .map_err(|e| anyhow::anyhow!("Failed to configure TLS endpoint: {e}"))
+}
+
 pub async fn try_ping(
     peer_node: &NodeState,
     payload: Option<gossip_message::Payload>,
@@ -614,34 +657,25 @@ pub async fn try_ping(
         .timeout(Duration::from_secs(10));
 
     if let Some(mtls_manager) = mtls_manager {
-        mtls_manager.load_client_config().await.map_err(|e| {
-            tonic::Status::unavailable(format!(
-                "Failed to load mTLS client config for {peer_name}: {e}"
-            ))
-        })?;
-
         let tls_domain = endpoint
             .uri()
             .host()
             .map(str::to_owned)
             .unwrap_or_else(|| peer_name.clone());
-        let ca_certificate = mtls_manager.load_ca_certificate().await.map_err(|e| {
+        let peer_authority = peer_addr.to_string();
+        endpoint = configure_mtls_endpoint_for_peer(
+            endpoint,
+            mtls_manager,
+            &peer_name,
+            &peer_authority,
+            tls_domain,
+        )
+        .await
+        .map_err(|e| {
             tonic::Status::unavailable(format!(
-                "Failed to load mTLS CA certificate for {peer_name}: {e}"
+                "Failed to configure mTLS endpoint for {peer_name}: {e}"
             ))
         })?;
-
-        endpoint = endpoint
-            .tls_config(
-                ClientTlsConfig::new()
-                    .domain_name(tls_domain)
-                    .ca_certificate(ca_certificate),
-            )
-            .map_err(|e| {
-                tonic::Status::unavailable(format!(
-                    "Failed to configure TLS endpoint for {peer_name}: {e}"
-                ))
-            })?;
     }
 
     let channel = endpoint.connect().await.map_err(|e| {
@@ -702,7 +736,7 @@ macro_rules! mesh_run {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Once;
+    use std::sync::{Arc, Once};
 
     use tracing as log;
     use tracing_subscriber::{
@@ -710,7 +744,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::tests::test_utils::{bind_node, wait_for};
+    use crate::{
+        mtls::{ExpectedPeerTlsIdentity, SpiffeIdentity},
+        tests::test_utils::{bind_node, wait_for},
+    };
 
     static INIT: Once = Once::new();
     fn init() {
@@ -770,6 +807,42 @@ mod tests {
 
         assert_eq!(response.address, advertise_addr.to_string());
         handler.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_try_ping_rejects_unconfigured_mtls_peer_authority() {
+        let expected_identity = SpiffeIdentity::parse_region_agent(
+            "spiffe://oraclecorp.com/oci/oc1/prod/region/us-chicago-1/service/smg-region-agent",
+        )
+        .expect("expected identity should parse");
+        let expected_tls = ExpectedPeerTlsIdentity::new("sync.example", expected_identity.clone())
+            .expect("expected TLS target should build");
+        let mtls_manager = Arc::new(MTLSManager::new(MTLSConfig {
+            expected_peer_tls_by_authority: BTreeMap::from([(
+                "sync.example:9443".to_string(),
+                expected_tls,
+            )]),
+            ..MTLSConfig::default()
+        }));
+
+        let error = try_ping(
+            &NodeState {
+                name: "B".to_string(),
+                address: "127.0.0.1:1".to_string(),
+                status: NodeStatus::Alive as i32,
+                version: 1,
+                metadata: HashMap::new(),
+            },
+            None,
+            Some(mtls_manager),
+        )
+        .await
+        .expect_err("unconfigured authority should fail closed before connecting");
+
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error
+            .message()
+            .contains("No expected mTLS identity configured"));
     }
 
     #[tokio::test]

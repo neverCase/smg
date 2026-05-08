@@ -1,3 +1,5 @@
+use smg_mesh::SpiffeIdentity;
+
 use super::{CrossRegionError, CrossRegionResult, RegionPeerRegistry, SettledRequestContext};
 
 /// Authenticated inbound Region Agent identity derived from the mTLS peer certificate.
@@ -28,6 +30,21 @@ impl AuthenticatedPeerIdentity {
             });
         }
         Ok(identity)
+    }
+
+    /// Build an authenticated peer identity from an SMG Region Agent SPIFFE URI SAN.
+    pub fn from_spiffe_uri(uri: impl Into<String>) -> CrossRegionResult<Self> {
+        let identity = SpiffeIdentity::parse_region_agent(uri.into()).map_err(|error| {
+            CrossRegionError::UnauthorizedPeer {
+                reason: format!("invalid SPIFFE peer identity: {error}"),
+            }
+        })?;
+        Self::from_spiffe_identity(identity)
+    }
+
+    /// Build an authenticated peer identity from a parsed SPIFFE identity.
+    pub fn from_spiffe_identity(identity: SpiffeIdentity) -> CrossRegionResult<Self> {
+        Self::new(identity.region_id().to_string(), identity.uri().to_string())
     }
 
     /// Return the authenticated peer region extracted from mTLS identity.
@@ -132,6 +149,30 @@ mod tests {
             ),
         )
         .expect("peer identity should build")
+    }
+
+    #[test]
+    fn authenticated_peer_identity_parses_spiffe_uri() {
+        let identity = AuthenticatedPeerIdentity::from_spiffe_uri(
+            "spiffe://oraclecorp.com/oci/oc1/prod/region/us-chicago-1/service/smg-region-agent",
+        )
+        .expect("valid SPIFFE URI should parse");
+
+        assert_eq!(identity.region_id(), "us-chicago-1");
+        assert_eq!(
+            identity.mtls_identity(),
+            "spiffe://oraclecorp.com/oci/oc1/prod/region/us-chicago-1/service/smg-region-agent"
+        );
+    }
+
+    #[test]
+    fn authenticated_peer_identity_rejects_invalid_spiffe_uri() {
+        let error = AuthenticatedPeerIdentity::from_spiffe_uri(
+            "spiffe://oraclecorp.com/oci/oc1/prod/region/us-chicago-1/service/other",
+        )
+        .expect_err("wrong SPIFFE service should be rejected");
+
+        assert!(error.to_string().contains("SPIFFE"));
     }
 
     #[test]

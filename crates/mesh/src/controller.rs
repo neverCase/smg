@@ -11,7 +11,7 @@ use std::{
 use anyhow::Result;
 use rand::seq::{IndexedRandom, SliceRandom};
 use tokio::sync::{mpsc, watch, Mutex};
-use tonic::transport::{ClientTlsConfig, Endpoint};
+use tonic::transport::Endpoint;
 use tracing as log;
 use tracing::{instrument, Instrument};
 
@@ -19,7 +19,7 @@ use super::{
     flow_control::RetryManager,
     mtls::MTLSManager,
     service::{
-        broadcast_node_states,
+        broadcast_node_states, configure_mtls_endpoint_for_peer,
         gossip::{
             gossip_client::GossipClient, gossip_message, stream_message::Payload as StreamPayload,
             NodeState, NodeStatus, Ping, PingReq, StateSync, StreamMessage, StreamMessageType,
@@ -455,6 +455,7 @@ impl MeshController {
                             vec![unreachable_node],
                             target_nodes,
                             None, // Use default timeout
+                            self.mtls_manager.clone(),
                         )
                         .await;
 
@@ -1242,18 +1243,14 @@ impl MeshController {
                 .host()
                 .map(str::to_owned)
                 .unwrap_or_else(|| peer_name.clone());
-            let ca_certificate = mtls_manager
-                .load_ca_certificate()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to load mTLS CA certificate: {e}"))?;
-
-            endpoint = endpoint
-                .tls_config(
-                    ClientTlsConfig::new()
-                        .domain_name(tls_domain)
-                        .ca_certificate(ca_certificate),
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to configure TLS endpoint: {e}"))?;
+            endpoint = configure_mtls_endpoint_for_peer(
+                endpoint,
+                mtls_manager,
+                &peer_name,
+                &peer_addr,
+                tls_domain,
+            )
+            .await?;
         }
 
         let channel = endpoint.connect().await.map_err(|e| {
