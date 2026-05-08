@@ -50,8 +50,9 @@ use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     cross_region::{
-        headers::REQUEST_MODE_HEADER, CrossRegionError, CrossRegionHeaders, SettledRequestContext,
-        UnresolvedRequestContext,
+        headers::REQUEST_MODE_HEADER, validate_settled_local_execution, AuthenticatedPeerIdentity,
+        CrossRegionError, CrossRegionHeaders, RegionPeer, RegionPeerRegistry,
+        SettledRequestContext, UnresolvedRequestContext,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -93,17 +94,37 @@ pub struct AppState {
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RequestListener {
     Local,
-    Forwarding,
+    Forwarding {
+        peer_identity: Option<AuthenticatedPeerIdentity>,
+    },
+}
+
+impl RequestListener {
+    /// Return true when this request arrived through the forwarding listener.
+    fn is_forwarding(&self) -> bool {
+        matches!(self, Self::Forwarding { .. })
+    }
+
+    /// Consume the listener context and return the authenticated forwarding peer.
+    fn into_forwarding_peer(self) -> Option<AuthenticatedPeerIdentity> {
+        match self {
+            Self::Local => None,
+            Self::Forwarding { peer_identity } => peer_identity,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InferenceRequestDispatch {
     Local,
     Unresolved(UnresolvedRequestContext),
-    Settled(SettledRequestContext),
+    Settled {
+        context: SettledRequestContext,
+        peer_identity: AuthenticatedPeerIdentity,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +169,7 @@ fn classify_inference_request(
     platform_max_retry: u32,
 ) -> Result<InferenceRequestDispatch, InferenceDispatchError> {
     if !headers.contains_key(REQUEST_MODE_HEADER) {
-        if listener == RequestListener::Forwarding {
+        if listener.is_forwarding() {
             return Err(InferenceDispatchError::new(
                 StatusCode::FORBIDDEN,
                 "forwarded inference requests must use SETTLED request mode",
@@ -159,7 +180,7 @@ fn classify_inference_request(
 
     match CrossRegionHeaders::parse(headers, platform_max_retry)? {
         CrossRegionHeaders::Unresolved(context) => {
-            if listener == RequestListener::Forwarding {
+            if listener.is_forwarding() {
                 return Err(InferenceDispatchError::new(
                     StatusCode::FORBIDDEN,
                     "forwarded inference requests must use SETTLED request mode",
@@ -168,15 +189,67 @@ fn classify_inference_request(
             Ok(InferenceRequestDispatch::Unresolved(context))
         }
         CrossRegionHeaders::Settled(context) => {
-            if listener != RequestListener::Forwarding {
+            if !listener.is_forwarding() {
                 return Err(InferenceDispatchError::new(
                     StatusCode::FORBIDDEN,
                     "SETTLED cross-region requests must arrive on the trusted request-forwarding listener",
                 ));
             }
-            Ok(InferenceRequestDispatch::Settled(context))
+            let peer_identity = listener.into_forwarding_peer().ok_or_else(|| {
+                InferenceDispatchError::new(
+                    StatusCode::FORBIDDEN,
+                    "SETTLED cross-region requests require authenticated forwarding peer identity",
+                )
+            })?;
+            Ok(InferenceRequestDispatch::Settled {
+                context,
+                peer_identity,
+            })
         }
     }
+}
+
+/// Return the configured local region id required for settled execution.
+fn local_cross_region_id(config: &RouterConfig) -> Result<&str, CrossRegionError> {
+    config
+        .cross_region
+        .region_id
+        .as_deref()
+        .filter(|region| !region.trim().is_empty())
+        .ok_or_else(|| CrossRegionError::InvalidConfig {
+            reason: "cross_region.region_id is required for settled execution".to_string(),
+        })
+}
+
+/// Build the inbound peer registry used to verify authenticated source regions.
+fn settled_peer_registry(config: &RouterConfig) -> Result<RegionPeerRegistry, CrossRegionError> {
+    let peers = config
+        .cross_region
+        .peers
+        .iter()
+        .map(RegionPeer::from_config)
+        .collect::<Result<Vec<_>, _>>()?;
+    RegionPeerRegistry::new(peers)
+}
+
+/// Validate settled request metadata before local router execution.
+fn validate_settled_dispatch(
+    state: &AppState,
+    context: &SettledRequestContext,
+    peer_identity: &AuthenticatedPeerIdentity,
+    request_model_id: &str,
+) -> Result<(), InferenceDispatchError> {
+    let router_config = &state.context.router_config;
+    let local_region_id = local_cross_region_id(router_config)?;
+    let peer_registry = settled_peer_registry(router_config)?;
+    validate_settled_local_execution(
+        context,
+        local_region_id,
+        peer_identity,
+        &peer_registry,
+        request_model_id,
+    )?;
+    Ok(())
 }
 
 async fn parse_function_call(
@@ -298,6 +371,7 @@ async fn v1_chat_completions(
 async fn v1_chat_completions_forwarded(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    peer_identity: Option<Extension<AuthenticatedPeerIdentity>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
@@ -306,7 +380,9 @@ async fn v1_chat_completions_forwarded(
         headers,
         tenant_meta,
         body,
-        RequestListener::Forwarding,
+        RequestListener::Forwarding {
+            peer_identity: peer_identity.map(|Extension(identity)| identity),
+        },
     )
     .await
 }
@@ -332,10 +408,20 @@ async fn route_chat_completion_for_listener(
                 .route_chat(Some(&headers), &tenant_meta, &body, &body.model)
                 .await
         }
-        Ok(InferenceRequestDispatch::Settled(context)) => {
+        Ok(InferenceRequestDispatch::Settled {
+            context,
+            peer_identity,
+        }) => {
+            if let Err(error) =
+                validate_settled_dispatch(&state, &context, &peer_identity, &body.model)
+            {
+                return error.into_response();
+            }
             debug!(
                 route_id = %context.route.route_id,
+                entry_region = %context.common.entry_region,
                 target_region = %context.route.target_region,
+                committed_model = %context.route.committed_model,
                 "executing settled cross-region chat request locally"
             );
             state
@@ -406,6 +492,7 @@ async fn v1_responses(
 async fn v1_responses_forwarded(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    peer_identity: Option<Extension<AuthenticatedPeerIdentity>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
@@ -414,7 +501,9 @@ async fn v1_responses_forwarded(
         headers,
         tenant_meta,
         body,
-        RequestListener::Forwarding,
+        RequestListener::Forwarding {
+            peer_identity: peer_identity.map(|Extension(identity)| identity),
+        },
     )
     .await
 }
@@ -440,10 +529,20 @@ async fn route_responses_for_listener(
                 .route_responses(Some(&headers), &tenant_meta, &body, &body.model)
                 .await
         }
-        Ok(InferenceRequestDispatch::Settled(context)) => {
+        Ok(InferenceRequestDispatch::Settled {
+            context,
+            peer_identity,
+        }) => {
+            if let Err(error) =
+                validate_settled_dispatch(&state, &context, &peer_identity, &body.model)
+            {
+                return error.into_response();
+            }
             debug!(
                 route_id = %context.route.route_id,
+                entry_region = %context.common.entry_region,
                 target_region = %context.route.target_region,
+                committed_model = %context.route.committed_model,
                 "executing settled cross-region responses request locally"
             );
             state
@@ -2080,11 +2179,12 @@ mod tests {
 
     use super::*;
     use crate::{
+        config::CrossRegionPeerConfig,
         cross_region::headers::{
-            ALLOWED_MODELS_HEADER, ALLOWED_REGIONS_HEADER, ATTEMPT_HEADER, CONTRACT_VERSION_HEADER,
-            ENTRY_REGION_HEADER, FAILOVER_MODE_HEADER, MAX_RETRY_HEADER, OPC_REQUEST_ID_HEADER,
-            REQUEST_MODE_HEADER, REQUEST_MODE_SETTLED, REQUEST_MODE_UNRESOLVED, ROUTE_ID_HEADER,
-            SOURCE_SERVICE_HEADER, TARGET_REGION_HEADER,
+            ALLOWED_MODELS_HEADER, ALLOWED_REGIONS_HEADER, ATTEMPT_HEADER, COMMITTED_MODEL_HEADER,
+            CONTRACT_VERSION_HEADER, ENTRY_REGION_HEADER, FAILOVER_MODE_HEADER, MAX_RETRY_HEADER,
+            OPC_REQUEST_ID_HEADER, REQUEST_MODE_HEADER, REQUEST_MODE_SETTLED,
+            REQUEST_MODE_UNRESOLVED, ROUTE_ID_HEADER, SOURCE_SERVICE_HEADER, TARGET_REGION_HEADER,
         },
         policies::PolicyRegistry,
         tenant::{canonical_tenant_key, TenantIdentity},
@@ -2156,6 +2256,14 @@ mod tests {
         router_config.cross_region.enabled = true;
         router_config.cross_region.region_id = Some("us-ashburn-1".to_string());
         router_config.cross_region.request_plane.enabled = true;
+        router_config.cross_region.peers = vec![CrossRegionPeerConfig {
+            region_id: Some("us-chicago-1".to_string()),
+            request_url: Some("https://smg-region-agent.us-chicago-1.internal:8443".to_string()),
+            sync_url: Some("https://smg-region-agent.us-chicago-1.internal:9443".to_string()),
+            realm: Some("oc1".to_string()),
+            environment: Some("prod".to_string()),
+            ..CrossRegionPeerConfig::default()
+        }];
         configure(&mut router_config);
 
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -2200,8 +2308,13 @@ mod tests {
 
     /// Build a minimal valid chat-completions request.
     fn chat_request() -> ChatCompletionRequest {
+        chat_request_for_model("cohere.command-r-plus")
+    }
+
+    /// Build a minimal chat-completions request for a specific model.
+    fn chat_request_for_model(model: &str) -> ChatCompletionRequest {
         serde_json::from_value(json!({
-            "model": "cohere.command-r-plus",
+            "model": model,
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .expect("chat request fixture should deserialize")
@@ -2209,8 +2322,13 @@ mod tests {
 
     /// Build a minimal valid responses request.
     fn responses_request() -> ResponsesRequest {
+        responses_request_for_model("cohere.command-r-plus")
+    }
+
+    /// Build a minimal responses request for a specific model.
+    fn responses_request_for_model(model: &str) -> ResponsesRequest {
         serde_json::from_value(json!({
-            "model": "cohere.command-r-plus",
+            "model": model,
             "input": "hello"
         }))
         .expect("responses request fixture should deserialize")
@@ -2219,6 +2337,31 @@ mod tests {
     /// Add a static header value.
     fn insert(headers: &mut HeaderMap, name: &'static str, value: &'static str) {
         headers.insert(name, HeaderValue::from_static(value));
+    }
+
+    /// Build an authenticated peer identity for forwarding-listener tests.
+    fn peer_identity(region_id: &str) -> AuthenticatedPeerIdentity {
+        AuthenticatedPeerIdentity::new(
+            region_id,
+            format!(
+                "spiffe://oraclecorp.com/oci/oc1/prod/region/{region_id}/service/smg-region-agent"
+            ),
+        )
+        .expect("peer identity should build")
+    }
+
+    /// Build a forwarding listener context with the configured source peer.
+    fn forwarding_listener() -> RequestListener {
+        RequestListener::Forwarding {
+            peer_identity: Some(peer_identity("us-chicago-1")),
+        }
+    }
+
+    /// Build a forwarding listener context without authenticated mTLS identity.
+    fn forwarding_listener_without_peer() -> RequestListener {
+        RequestListener::Forwarding {
+            peer_identity: None,
+        }
     }
 
     /// Build valid unresolved cross-region headers.
@@ -2245,10 +2388,15 @@ mod tests {
         let mut headers = HeaderMap::new();
         insert(&mut headers, CONTRACT_VERSION_HEADER, "1");
         insert(&mut headers, REQUEST_MODE_HEADER, REQUEST_MODE_SETTLED);
-        insert(&mut headers, ENTRY_REGION_HEADER, "us-ashburn-1");
+        insert(&mut headers, ENTRY_REGION_HEADER, "us-chicago-1");
         insert(&mut headers, SOURCE_SERVICE_HEADER, "smg");
         insert(&mut headers, OPC_REQUEST_ID_HEADER, "opc-request-1");
         insert(&mut headers, TARGET_REGION_HEADER, "us-ashburn-1");
+        insert(
+            &mut headers,
+            COMMITTED_MODEL_HEADER,
+            "cohere.command-r-plus",
+        );
         insert(&mut headers, ROUTE_ID_HEADER, "route-1");
         insert(&mut headers, ATTEMPT_HEADER, "1");
         headers
@@ -2292,8 +2440,8 @@ mod tests {
             Ok(InferenceRequestDispatch::Unresolved(_))
         ));
         assert!(matches!(
-            classify_inference_request(&settled_headers(), RequestListener::Forwarding, 5),
-            Ok(InferenceRequestDispatch::Settled(_))
+            classify_inference_request(&settled_headers(), forwarding_listener(), 5),
+            Ok(InferenceRequestDispatch::Settled { .. })
         ));
     }
 
@@ -2308,14 +2456,23 @@ mod tests {
     #[test]
     fn forwarding_listener_rejects_missing_and_unresolved_request_mode() {
         let missing_mode =
-            classify_inference_request(&HeaderMap::new(), RequestListener::Forwarding, 5)
+            classify_inference_request(&HeaderMap::new(), forwarding_listener_without_peer(), 5)
                 .expect_err("forwarding listener must require settled mode");
         let unresolved =
-            classify_inference_request(&unresolved_headers(), RequestListener::Forwarding, 5)
+            classify_inference_request(&unresolved_headers(), forwarding_listener(), 5)
                 .expect_err("forwarding listener must reject unresolved mode");
 
         assert_eq!(missing_mode.status(), StatusCode::FORBIDDEN);
         assert_eq!(unresolved.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn forwarding_listener_rejects_settled_without_authenticated_peer_identity() {
+        let error =
+            classify_inference_request(&settled_headers(), forwarding_listener_without_peer(), 5)
+                .expect_err("settled request should require authenticated peer identity");
+
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -2381,6 +2538,7 @@ mod tests {
         let response = v1_chat_completions_forwarded(
             State(state),
             settled_headers(),
+            Some(Extension(peer_identity("us-chicago-1"))),
             Extension(tenant_meta()),
             ValidatedJson(chat_request()),
         )
@@ -2392,6 +2550,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settled_chat_request_without_forwarding_identity_is_rejected_before_local_router() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router.clone());
+
+        let response = v1_chat_completions_forwarded(
+            State(state),
+            settled_headers(),
+            None,
+            Extension(tenant_meta()),
+            ValidatedJson(chat_request()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(router.chat_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn settled_chat_request_with_target_mismatch_is_rejected_before_local_router() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router.clone());
+        let mut headers = settled_headers();
+        insert(&mut headers, TARGET_REGION_HEADER, "us-phoenix-1");
+
+        let response = v1_chat_completions_forwarded(
+            State(state),
+            headers,
+            Some(Extension(peer_identity("us-chicago-1"))),
+            Extension(tenant_meta()),
+            ValidatedJson(chat_request()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(router.chat_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn settled_chat_request_with_peer_region_mismatch_is_rejected() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router.clone());
+
+        let response = v1_chat_completions_forwarded(
+            State(state),
+            settled_headers(),
+            Some(Extension(peer_identity("us-phoenix-1"))),
+            Extension(tenant_meta()),
+            ValidatedJson(chat_request()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(router.chat_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn settled_chat_request_delegates_model_supportability_to_local_router() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router.clone());
+        let mut headers = settled_headers();
+        insert(&mut headers, COMMITTED_MODEL_HEADER, "dynamic-model");
+
+        let response = v1_chat_completions_forwarded(
+            State(state),
+            headers,
+            Some(Extension(peer_identity("us-chicago-1"))),
+            Extension(tenant_meta()),
+            ValidatedJson(chat_request_for_model("dynamic-model")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(router.chat_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn settled_chat_request_with_model_mismatch_is_rejected() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router.clone());
+
+        let response = v1_chat_completions_forwarded(
+            State(state),
+            settled_headers(),
+            Some(Extension(peer_identity("us-chicago-1"))),
+            Extension(tenant_meta()),
+            ValidatedJson(chat_request_for_model("different-model")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(router.chat_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn missing_mode_chat_request_on_forwarding_listener_is_rejected() {
         let router = Arc::new(DispatchSpyRouter::default());
         let state = test_state(router.clone());
@@ -2399,6 +2651,7 @@ mod tests {
         let response = v1_chat_completions_forwarded(
             State(state),
             HeaderMap::new(),
+            None,
             Extension(tenant_meta()),
             ValidatedJson(chat_request()),
         )
@@ -2454,6 +2707,7 @@ mod tests {
         let response = v1_responses_forwarded(
             State(state),
             settled_headers(),
+            Some(Extension(peer_identity("us-chicago-1"))),
             Extension(tenant_meta()),
             ValidatedJson(responses_request()),
         )
@@ -2472,6 +2726,7 @@ mod tests {
         let response = v1_responses_forwarded(
             State(state),
             HeaderMap::new(),
+            None,
             Extension(tenant_meta()),
             ValidatedJson(responses_request()),
         )
@@ -2496,9 +2751,13 @@ mod tests {
             Vec::new(),
         )
         .expect("forwarding app should build");
+        let mut request = forwarded_responses_http_request(settled_headers());
+        request
+            .extensions_mut()
+            .insert(peer_identity("us-chicago-1"));
 
         let response = app
-            .oneshot(forwarded_responses_http_request(settled_headers()))
+            .oneshot(request)
             .await
             .expect("forwarded request should complete");
 
@@ -2509,5 +2768,28 @@ mod tests {
             router.response_storage_context_hits.load(Ordering::SeqCst),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn forwarding_app_rejects_settled_request_without_authenticated_peer_identity() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router.clone());
+        let app = build_request_forwarding_app(
+            state,
+            AuthConfig::new(None),
+            1024 * 1024,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("forwarding app should build");
+        let request = forwarded_responses_http_request(settled_headers());
+
+        let response = app
+            .oneshot(request)
+            .await
+            .expect("forwarded request should complete");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(router.responses_calls.load(Ordering::SeqCst), 0);
     }
 }

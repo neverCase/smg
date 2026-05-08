@@ -1,7 +1,7 @@
 //! Cross-region smart-router boundaries.
 //!
-//! This module is intentionally inert until the later request-plane and
-//! sync-plane tasks wire it into serving paths.
+//! Serving paths opt into these helpers as individual request-plane and
+//! sync-plane tasks are implemented.
 
 pub mod breaker;
 pub mod candidate_calculation;
@@ -11,6 +11,7 @@ pub mod headers;
 pub mod metrics;
 pub mod peers;
 pub mod profile;
+pub mod settled;
 pub mod signals;
 pub mod state;
 pub mod sync;
@@ -34,6 +35,7 @@ pub use metrics::{
 };
 pub use peers::{RegionPeer, RegionPeerRegistry};
 pub use profile::{FailoverPolicy, ModalityPolicy, RoutingProfileContext};
+pub use settled::{validate_settled_local_execution, AuthenticatedPeerIdentity};
 pub use signals::{
     ClientLatencySignal, SignalEnvelope, SignalKey, SmgReadinessSignal, WorkerHealthSignal,
     WorkerLoadSignal, SIGNAL_CONTRACT_VERSION,
@@ -67,6 +69,9 @@ pub enum CrossRegionError {
 
     #[error("forwarding target is invalid: {reason}")]
     InvalidForwardingTarget { reason: String },
+
+    #[error("cross-region peer identity is unauthorized: {reason}")]
+    UnauthorizedPeer { reason: String },
 
     #[error("no eligible cross-region candidate: {reason}")]
     NoCandidate { reason: String },

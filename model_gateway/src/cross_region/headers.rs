@@ -47,6 +47,9 @@ pub const OUTPUT_MODALITY_HEADER: &str = "x-output-modality";
 /// Header carrying the target region after a route has been committed.
 pub const TARGET_REGION_HEADER: &str = "x-target-region";
 
+/// Header carrying the single model id committed by the entry Region Agent.
+pub const COMMITTED_MODEL_HEADER: &str = "x-committed-model";
+
 /// Header carrying the committed route id.
 pub const ROUTE_ID_HEADER: &str = "x-route-id";
 
@@ -106,6 +109,7 @@ impl FromStr for RequestMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettledRouteMetadata {
     pub target_region: String,
+    pub committed_model: String,
     pub route_id: String,
     pub attempt: u32,
 }
@@ -171,6 +175,7 @@ impl CrossRegionHeaders {
                 common,
                 route: SettledRouteMetadata {
                     target_region: "unknown".to_string(),
+                    committed_model: "unknown".to_string(),
                     route_id: "unknown".to_string(),
                     attempt: 0,
                 },
@@ -234,6 +239,7 @@ impl CrossRegionError {
     pub fn http_status(&self) -> StatusCode {
         match self {
             Self::InvalidHeader { .. } | Self::InvalidProfile { .. } => StatusCode::BAD_REQUEST,
+            Self::UnauthorizedPeer { .. } => StatusCode::FORBIDDEN,
             Self::InvalidConfig { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::PeerNotFound { .. } | Self::InvalidPeer { .. } => StatusCode::BAD_GATEWAY,
             Self::PeerDisabled { .. }
@@ -350,6 +356,7 @@ fn parse_csv_header(headers: &HeaderMap, name: &'static str) -> CrossRegionResul
 /// Parse settled-only route metadata without requiring routing profile headers.
 fn parse_settled_metadata(headers: &HeaderMap) -> CrossRegionResult<SettledRouteMetadata> {
     let target_region = required_header(headers, TARGET_REGION_HEADER)?;
+    let committed_model = required_header(headers, COMMITTED_MODEL_HEADER)?;
     let route_id = required_header(headers, ROUTE_ID_HEADER)?;
     let attempt = required_header(headers, ATTEMPT_HEADER)?
         .parse::<u32>()
@@ -357,6 +364,7 @@ fn parse_settled_metadata(headers: &HeaderMap) -> CrossRegionResult<SettledRoute
 
     Ok(SettledRouteMetadata {
         target_region,
+        committed_model,
         route_id,
         attempt,
     })
@@ -364,7 +372,12 @@ fn parse_settled_metadata(headers: &HeaderMap) -> CrossRegionResult<SettledRoute
 
 /// Reject settled-only metadata on unresolved requests to avoid ambiguous routing state.
 fn reject_settled_headers_on_unresolved(headers: &HeaderMap) -> CrossRegionResult<()> {
-    for header in [TARGET_REGION_HEADER, ROUTE_ID_HEADER, ATTEMPT_HEADER] {
+    for header in [
+        TARGET_REGION_HEADER,
+        COMMITTED_MODEL_HEADER,
+        ROUTE_ID_HEADER,
+        ATTEMPT_HEADER,
+    ] {
         if headers.contains_key(header) {
             return Err(invalid_header(
                 header,
@@ -470,6 +483,11 @@ mod tests {
         insert(&mut headers, SOURCE_SERVICE_HEADER, "smg");
         insert(&mut headers, OPC_REQUEST_ID_HEADER, "opc-request-1");
         insert(&mut headers, TARGET_REGION_HEADER, "us-chicago-1");
+        insert(
+            &mut headers,
+            COMMITTED_MODEL_HEADER,
+            "cohere.command-r-plus",
+        );
         insert(&mut headers, ROUTE_ID_HEADER, "route-1");
         insert(&mut headers, ATTEMPT_HEADER, "1");
         headers
@@ -619,6 +637,7 @@ mod tests {
         assert_eq!(context.common.request_mode, RequestMode::Settled);
         assert_eq!(context.common.entry_region, "us-ashburn-1");
         assert_eq!(context.route.target_region, "us-chicago-1");
+        assert_eq!(context.route.committed_model, "cohere.command-r-plus");
         assert_eq!(context.route.attempt, 1);
     }
 
@@ -630,6 +649,16 @@ mod tests {
         let error = CrossRegionHeaders::parse(&headers, 3).expect_err("missing route id");
 
         assert!(error.to_string().contains(ROUTE_ID_HEADER));
+    }
+
+    #[test]
+    fn settled_missing_committed_model_is_rejected() {
+        let mut headers = settled_headers();
+        headers.remove(COMMITTED_MODEL_HEADER);
+
+        let error = CrossRegionHeaders::parse(&headers, 3).expect_err("missing committed model");
+
+        assert!(error.to_string().contains(COMMITTED_MODEL_HEADER));
     }
 
     #[test]
@@ -673,6 +702,13 @@ mod tests {
         assert!(unresolved.settled().is_none());
         assert_eq!(settled.request_mode(), RequestMode::Settled);
         assert!(settled.profile().is_none());
+        assert_eq!(
+            settled
+                .settled()
+                .expect("settled route metadata")
+                .committed_model,
+            "cohere.command-r-plus"
+        );
         assert_eq!(
             settled
                 .settled()
