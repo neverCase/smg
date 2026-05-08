@@ -31,6 +31,11 @@ impl CrossRegionBreaker {
         Self::default()
     }
 
+    /// Create a breaker facade with a fixed default state for every remote region.
+    pub fn with_default_state(default_state: BreakerState) -> Self {
+        Self { default_state }
+    }
+
     /// Return the current state for a region; the skeleton defaults to closed.
     pub fn state_for(&self, _region_id: &str) -> BreakerState {
         self.default_state

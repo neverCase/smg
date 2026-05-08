@@ -18,8 +18,9 @@ pub mod sync;
 
 pub use breaker::{BreakerState, CrossRegionBreaker};
 pub use candidate_calculation::{
-    CandidateCalculationInput, CandidateCalculator, ExecutionTarget, RegionCandidate,
-    RegionRouteDecision, RouteCommit,
+    CandidateCalculationInput, CandidateCalculationOutput, CandidateCalculator, CandidateRejection,
+    CandidateRejectionReason, ExecutionTarget, RegionCandidate, RegionRouteDecision, RouteCommit,
+    WorkerHealthSummary,
 };
 pub use config::{
     CrossRegionContext, CrossRegionMtlsRuntimeConfig, CrossRegionRuntimeConfig,
