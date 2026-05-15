@@ -832,13 +832,63 @@ async fn test_openai_router_chat_streaming_with_mock() {
 }
 
 /// Test circuit breaker functionality
+#[expect(clippy::disallowed_methods, reason = "test infrastructure")]
 #[tokio::test]
 async fn test_openai_router_circuit_breaker() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": {
+                            "message": "mock upstream failure",
+                            "type": "internal_error",
+                            "code": "internal_error"
+                        }
+                    })),
+                )
+            }),
+        )
+        .route(
+            "/v1/models",
+            post(|| async {
+                Json(json!({
+                    "object": "list",
+                    "data": [{
+                        "id": "gpt-3.5-turbo",
+                        "object": "model",
+                        "created": 1677610602,
+                        "owned_by": "openai"
+                    }]
+                }))
+            })
+            .get(|| async {
+                Json(json!({
+                    "object": "list",
+                    "data": [{
+                        "id": "gpt-3.5-turbo",
+                        "object": "model",
+                        "created": 1677610602,
+                        "owned_by": "openai"
+                    }]
+                }))
+            }),
+        );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base_url = format!("http://{addr}");
+
     let ctx = create_test_app_context().await;
-    register_external_worker(&ctx, "http://invalid-url-that-will-fail", None);
+    register_external_worker(&ctx, &base_url, None);
     let router = OpenAIRouter::new(&ctx).await.unwrap();
 
     let chat_request = create_minimal_chat_request();
+    let mut saw_circuit_breaker_rejection = false;
 
     // First few requests should fail and record failures
     for _ in 0..3 {
@@ -847,11 +897,18 @@ async fn test_openai_router_circuit_breaker() {
             .route_chat(None, &tenant_meta, &chat_request, &chat_request.model)
             .await;
         // Should get either an error or circuit breaker response
-        assert!(
-            response.status() == StatusCode::INTERNAL_SERVER_ERROR
-                || response.status() == StatusCode::SERVICE_UNAVAILABLE
-        );
+        match response.status() {
+            StatusCode::INTERNAL_SERVER_ERROR => {}
+            StatusCode::SERVICE_UNAVAILABLE => saw_circuit_breaker_rejection = true,
+            status => panic!("expected upstream 500 or circuit-breaker 503, got {status}"),
+        }
     }
+
+    assert!(
+        saw_circuit_breaker_rejection,
+        "expected circuit breaker to reject at least one request"
+    );
+    server.abort();
 }
 
 /// Test that /v1/models returns models from registered workers' ModelCards
