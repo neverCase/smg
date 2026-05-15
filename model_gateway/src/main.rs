@@ -733,17 +733,18 @@ struct CliArgs {
     )]
     cross_region_sync_plane_enabled: Option<bool>,
 
-    /// Private NLB signal-sync listener port.
-    #[arg(long, help_heading = "Cross-Region Smart Router")]
-    cross_region_sync_plane_listen_port: Option<u16>,
-
-    /// Full signal resync interval in seconds.
-    #[arg(long, help_heading = "Cross-Region Smart Router")]
-    cross_region_sync_plane_full_resync_interval_seconds: Option<u64>,
-
-    /// Remote signal stale-after interval in seconds.
+    /// Consumer-side signal freshness window in seconds. Replica signals
+    /// older than this are excluded from cross-region rankings.
     #[arg(long, help_heading = "Cross-Region Smart Router")]
     cross_region_sync_plane_signal_stale_after_seconds: Option<u64>,
+
+    /// This replica's identifier for cross-region signals (the `actor` stamped
+    /// on every published envelope and the trailing segment of per-replica
+    /// signal keys). Falls back to `--mesh-server-name` when unset and mesh is
+    /// enabled, otherwise an `smg-<random>` value is generated at boot.
+    /// Must match `[A-Za-z0-9._-]+` to be safe in key path segments.
+    #[arg(long, help_heading = "Cross-Region Smart Router")]
+    cross_region_server_name: Option<String>,
 
     /// Peer Region Agent mapping: region_id=...,request_url=https://host:8443,sync_url=https://host:9443,realm=...,environment=...
     #[arg(long = "cross-region-peer", action = ArgAction::Append, value_parser = parse_cross_region_peer, help_heading = "Cross-Region Smart Router")]
@@ -1008,10 +1009,16 @@ impl CliArgs {
     fn build_cross_region_config(&self) -> CrossRegionConfig {
         let request_plane_defaults = CrossRegionRequestPlaneConfig::default();
         let sync_plane_defaults = CrossRegionSyncPlaneConfig::default();
+        let server_name = if self.cross_region_enabled {
+            Some(self.resolve_cross_region_server_name())
+        } else {
+            self.cross_region_server_name.clone()
+        };
 
         CrossRegionConfig {
             enabled: self.cross_region_enabled,
             region_id: self.cross_region_region_id.clone(),
+            server_name,
             realm: self.cross_region_realm.clone(),
             environment: self.cross_region_environment.clone(),
             local_only_on_degraded_sync: self
@@ -1038,12 +1045,6 @@ impl CliArgs {
                 enabled: self
                     .cross_region_sync_plane_enabled
                     .unwrap_or(sync_plane_defaults.enabled),
-                listen_port: self
-                    .cross_region_sync_plane_listen_port
-                    .unwrap_or(sync_plane_defaults.listen_port),
-                full_resync_interval_seconds: self
-                    .cross_region_sync_plane_full_resync_interval_seconds
-                    .unwrap_or(sync_plane_defaults.full_resync_interval_seconds),
                 signal_stale_after_seconds: self
                     .cross_region_sync_plane_signal_stale_after_seconds
                     .unwrap_or(sync_plane_defaults.signal_stale_after_seconds),
@@ -1057,6 +1058,22 @@ impl CliArgs {
                 client_key_path: self.cross_region_mtls_client_key_path.clone(),
             },
         }
+    }
+
+    /// Resolve this replica's cross-region `server_name`. Resolution order:
+    /// explicit `--cross-region-server-name` → `--mesh-server-name` →
+    /// generated `smg-<random>` so a co-deployed mesh/cross-region pair shares
+    /// identity by default without forcing the operator to set both flags.
+    fn resolve_cross_region_server_name(&self) -> String {
+        if let Some(name) = &self.cross_region_server_name {
+            return name.to_string();
+        }
+        if let Some(name) = &self.mesh_server_name {
+            return name.to_string();
+        }
+        let mut rng = rand::rng();
+        let random_string: String = (0..4).map(|_| rng.sample(Alphanumeric) as char).collect();
+        format!("smg-{random_string}")
     }
 
     fn parse_mesh_socket_addr(
@@ -1932,10 +1949,6 @@ mod tests {
             "automatic",
             "--cross-region-request-plane-local-first-tie-break",
             "false",
-            "--cross-region-sync-plane-listen-port",
-            "19443",
-            "--cross-region-sync-plane-full-resync-interval-seconds",
-            "600",
             "--cross-region-sync-plane-signal-stale-after-seconds",
             "45",
             "--cross-region-peer",
@@ -1977,7 +1990,13 @@ mod tests {
                 .request_plane
                 .local_first_tie_break
         );
-        assert_eq!(router_config.cross_region.sync_plane.listen_port, 19443);
+        assert_eq!(
+            router_config
+                .cross_region
+                .sync_plane
+                .signal_stale_after_seconds,
+            45
+        );
         assert_eq!(router_config.cross_region.peers.len(), 1);
 
         let server_config = args

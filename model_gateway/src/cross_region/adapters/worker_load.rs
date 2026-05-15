@@ -1,10 +1,6 @@
 //! Worker-load adapter — emits `worker-load/{region}/{worker_id}/{server_name}`.
 //!
-//! Periodic reconcile (no event-driven path — load changes continuously). On
-//! each tick the adapter scans `WorkerRegistry::get_all_with_ids()` and
-//! publishes one `WorkerLoadSignal` per worker. v1 uses the existing
-//! `Worker::load()` atomic counter as the in-flight metric; the
-//! `WorkerLoadInfo.load` field carries it for compatibility with `/get_loads`.
+//! Periodic reconcile scans local workers and publishes current in-flight load.
 
 use std::sync::Arc;
 
@@ -17,8 +13,7 @@ use crate::{
     worker::{registry::WorkerId, Worker, WorkerRegistry},
 };
 
-/// Default freshness window (design §4): worker-load uses 15 s with a 5 s
-/// reconcile tick, so a quiescent worker stays fresh for two refresh cycles.
+/// Default freshness window: 15 s with a 5 s reconcile.
 pub const DEFAULT_WORKER_LOAD_STALE_AFTER_MS: u32 = 15_000;
 
 /// Worker-load producer.
@@ -41,8 +36,7 @@ impl WorkerLoadAdapter {
         self
     }
 
-    /// Publish current load for one worker. Public for adapters that want to
-    /// drive single-worker updates (e.g., threshold-triggered emits).
+    /// Publish current load for one worker.
     pub fn publish_for(
         &self,
         worker_id: &WorkerId,
@@ -83,8 +77,7 @@ impl WorkerLoadAdapter {
         )
     }
 
-    /// Republish load for every registered worker. Invoked by the gateway's
-    /// 5 s reconcile tick.
+    /// Republish load for every registered worker.
     pub fn reconcile(&self, registry: &WorkerRegistry) {
         for (worker_id, worker) in registry.get_all_with_ids() {
             if let Err(err) = self.publish_for(&worker_id, &worker) {
@@ -103,14 +96,10 @@ mod tests {
     use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
-
-    fn service() -> Arc<CrossRegionSyncService> {
-        Arc::new(
-            CrossRegionSyncService::new("us-ashburn-1".to_string(), "smg-router-a".to_string())
-                .expect("service constructs"),
-        )
-    }
+    use crate::{
+        cross_region::adapters::test_support::{live_envelopes, service, single_live},
+        worker::BasicWorkerBuilder,
+    };
 
     fn registry_with_load(url: &str, load: usize) -> (Arc<WorkerRegistry>, WorkerId) {
         let registry = Arc::new(WorkerRegistry::new());
@@ -138,9 +127,8 @@ mod tests {
             .publish_for(&worker_id, &worker)
             .expect("publish ok");
 
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 1);
-        match &entries[0].key {
+        let env = single_live(&svc);
+        match &env.key {
             SignalKey::WorkerLoad {
                 region_id,
                 worker_id: key_wid,
@@ -150,9 +138,9 @@ mod tests {
                 assert_eq!(key_wid, worker_id.as_str());
                 assert_eq!(server_name, "smg-router-a");
             }
-            _ => panic!("unexpected key: {:?}", entries[0].key),
+            _ => panic!("unexpected key: {:?}", env.key),
         }
-        match &entries[0].signal {
+        match env.signal {
             Some(SignalKind::WorkerLoad(s)) => {
                 assert_eq!(s.load.load, 7);
                 assert_eq!(s.load.worker_id.as_deref(), Some(worker_id.as_str()));
@@ -181,19 +169,16 @@ mod tests {
 
         adapter.reconcile(&registry);
 
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 3);
-        let loads: Vec<isize> = entries
+        let envelopes = live_envelopes(&svc);
+        assert_eq!(envelopes.len(), 3);
+        let mut loads: Vec<isize> = envelopes
             .iter()
             .filter_map(|e| match e.signal.as_ref()? {
                 SignalKind::WorkerLoad(s) => Some(s.load.load),
                 _ => None,
             })
             .collect();
-        // Each replica records its own counter — sums should equal the three
-        // loads we wired up (0, 1, 2), order-independent.
-        let mut sorted = loads.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, vec![0, 1, 2]);
+        loads.sort_unstable();
+        assert_eq!(loads, vec![0, 1, 2]);
     }
 }

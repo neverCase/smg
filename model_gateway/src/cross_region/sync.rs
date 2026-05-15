@@ -1,46 +1,28 @@
-//! Cross-region peer-to-peer signal sync service.
+//! Cross-region signal sync over mesh broadcast streams.
 //!
-//! Producer side: each adapter calls [`CrossRegionSyncService::publish_signal`]
-//! to append an envelope to the in-memory log. The pull endpoint (Phase 4)
-//! serves [`local_log_snapshot`] / [`local_log_delta`] over mTLS to peers.
-//!
-//! Consumer side: the per-peer poller calls [`apply_remote_envelopes`] to
-//! merge pulled envelopes into the materialized [`CrossRegionState`] and
-//! track observed peer-side max versions for restart-safe republication.
+//! Producers stage latest-wins envelopes. Mesh drains them once per gossip
+//! round and peers materialize them into `CrossRegionState`. Delivery is
+//! at-most-once, so producers re-emit and stale signals age out.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
+use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use smg_mesh::{DrainHandle, StreamDrainFn, StreamNamespace};
 
 use super::{
     ClientLatencySignal, CrossRegionError, CrossRegionResult, CrossRegionState, SignalEnvelope,
     SignalKey, SignalVersion, SmgReadinessSignal, WorkerHealthSignal, WorkerLoadSignal,
 };
 
-/// Opaque per-producer log cursor handed out to consumers. Monotonic, never
-/// reused; consumers pass the most recent value back via the pull endpoint's
-/// `since=` parameter.
-pub type Cursor = u64;
+/// Mesh stream prefix for cross-region signal envelopes.
+pub const CROSS_REGION_NAMESPACE_PREFIX: &str = "cross_region:";
 
-/// Returned by [`CrossRegionSyncService::local_log_delta`] when the requested
-/// cursor falls outside the retained log range. The pull endpoint maps this
-/// to a 409 so the consumer retries with no cursor for a full snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CursorStale;
-
-/// Body-erased signal payload. Adapters construct one of these per publish
-/// and hand it to [`CrossRegionSyncService::publish_signal`]. The wire format
-/// is tag-discriminated JSON via serde so the pull endpoint's untyped
-/// envelope stays self-describing.
+/// Typed signal payload carried by an envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-// PartialEq omitted because `WorkerLoadSignal` wraps `WorkerLoadInfo`, which
-// is not `PartialEq`. None of the producer-side logic compares envelopes by
-// equality; tests assert on individual fields.
+// `WorkerLoadSignal` is not `PartialEq`; tests assert fields directly.
 pub enum SignalKind {
     SmgReadiness(SmgReadinessSignal),
     WorkerHealth(WorkerHealthSignal),
@@ -48,48 +30,18 @@ pub enum SignalKind {
     ClientLatency(ClientLatencySignal),
 }
 
-/// Defaults for log retention. These are the producer-side limits;
-/// the consumer-side `CrossRegionState` will get matching freshness gates
-/// when the pull-protocol consumer is wired up.
-#[derive(Debug, Clone, Copy)]
-pub struct SyncRetention {
-    /// Keep `removed: true` entries in the log this long so a peer recovering
-    /// from a partition shorter than this still observes the deletion. Must
-    /// exceed `max_tolerated_partition + max_clock_skew` (design §2b).
-    pub tombstone_retention_ms: i64,
-    /// Keep stale per-replica live entries this long. After this, a dead
-    /// replica's keys are GC'd locally.
-    pub dead_replica_retention_ms: i64,
-}
-
-impl Default for SyncRetention {
-    fn default() -> Self {
-        Self {
-            // 24h — sized for typical multi-region operational outage budget.
-            tombstone_retention_ms: 24 * 60 * 60 * 1_000,
-            // 6h — covers routine replica churn.
-            dead_replica_retention_ms: 6 * 60 * 60 * 1_000,
-        }
-    }
-}
-
-/// Cross-region signal sync service.
-///
-/// Owns the producer's append-only log and the consumer's materialized state.
-/// `region_id` and `server_name` are stamped onto every published envelope as
-/// the key's region/replica segments and the envelope's actor field.
+/// Local producer state plus remote materialized state.
 pub struct CrossRegionSyncService {
     region_id: String,
     server_name: String,
     state: Arc<RwLock<CrossRegionState>>,
-    log: Arc<RwLock<SignalLog>>,
-    /// Per-key max version observed from peers' caches for keys this replica
-    /// writes. Populated by [`apply_remote_envelopes`] when a pulled envelope
-    /// carries our own `actor`. Used by [`publish_signal`] so a restarted
-    /// producer can compute a `version` that exceeds whatever peers retained
-    /// from before the restart (design §2c).
-    observed_remote_max: Arc<RwLock<HashMap<SignalKey, u64>>>,
-    retention: SyncRetention,
+    namespace: Arc<StreamNamespace>,
+    /// Encoded envelopes waiting for the next mesh drain; latest wins per key.
+    outbox: Arc<RwLock<HashMap<SignalKey, Bytes>>>,
+    /// Per-key local version floor for envelope metadata.
+    latest_per_key: Arc<RwLock<HashMap<SignalKey, u64>>>,
+    /// Keeps the mesh drain callback registered.
+    _drain_handle: DrainHandle,
 }
 
 impl std::fmt::Debug for CrossRegionSyncService {
@@ -97,61 +49,54 @@ impl std::fmt::Debug for CrossRegionSyncService {
         f.debug_struct("CrossRegionSyncService")
             .field("region_id", &self.region_id)
             .field("server_name", &self.server_name)
-            .field("retention", &self.retention)
+            .field("namespace", &self.namespace.prefix())
             .finish_non_exhaustive()
     }
 }
 
 impl CrossRegionSyncService {
-    /// Build a sync service rooted at this replica's identity. Validates
-    /// `server_name` charset (design §2c step 4) so a `/` in the name can
-    /// never reach a key segment and break parsing.
-    pub fn new(region_id: String, server_name: String) -> CrossRegionResult<Self> {
-        Self::new_with_retention(region_id, server_name, SyncRetention::default())
-    }
-
-    /// Variant that lets tests / config plumb custom retention windows.
-    pub fn new_with_retention(
+    /// Build a sync service and register its mesh drain callback.
+    pub fn new(
         region_id: String,
         server_name: String,
-        retention: SyncRetention,
+        namespace: Arc<StreamNamespace>,
     ) -> CrossRegionResult<Self> {
         validate_identity_segment("region_id", &region_id)?;
         validate_identity_segment("server_name", &server_name)?;
+        let outbox: Arc<RwLock<HashMap<SignalKey, Bytes>>> = Arc::new(RwLock::new(HashMap::new()));
+        let drain_handle = namespace.register_drain(build_drain_callback(outbox.clone()));
         Ok(Self {
             region_id,
             server_name,
             state: Arc::new(RwLock::new(CrossRegionState::new())),
-            log: Arc::new(RwLock::new(SignalLog::new())),
-            observed_remote_max: Arc::new(RwLock::new(HashMap::new())),
-            retention,
+            namespace,
+            outbox,
+            latest_per_key: Arc::new(RwLock::new(HashMap::new())),
+            _drain_handle: drain_handle,
         })
     }
 
-    /// This replica's region (the value adapters must put in the key's
-    /// `region`/`client_region` segment).
+    /// This replica's region.
     pub fn region_id(&self) -> &str {
         &self.region_id
     }
 
-    /// This replica's `server_name` (the value adapters must put in the
-    /// key's trailing segment and what every envelope's `actor` carries).
+    /// This replica's `server_name` (stamped as every envelope's `actor`).
     pub fn server_name(&self) -> &str {
         &self.server_name
     }
 
-    /// Shared materialized state. Consumers (candidate calculation, the
-    /// `/get_loads` projection) read through this Arc. Wrapped in `RwLock`
-    /// because [`apply_remote_envelopes`] writes from a polling task.
+    /// Shared materialized state for routing/projection consumers.
     pub fn state(&self) -> Arc<RwLock<CrossRegionState>> {
         self.state.clone()
     }
 
-    /// Publish a live signal. The service computes a wall-clock-anchored
-    /// version (§2c), stamps the local `actor`, validates the key's
-    /// region/server_name segments against this replica's identity, and
-    /// appends the envelope to the log. Echoes into local state so adapters
-    /// see a consistent self-view.
+    /// Mesh stream namespace used by the runtime subscriber.
+    pub fn namespace(&self) -> Arc<StreamNamespace> {
+        self.namespace.clone()
+    }
+
+    /// Stage a live signal for broadcast and mirror it into local state.
     pub fn publish_signal(
         &self,
         key: SignalKey,
@@ -160,84 +105,31 @@ impl CrossRegionSyncService {
     ) -> CrossRegionResult<()> {
         self.validate_key(&key)?;
         validate_body_against_key(&key, &signal)?;
-        let envelope = self.build_envelope(key, Some(signal), stale_after_ms, false);
-        self.append_and_mirror(envelope);
+        let envelope = self.build_envelope(key.clone(), Some(signal), stale_after_ms, false);
+        let bytes = encode_envelope(&envelope)?;
+        self.outbox.write().insert(key, bytes);
+        apply_envelope_to_state(&mut self.state.write(), &envelope);
         Ok(())
     }
 
-    /// Publish a tombstone for a key. The signal body becomes `None`,
-    /// `stale_after_ms = 0`, and `removed = true`. Versioning is identical
-    /// to [`publish_signal`] so a tombstone post-restart still outranks any
-    /// live entry peers retained.
+    /// Remove a local signal. Peers drop stale copies by freshness/GC.
     pub fn remove_signal(&self, key: SignalKey) -> CrossRegionResult<()> {
         self.validate_key(&key)?;
+        self.outbox.write().remove(&key);
+        // Preserve local version ordering for the self-view.
         let envelope = self.build_envelope(key, None, 0, true);
-        self.append_and_mirror(envelope);
+        apply_envelope_to_state(&mut self.state.write(), &envelope);
         Ok(())
     }
 
-    /// Serve a full snapshot of the local log. Returns the high-water cursor
-    /// (= highest cursor present, or 0 if the log is empty) so the caller can
-    /// fetch deltas with [`local_log_delta`] afterwards.
-    pub fn local_log_snapshot(&self) -> (Vec<SignalEnvelope<SignalKind>>, Cursor) {
-        let log = self.log.read();
-        let entries = log
-            .entries
-            .iter()
-            .map(|(_, env)| env.clone())
-            .collect::<Vec<_>>();
-        (entries, log.high_water())
-    }
-
-    /// Serve a cursor delta. Returns every envelope with cursor strictly
-    /// greater than `since` plus the new high-water mark. `Err(CursorStale)`
-    /// indicates the caller's cursor is older than the retained log range;
-    /// the pull endpoint maps this to HTTP 409 and the client retries with
-    /// no cursor.
-    pub fn local_log_delta(
-        &self,
-        since: Cursor,
-    ) -> Result<(Vec<SignalEnvelope<SignalKind>>, Cursor), CursorStale> {
-        let log = self.log.read();
-        if let Some((oldest, _)) = log.entries.front() {
-            // The caller's cursor is stale iff the oldest retained cursor
-            // is *strictly greater than* `since + 1` — that means we'd
-            // miss at least one entry between (since, oldest).
-            if *oldest > since.saturating_add(1) {
-                return Err(CursorStale);
-            }
-        }
-        let entries = log
-            .entries
-            .iter()
-            .filter_map(|(c, env)| if *c > since { Some(env.clone()) } else { None })
-            .collect::<Vec<_>>();
-        Ok((entries, log.high_water()))
-    }
-
-    /// Apply envelopes pulled from a peer. Updates `CrossRegionState` for
-    /// each typed signal and records the observed max version for any
-    /// envelope whose actor matches this replica (so a restarted producer
-    /// can compute a version that exceeds peer-cached pre-restart writes).
-    pub fn apply_remote_envelopes(&self, _peer: &str, envelopes: &[SignalEnvelope<SignalKind>]) {
-        let mut state = self.state.write();
-        let mut observed = self.observed_remote_max.write();
-        for env in envelopes {
-            if env.actor == self.server_name {
-                let entry = observed.entry(env.key.clone()).or_insert(0);
-                if env.version > *entry {
-                    *entry = env.version;
-                }
-            }
-            apply_envelope_to_state(&mut state, env);
-        }
-    }
-
-    /// Drop log entries whose age exceeds the retention bounds. Run by a
-    /// periodic task in production; exposed here so tests and the pull
-    /// endpoint can trigger it deterministically.
-    pub fn gc_log(&self, now_ms: i64) {
-        self.log.write().gc(now_ms, &self.retention);
+    /// Test/diagnostic snapshot of staged envelopes.
+    #[doc(hidden)]
+    pub fn outbox_snapshot(&self) -> Vec<SignalEnvelope<SignalKind>> {
+        let outbox = self.outbox.read();
+        outbox
+            .values()
+            .filter_map(|bytes| serde_json::from_slice(bytes).ok())
+            .collect()
     }
 
     // ---- internals ----
@@ -272,24 +164,10 @@ impl CrossRegionSyncService {
         removed: bool,
     ) -> SignalEnvelope<SignalKind> {
         let now = now_ms();
-        let prev = self
-            .log
-            .read()
-            .latest_per_key
-            .get(&key)
-            .copied()
-            .unwrap_or(0);
-        let observed = self
-            .observed_remote_max
-            .read()
-            .get(&key)
-            .copied()
-            .unwrap_or(0);
-        // Wall-clock-anchored, multi-writer-safe version (design §2c).
+        let prev = self.latest_per_key.read().get(&key).copied().unwrap_or(0);
         let now_u64 = u64::try_from(now.max(0)).unwrap_or(0);
-        let version = now_u64
-            .max(prev.saturating_add(1))
-            .max(observed.saturating_add(1));
+        let version = now_u64.max(prev.saturating_add(1));
+        self.latest_per_key.write().insert(key.clone(), version);
         SignalEnvelope {
             key,
             version,
@@ -300,56 +178,117 @@ impl CrossRegionSyncService {
             signal,
         }
     }
+}
 
-    fn append_and_mirror(&self, envelope: SignalEnvelope<SignalKind>) {
-        // Append to log first (so any reader sees a consistent log+state).
-        self.log.write().append(envelope.clone());
-        // Mirror envelopes into state for the producer's self-view.
-        apply_envelope_to_state(&mut self.state.write(), &envelope);
+/// Mesh wire key for a signal envelope.
+pub fn mesh_path(key: &SignalKey) -> String {
+    format!("{}{}", CROSS_REGION_NAMESPACE_PREFIX, key.as_path())
+}
+
+fn encode_envelope(envelope: &SignalEnvelope<SignalKind>) -> CrossRegionResult<Bytes> {
+    serde_json::to_vec(envelope)
+        .map(Bytes::from)
+        .map_err(|e| CrossRegionError::InvalidConfig {
+            reason: format!("failed to encode signal envelope: {e}"),
+        })
+}
+
+/// Drain staged envelopes into mesh's per-round stream batch.
+fn build_drain_callback(outbox: Arc<RwLock<HashMap<SignalKey, Bytes>>>) -> StreamDrainFn {
+    Box::new(move || {
+        let mut staged = outbox.write();
+        let mut out = Vec::with_capacity(staged.len());
+        for (key, bytes) in staged.drain() {
+            out.push((mesh_path(&key), bytes));
+        }
+        out
+    })
+}
+
+/// Apply one decoded envelope to materialized state.
+pub fn apply_envelope_to_state(
+    state: &mut CrossRegionState,
+    envelope: &SignalEnvelope<SignalKind>,
+) {
+    let version = SignalVersion {
+        version: envelope.version,
+        actor: envelope.actor.clone(),
+        updated_at_ms: envelope.generated_at_ms,
+    };
+    if envelope.removed {
+        state.remove_key_with_version(&envelope.key, &version);
+        return;
+    }
+    match envelope.signal.as_ref() {
+        Some(SignalKind::SmgReadiness(s)) => state.upsert_readiness(s.clone(), version),
+        Some(SignalKind::WorkerHealth(s)) => state.upsert_worker_health(s.clone(), version),
+        Some(SignalKind::WorkerLoad(s)) => state.upsert_worker_load(s.as_ref().clone(), version),
+        Some(SignalKind::ClientLatency(s)) => state.upsert_client_latency(s.clone(), version),
+        None => {}
     }
 }
 
-/// Validate that a body's region/worker/server_name fields agree with the key.
-/// Adapters should construct bodies consistently, but defense-in-depth keys
-/// this from accidentally diverging.
-fn validate_body_against_key(key: &SignalKey, signal: &SignalKind) -> CrossRegionResult<()> {
-    let mismatch = |field: &str, key_val: &str, body_val: &str| CrossRegionError::InvalidConfig {
-        reason: format!("signal body {field} {body_val:?} does not match key {field} {key_val:?}",),
+/// Validate envelope invariants on the subscriber decode path.
+pub fn validate_remote_envelope(envelope: &SignalEnvelope<SignalKind>) -> CrossRegionResult<()> {
+    if envelope.actor != envelope.key.server_name_segment() {
+        return Err(CrossRegionError::InvalidConfig {
+            reason: format!(
+                "remote envelope actor {:?} does not match key server_name {:?}",
+                envelope.actor,
+                envelope.key.server_name_segment(),
+            ),
+        });
+    }
+    match (envelope.removed, envelope.signal.as_ref()) {
+        (true, None) => Ok(()),
+        (true, Some(_)) => Err(CrossRegionError::InvalidConfig {
+            reason: "removed signal envelope must not carry a signal body".to_string(),
+        }),
+        (false, Some(signal)) => validate_body_against_key(&envelope.key, signal),
+        (false, None) => Err(CrossRegionError::InvalidConfig {
+            reason: "live signal envelope must carry a signal body".to_string(),
+        }),
+    }
+}
+
+/// Decode a subscriber-delivered byte payload into an envelope.
+pub fn decode_envelope(chunks: &[Bytes]) -> CrossRegionResult<SignalEnvelope<SignalKind>> {
+    let envelope: SignalEnvelope<SignalKind> = if chunks.len() == 1 {
+        serde_json::from_slice(&chunks[0]).map_err(|e| CrossRegionError::InvalidConfig {
+            reason: format!("failed to decode signal envelope: {e}"),
+        })?
+    } else {
+        let mut buf = Vec::with_capacity(chunks.iter().map(|c| c.len()).sum());
+        for chunk in chunks {
+            buf.extend_from_slice(chunk);
+        }
+        serde_json::from_slice(&buf).map_err(|e| CrossRegionError::InvalidConfig {
+            reason: format!("failed to decode signal envelope: {e}"),
+        })?
     };
-    match (key, signal) {
+    validate_remote_envelope(&envelope)?;
+    Ok(envelope)
+}
+
+/// Validate that body fields agree with key segments.
+fn validate_body_against_key(key: &SignalKey, signal: &SignalKind) -> CrossRegionResult<()> {
+    let matches = match (key, signal) {
         (
             SignalKey::SmgReadiness {
                 region_id,
                 server_name,
             },
-            SignalKind::SmgReadiness(body),
-        ) => {
-            if &body.region_id != region_id {
-                return Err(mismatch("region_id", region_id, &body.region_id));
-            }
-            if &body.server_name != server_name {
-                return Err(mismatch("server_name", server_name, &body.server_name));
-            }
-            Ok(())
-        }
+            SignalKind::SmgReadiness(s),
+        ) => s.region_id == *region_id && s.server_name == *server_name,
         (
             SignalKey::WorkerHealth {
                 region_id,
                 worker_id,
                 server_name,
             },
-            SignalKind::WorkerHealth(body),
+            SignalKind::WorkerHealth(s),
         ) => {
-            if &body.region_id != region_id {
-                return Err(mismatch("region_id", region_id, &body.region_id));
-            }
-            if &body.worker_id != worker_id {
-                return Err(mismatch("worker_id", worker_id, &body.worker_id));
-            }
-            if &body.server_name != server_name {
-                return Err(mismatch("server_name", server_name, &body.server_name));
-            }
-            Ok(())
+            s.region_id == *region_id && s.worker_id == *worker_id && s.server_name == *server_name
         }
         (
             SignalKey::WorkerLoad {
@@ -357,18 +296,9 @@ fn validate_body_against_key(key: &SignalKey, signal: &SignalKind) -> CrossRegio
                 worker_id,
                 server_name,
             },
-            SignalKind::WorkerLoad(body),
+            SignalKind::WorkerLoad(s),
         ) => {
-            if &body.region_id != region_id {
-                return Err(mismatch("region_id", region_id, &body.region_id));
-            }
-            if &body.worker_id != worker_id {
-                return Err(mismatch("worker_id", worker_id, &body.worker_id));
-            }
-            if &body.server_name != server_name {
-                return Err(mismatch("server_name", server_name, &body.server_name));
-            }
-            Ok(())
+            s.region_id == *region_id && s.worker_id == *worker_id && s.server_name == *server_name
         }
         (
             SignalKey::ClientLatency {
@@ -376,30 +306,20 @@ fn validate_body_against_key(key: &SignalKey, signal: &SignalKind) -> CrossRegio
                 target_region,
                 server_name,
             },
-            SignalKind::ClientLatency(body),
+            SignalKind::ClientLatency(s),
         ) => {
-            if &body.client_region != client_region {
-                return Err(mismatch(
-                    "client_region",
-                    client_region,
-                    &body.client_region,
-                ));
-            }
-            if &body.target_region != target_region {
-                return Err(mismatch(
-                    "target_region",
-                    target_region,
-                    &body.target_region,
-                ));
-            }
-            if &body.server_name != server_name {
-                return Err(mismatch("server_name", server_name, &body.server_name));
-            }
-            Ok(())
+            s.client_region == *client_region
+                && s.target_region == *target_region
+                && s.server_name == *server_name
         }
-        _ => Err(CrossRegionError::InvalidConfig {
-            reason: "signal body kind does not match key kind".to_string(),
-        }),
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(CrossRegionError::InvalidConfig {
+            reason: "signal body fields must match the envelope key segments".to_string(),
+        })
     }
 }
 
@@ -422,24 +342,6 @@ fn validate_identity_segment(field: &str, value: &str) -> CrossRegionResult<()> 
     Ok(())
 }
 
-fn apply_envelope_to_state(state: &mut CrossRegionState, envelope: &SignalEnvelope<SignalKind>) {
-    if envelope.removed {
-        state.remove_key(&envelope.key);
-        return;
-    }
-    let version = SignalVersion {
-        version: envelope.version,
-        updated_at_ms: envelope.generated_at_ms,
-    };
-    match envelope.signal.as_ref() {
-        Some(SignalKind::SmgReadiness(s)) => state.upsert_readiness(s.clone(), version),
-        Some(SignalKind::WorkerHealth(s)) => state.upsert_worker_health(s.clone(), version),
-        Some(SignalKind::WorkerLoad(s)) => state.upsert_worker_load(s.as_ref().clone(), version),
-        Some(SignalKind::ClientLatency(s)) => state.upsert_client_latency(s.clone(), version),
-        None => {}
-    }
-}
-
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -448,61 +350,10 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-#[derive(Debug)]
-struct SignalLog {
-    entries: VecDeque<(Cursor, SignalEnvelope<SignalKind>)>,
-    /// Next cursor to hand out. Starts at 1 so 0 is reserved for
-    /// "no cursor — give me a full snapshot".
-    next_cursor: Cursor,
-    /// Per-key max version seen by the local writer, used to compute the
-    /// next version without scanning `entries`.
-    latest_per_key: HashMap<SignalKey, u64>,
-}
-
-impl SignalLog {
-    fn new() -> Self {
-        Self {
-            entries: VecDeque::new(),
-            next_cursor: 1,
-            latest_per_key: HashMap::new(),
-        }
-    }
-
-    fn append(&mut self, env: SignalEnvelope<SignalKind>) {
-        let cursor = self.next_cursor;
-        self.next_cursor = self.next_cursor.saturating_add(1);
-        let key = env.key.clone();
-        let version = env.version;
-        self.entries.push_back((cursor, env));
-        let entry = self.latest_per_key.entry(key).or_insert(0);
-        if version > *entry {
-            *entry = version;
-        }
-    }
-
-    /// High-water cursor — the largest cursor present in the log, or 0 if
-    /// empty. Returned by `local_log_snapshot` / `local_log_delta` and
-    /// passed back as the consumer's next `since=` value.
-    fn high_water(&self) -> Cursor {
-        self.next_cursor.saturating_sub(1)
-    }
-
-    fn gc(&mut self, now_ms: i64, retention: &SyncRetention) {
-        self.entries.retain(|(_, env)| {
-            let age = now_ms.saturating_sub(env.generated_at_ms);
-            let limit = if env.removed {
-                retention.tombstone_retention_ms
-            } else {
-                retention.dead_replica_retention_ms
-            };
-            age <= limit
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::WorkerStatus;
+    use smg_mesh::{MeshKV, StreamConfig, StreamRouting};
 
     use super::*;
 
@@ -510,7 +361,15 @@ mod tests {
     const SERVER: &str = "smg-router-a";
 
     fn service() -> CrossRegionSyncService {
-        CrossRegionSyncService::new(REGION.to_string(), SERVER.to_string())
+        let mesh_kv = Arc::new(MeshKV::new(SERVER.to_string()));
+        let ns = mesh_kv.configure_stream_prefix(
+            CROSS_REGION_NAMESPACE_PREFIX,
+            StreamConfig {
+                max_buffer_bytes: 16 * 1024 * 1024,
+                routing: StreamRouting::Broadcast,
+            },
+        );
+        CrossRegionSyncService::new(REGION.to_string(), SERVER.to_string(), ns)
             .expect("service should construct")
     }
 
@@ -529,58 +388,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn new_rejects_invalid_server_name() {
-        let err = CrossRegionSyncService::new(REGION.to_string(), "smg/router".to_string())
-            .expect_err("slash in server_name must be rejected");
-        assert!(matches!(err, CrossRegionError::InvalidConfig { .. }));
+    fn make_namespace() -> Arc<StreamNamespace> {
+        let mesh_kv = Arc::new(MeshKV::new(SERVER.to_string()));
+        mesh_kv.configure_stream_prefix(
+            CROSS_REGION_NAMESPACE_PREFIX,
+            StreamConfig {
+                max_buffer_bytes: 16 * 1024 * 1024,
+                routing: StreamRouting::Broadcast,
+            },
+        )
     }
 
     #[test]
     fn new_rejects_empty_region_id() {
-        let err = CrossRegionSyncService::new(String::new(), SERVER.to_string())
+        let err = CrossRegionSyncService::new(String::new(), SERVER.to_string(), make_namespace())
             .expect_err("empty region_id must be rejected");
         assert!(matches!(err, CrossRegionError::InvalidConfig { .. }));
     }
 
     #[test]
-    fn publish_signal_assigns_actor_and_increasing_version() {
-        let svc = service();
-        svc.publish_signal(
-            readiness_key(),
-            SignalKind::SmgReadiness(readiness_body()),
-            30_000,
+    fn new_rejects_invalid_server_name() {
+        let err = CrossRegionSyncService::new(
+            REGION.to_string(),
+            "smg/router".to_string(),
+            make_namespace(),
         )
-        .expect("first publish should succeed");
-
-        let (entries, cursor_after_first) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 1);
-        let first = &entries[0];
-        assert_eq!(first.actor, SERVER);
-        assert!(first.version > 0);
-        assert_eq!(first.stale_after_ms, 30_000);
-        assert!(!first.removed);
-        assert!(matches!(first.signal, Some(SignalKind::SmgReadiness(_))));
-
-        svc.publish_signal(
-            readiness_key(),
-            SignalKind::SmgReadiness(readiness_body()),
-            30_000,
-        )
-        .expect("second publish should succeed");
-        let (entries, cursor_after_second) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 2);
-        assert!(
-            entries[1].version > entries[0].version,
-            "second publish must outrank first: {} <= {}",
-            entries[1].version,
-            entries[0].version,
-        );
-        assert!(cursor_after_second > cursor_after_first);
+        .expect_err("invalid server_name must be rejected");
+        assert!(matches!(err, CrossRegionError::InvalidConfig { .. }));
     }
 
     #[test]
-    fn remove_signal_emits_tombstone_with_higher_version() {
+    fn publish_stages_envelope_in_outbox_and_mirrors_state() {
         let svc = service();
         svc.publish_signal(
             readiness_key(),
@@ -588,22 +426,50 @@ mod tests {
             30_000,
         )
         .unwrap();
-        svc.remove_signal(readiness_key()).expect("remove ok");
 
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 2);
-        let tombstone = &entries[1];
-        assert!(tombstone.removed);
-        assert_eq!(tombstone.stale_after_ms, 0);
-        assert!(tombstone.signal.is_none());
-        assert!(tombstone.version > entries[0].version);
+        let staged = svc.outbox_snapshot();
+        assert_eq!(staged.len(), 1);
+        let envelope = &staged[0];
+        assert_eq!(envelope.actor, SERVER);
+        assert!(matches!(
+            envelope.signal,
+            Some(SignalKind::SmgReadiness(ref s)) if s.ready
+        ));
 
         let state = svc.state();
         let state = state.read();
         assert!(
-            state.readiness(REGION).is_none(),
-            "tombstone should remove the materialized value immediately"
+            state
+                .readiness_replica(REGION, SERVER)
+                .expect("present")
+                .ready
         );
+    }
+
+    #[test]
+    fn publish_signal_version_is_monotone_per_key() {
+        let svc = service();
+        svc.publish_signal(
+            readiness_key(),
+            SignalKind::SmgReadiness(readiness_body()),
+            30_000,
+        )
+        .unwrap();
+        let first_version = svc.outbox_snapshot()[0].version;
+
+        svc.publish_signal(
+            readiness_key(),
+            SignalKind::SmgReadiness(SmgReadinessSignal {
+                ready: false,
+                ..readiness_body()
+            }),
+            30_000,
+        )
+        .unwrap();
+        let second = &svc.outbox_snapshot()[0];
+        assert!(second.version > first_version);
+        // Same key collapses to a single outbox entry (latest wins).
+        assert_eq!(svc.outbox_snapshot().len(), 1);
     }
 
     #[test]
@@ -629,11 +495,11 @@ mod tests {
         let svc = service();
         let key = SignalKey::SmgReadiness {
             region_id: REGION.to_string(),
-            server_name: "smg-router-evil".to_string(),
+            server_name: "other-server".to_string(),
         };
         let body = SmgReadinessSignal {
             region_id: REGION.to_string(),
-            server_name: "smg-router-evil".to_string(),
+            server_name: "other-server".to_string(),
             ready: true,
         };
         let err = svc
@@ -645,210 +511,106 @@ mod tests {
     #[test]
     fn publish_rejects_body_field_mismatching_key() {
         let svc = service();
-        let key = readiness_key();
-        // Key says SERVER but body claims something else — must fail.
         let body = SmgReadinessSignal {
-            region_id: REGION.to_string(),
-            server_name: "rogue".to_string(),
+            region_id: "wrong-region".to_string(),
+            server_name: SERVER.to_string(),
             ready: true,
         };
         let err = svc
-            .publish_signal(key, SignalKind::SmgReadiness(body), 30_000)
-            .expect_err("body/key server_name mismatch must be rejected");
+            .publish_signal(readiness_key(), SignalKind::SmgReadiness(body), 30_000)
+            .expect_err("body/key mismatch must be rejected");
         assert!(matches!(err, CrossRegionError::InvalidConfig { .. }));
     }
 
     #[test]
-    fn worker_health_key_and_body_round_trip() {
+    fn remove_signal_drops_outbox_entry_and_local_state() {
         let svc = service();
-        let key = SignalKey::WorkerHealth {
-            region_id: REGION.to_string(),
-            worker_id: "w-1".to_string(),
-            server_name: SERVER.to_string(),
-        };
-        let body = WorkerHealthSignal {
-            region_id: REGION.to_string(),
-            worker_id: "w-1".to_string(),
-            server_name: SERVER.to_string(),
-            status: WorkerStatus::Ready,
-        };
-        svc.publish_signal(key, SignalKind::WorkerHealth(body), 60_000)
-            .expect("publish ok");
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 1);
-        assert!(matches!(
-            entries[0].signal,
-            Some(SignalKind::WorkerHealth(_))
-        ));
+        svc.publish_signal(
+            readiness_key(),
+            SignalKind::SmgReadiness(readiness_body()),
+            30_000,
+        )
+        .unwrap();
+        svc.remove_signal(readiness_key()).unwrap();
+
+        assert!(svc.outbox_snapshot().is_empty());
+        let state = svc.state();
+        let state = state.read();
+        assert!(state.readiness_replica(REGION, SERVER).is_none());
     }
 
     #[test]
-    fn log_delta_returns_only_newer_entries() {
-        let svc = service();
-        let (_, c0) = svc.local_log_snapshot();
-        svc.publish_signal(
-            readiness_key(),
-            SignalKind::SmgReadiness(readiness_body()),
-            30_000,
-        )
-        .unwrap();
-        let (delta1, c1) = svc.local_log_delta(c0).expect("cursor ok");
-        assert_eq!(delta1.len(), 1);
-        assert!(c1 > c0);
-
-        // Another publish — delta from c1 returns just one entry.
-        svc.publish_signal(
-            readiness_key(),
-            SignalKind::SmgReadiness(readiness_body()),
-            30_000,
-        )
-        .unwrap();
-        let (delta2, _) = svc.local_log_delta(c1).expect("cursor ok");
-        assert_eq!(delta2.len(), 1);
-    }
-
-    #[test]
-    fn log_delta_with_stale_cursor_returns_cursor_stale() {
-        let svc = service();
-        // Force a non-empty log so the stale-cursor branch fires.
-        svc.publish_signal(
-            readiness_key(),
-            SignalKind::SmgReadiness(readiness_body()),
-            30_000,
-        )
-        .unwrap();
-        svc.publish_signal(
-            readiness_key(),
-            SignalKind::SmgReadiness(readiness_body()),
-            30_000,
-        )
-        .unwrap();
-        // GC dropping the front simulates a producer that has retained
-        // only recent entries.
-        {
-            let mut log = svc.log.write();
-            log.entries.pop_front();
-        }
-        // Cursor 0 is below the retained range now (front is cursor 2).
-        let err = svc.local_log_delta(0).expect_err("stale cursor should 409");
-        assert_eq!(err, CursorStale);
-    }
-
-    #[test]
-    fn apply_remote_envelope_updates_state() {
-        let svc = service();
-        let peer_key = SignalKey::SmgReadiness {
-            region_id: "us-chicago-1".to_string(),
-            server_name: "smg-router-peer".to_string(),
+    fn validate_remote_envelope_rejects_actor_key_mismatch() {
+        let envelope = SignalEnvelope {
+            key: readiness_key(),
+            version: 1,
+            actor: "different-actor".to_string(),
+            generated_at_ms: 0,
+            stale_after_ms: 0,
+            removed: false,
+            signal: Some(SignalKind::SmgReadiness(readiness_body())),
         };
-        let peer_envelope = SignalEnvelope {
-            key: peer_key,
-            version: 42,
+        let err =
+            validate_remote_envelope(&envelope).expect_err("actor/key mismatch must be rejected");
+        assert!(matches!(err, CrossRegionError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn validate_remote_envelope_rejects_removed_with_body() {
+        let envelope = SignalEnvelope {
+            key: readiness_key(),
+            version: 1,
+            actor: SERVER.to_string(),
+            generated_at_ms: 0,
+            stale_after_ms: 0,
+            removed: true,
+            signal: Some(SignalKind::SmgReadiness(readiness_body())),
+        };
+        let err = validate_remote_envelope(&envelope).expect_err("removed+body must be rejected");
+        assert!(matches!(err, CrossRegionError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn validate_remote_envelope_rejects_live_without_body() {
+        let envelope = SignalEnvelope::<SignalKind> {
+            key: readiness_key(),
+            version: 1,
+            actor: SERVER.to_string(),
+            generated_at_ms: 0,
+            stale_after_ms: 30_000,
+            removed: false,
+            signal: None,
+        };
+        let err =
+            validate_remote_envelope(&envelope).expect_err("live without body must be rejected");
+        assert!(matches!(err, CrossRegionError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn apply_envelope_to_state_round_trips_worker_health() {
+        let mut state = CrossRegionState::new();
+        let envelope = SignalEnvelope {
+            key: SignalKey::WorkerHealth {
+                region_id: "us-chicago-1".to_string(),
+                worker_id: "w1".to_string(),
+                server_name: "smg-router-peer".to_string(),
+            },
+            version: 5,
             actor: "smg-router-peer".to_string(),
             generated_at_ms: 1_700_000_000_000,
             stale_after_ms: 30_000,
             removed: false,
-            signal: Some(SignalKind::SmgReadiness(SmgReadinessSignal {
+            signal: Some(SignalKind::WorkerHealth(WorkerHealthSignal {
                 region_id: "us-chicago-1".to_string(),
+                worker_id: "w1".to_string(),
                 server_name: "smg-router-peer".to_string(),
-                ready: true,
+                status: WorkerStatus::Ready,
             })),
         };
-        svc.apply_remote_envelopes("us-chicago-1", &[peer_envelope]);
-        let state = svc.state();
-        let state = state.read();
-        let signal = state
-            .readiness("us-chicago-1")
-            .expect("peer readiness must be materialized");
-        assert!(signal.ready);
-    }
-
-    #[test]
-    fn apply_remote_envelope_with_own_actor_seeds_observed_remote_max() {
-        // Simulate post-restart: producer pulls peer's cache, sees its own
-        // pre-restart write at a high version, then the next publish must
-        // exceed that.
-        let svc = service();
-        let key = readiness_key();
-        let pre_restart_envelope = SignalEnvelope {
-            key: key.clone(),
-            version: 999_999,
-            actor: SERVER.to_string(),
-            generated_at_ms: 1_700_000_000_000,
-            stale_after_ms: 30_000,
-            removed: false,
-            signal: Some(SignalKind::SmgReadiness(readiness_body())),
-        };
-        svc.apply_remote_envelopes("peer-x", &[pre_restart_envelope]);
-
-        svc.publish_signal(key, SignalKind::SmgReadiness(readiness_body()), 30_000)
-            .unwrap();
-        let (entries, _) = svc.local_log_snapshot();
-        assert!(
-            entries[0].version > 999_999,
-            "post-restart publish must outrank pre-restart peer-observed version: {}",
-            entries[0].version,
-        );
-    }
-
-    #[test]
-    fn publish_mirrors_into_local_state() {
-        let svc = service();
-        svc.publish_signal(
-            readiness_key(),
-            SignalKind::SmgReadiness(readiness_body()),
-            30_000,
-        )
-        .unwrap();
-        let state = svc.state();
-        let state = state.read();
-        assert!(state.readiness(REGION).is_some());
-    }
-
-    #[test]
-    fn gc_drops_stale_live_entries_past_dead_replica_retention() {
-        let svc = CrossRegionSyncService::new_with_retention(
-            REGION.to_string(),
-            SERVER.to_string(),
-            SyncRetention {
-                tombstone_retention_ms: 100,
-                dead_replica_retention_ms: 50,
-            },
-        )
-        .unwrap();
-        svc.publish_signal(
-            readiness_key(),
-            SignalKind::SmgReadiness(readiness_body()),
-            30_000,
-        )
-        .unwrap();
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 1);
-        // 60ms after publish: live retention (50ms) exceeded — GC should drop.
-        let publish_ts = entries[0].generated_at_ms;
-        svc.gc_log(publish_ts + 60);
-        let (entries, _) = svc.local_log_snapshot();
-        assert!(entries.is_empty(), "stale live entry should be GC'd");
-    }
-
-    #[test]
-    fn gc_keeps_tombstones_longer_than_live_entries() {
-        let svc = CrossRegionSyncService::new_with_retention(
-            REGION.to_string(),
-            SERVER.to_string(),
-            SyncRetention {
-                tombstone_retention_ms: 100,
-                dead_replica_retention_ms: 50,
-            },
-        )
-        .unwrap();
-        svc.remove_signal(readiness_key()).unwrap();
-        let (entries, _) = svc.local_log_snapshot();
-        let tombstone_ts = entries[0].generated_at_ms;
-        // 60ms: tombstone retention (100ms) NOT yet exceeded — kept.
-        svc.gc_log(tombstone_ts + 60);
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 1, "tombstone should outlive live retention");
-        assert!(entries[0].removed);
+        apply_envelope_to_state(&mut state, &envelope);
+        let observed = state
+            .worker_health_replica("us-chicago-1", "w1", "smg-router-peer")
+            .expect("worker health materialized");
+        assert_eq!(observed.status, WorkerStatus::Ready);
     }
 }

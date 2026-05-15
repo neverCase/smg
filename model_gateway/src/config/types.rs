@@ -139,13 +139,11 @@ impl Default for CrossRegionRequestPlaneConfig {
     }
 }
 
-/// Cross-region signal sync listener and freshness tuning.
+/// Cross-region signal sync freshness tuning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CrossRegionSyncPlaneConfig {
     pub enabled: bool,
-    pub listen_port: u16,
-    pub full_resync_interval_seconds: u64,
     pub signal_stale_after_seconds: u64,
 }
 
@@ -153,8 +151,6 @@ impl Default for CrossRegionSyncPlaneConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            listen_port: 9443,
-            full_resync_interval_seconds: 300,
             signal_stale_after_seconds: 30,
         }
     }
@@ -226,6 +222,8 @@ pub struct CrossRegionConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub realm: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
@@ -241,6 +239,7 @@ impl Default for CrossRegionConfig {
         Self {
             enabled: false,
             region_id: None,
+            server_name: None,
             realm: None,
             environment: None,
             local_only_on_degraded_sync: true,
@@ -937,6 +936,7 @@ mod tests {
         CrossRegionConfig {
             enabled: true,
             region_id: Some("us-ashburn-1".to_string()),
+            server_name: Some("smg-router-a".to_string()),
             realm: Some("oc1".to_string()),
             environment: Some("prod".to_string()),
             peers: vec![CrossRegionPeerConfig {
@@ -1006,8 +1006,6 @@ mod tests {
         );
         assert!(config.request_plane.local_first_tie_break);
         assert!(config.sync_plane.enabled);
-        assert_eq!(config.sync_plane.listen_port, 9443);
-        assert_eq!(config.sync_plane.full_resync_interval_seconds, 300);
         assert_eq!(config.sync_plane.signal_stale_after_seconds, 30);
         assert!(config.peers.is_empty());
     }

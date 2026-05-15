@@ -1,16 +1,7 @@
 //! Worker-health adapter — emits `worker-health/{region}/{worker_id}/{server_name}`.
 //!
-//! Event-driven on `WorkerRegistry::subscribe_events()`. Each lifecycle
-//! transition (`Registered`, `Replaced`, `StatusChanged`) republishes the
-//! signal with the current status; `Removed` writes a tombstone via
-//! `CrossRegionSyncService::remove_signal`.
-//!
-//! v1 doesn't enforce the `xr.origin = local | mesh` label discipline yet
-//! (design §3b) — that filter is a follow-up. As long as
-//! `WorkerSyncAdapter` and `WorkerHealthAdapter` are wired in the same
-//! process and the gateway doesn't mesh-import workers, this v1 is correct.
-//! The label filter becomes load-bearing only once cross-region mesh import
-//! ships.
+//! Registry events publish current status; removals stop publishing that
+//! worker. A periodic reconcile keeps stable workers fresh.
 
 use std::sync::Arc;
 
@@ -23,9 +14,7 @@ use crate::{
     worker::{event::WorkerEvent, WorkerRegistry},
 };
 
-/// Default freshness window (design §4): worker-health uses 60 s with a 20 s
-/// periodic reconcile, so a healthy worker that emits no status events still
-/// stays fresh for two reconciles before consumers gate it out.
+/// Default freshness window: 60 s with a 20 s reconcile.
 pub const DEFAULT_WORKER_HEALTH_STALE_AFTER_MS: u32 = 60_000;
 
 /// Worker-health producer.
@@ -67,7 +56,7 @@ impl WorkerHealthAdapter {
             .publish_signal(key, SignalKind::WorkerHealth(body), self.stale_after_ms)
     }
 
-    /// Emit a tombstone for one worker.
+    /// Stop publishing health for one worker.
     pub fn remove_for(&self, worker_id: &str) -> CrossRegionResult<()> {
         let region_id = self.sync.region_id().to_string();
         let server_name = self.sync.server_name().to_string();
@@ -93,9 +82,7 @@ impl WorkerHealthAdapter {
         }
     }
 
-    /// Republish every known worker's current health. Caller invokes this
-    /// on a 20 s reconcile tick so stable healthy workers don't go stale
-    /// past `stale_after_ms` between event-driven updates.
+    /// Republish current health for every known worker.
     pub fn reconcile(&self, registry: &WorkerRegistry) {
         for (worker_id, worker) in registry.get_all_with_ids() {
             if let Err(err) = self.publish_for(worker_id.as_str(), worker.status()) {
@@ -116,14 +103,10 @@ mod tests {
     use openai_protocol::model_card::ModelCard;
 
     use super::*;
-    use crate::worker::{registry::WorkerId, BasicWorkerBuilder};
-
-    fn service() -> Arc<CrossRegionSyncService> {
-        Arc::new(
-            CrossRegionSyncService::new("us-ashburn-1".to_string(), "smg-router-a".to_string())
-                .expect("service constructs"),
-        )
-    }
+    use crate::{
+        cross_region::adapters::test_support::{live_envelopes, service, single_live},
+        worker::{registry::WorkerId, BasicWorkerBuilder},
+    };
 
     fn make_registry_with_worker(url: &str, status: WorkerStatus) -> (Arc<WorkerRegistry>, String) {
         let registry = Arc::new(WorkerRegistry::new());
@@ -150,9 +133,8 @@ mod tests {
             .publish_for("worker-uuid-1", WorkerStatus::Ready)
             .expect("publish ok");
 
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 1);
-        match &entries[0].key {
+        let env = single_live(&svc);
+        match &env.key {
             SignalKey::WorkerHealth {
                 region_id,
                 worker_id,
@@ -162,13 +144,10 @@ mod tests {
                 assert_eq!(worker_id, "worker-uuid-1");
                 assert_eq!(server_name, "smg-router-a");
             }
-            _ => panic!("unexpected key shape: {:?}", entries[0].key),
+            _ => panic!("unexpected key shape: {:?}", env.key),
         }
-        assert_eq!(
-            entries[0].stale_after_ms,
-            DEFAULT_WORKER_HEALTH_STALE_AFTER_MS
-        );
-        assert!(!entries[0].removed);
+        assert_eq!(env.stale_after_ms, DEFAULT_WORKER_HEALTH_STALE_AFTER_MS);
+        assert!(!env.removed);
     }
 
     #[test]
@@ -187,9 +166,8 @@ mod tests {
         };
         adapter.handle_event(&event).expect("handle ok");
 
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 1);
-        match &entries[0].signal {
+        let env = single_live(&svc);
+        match env.signal {
             Some(SignalKind::WorkerHealth(s)) => {
                 assert_eq!(s.status, WorkerStatus::Ready);
                 assert_eq!(s.worker_id, worker_id);
@@ -208,16 +186,30 @@ mod tests {
             .get(&WorkerId::from_string(worker_id.clone()))
             .expect("registered");
 
+        // Seed a live envelope before removal.
+        adapter
+            .publish_for(&worker_id, WorkerStatus::Ready)
+            .expect("publish ok");
+        assert_eq!(live_envelopes(&svc).len(), 1);
+
         let event = WorkerEvent::Removed {
             worker_id: WorkerId::from_string(worker_id.clone()),
             worker,
         };
         adapter.handle_event(&event).expect("handle ok");
 
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].removed);
-        assert!(entries[0].signal.is_none());
+        // Removal purges local state; peers age it out.
+        assert!(live_envelopes(&svc).is_empty());
+        let key = SignalKey::WorkerHealth {
+            region_id: "us-ashburn-1".to_string(),
+            worker_id: worker_id.clone(),
+            server_name: "smg-router-a".to_string(),
+        };
+        assert!(svc
+            .outbox_snapshot()
+            .iter()
+            .find(|env| env.key == key)
+            .is_none());
     }
 
     #[test]
@@ -240,8 +232,8 @@ mod tests {
         };
         adapter.handle_event(&event).unwrap();
 
-        let (entries, _) = svc.local_log_snapshot();
-        match &entries[0].signal {
+        let env = single_live(&svc);
+        match env.signal {
             Some(SignalKind::WorkerHealth(s)) => assert_eq!(s.status, WorkerStatus::Ready),
             other => panic!("unexpected signal: {other:?}"),
         }
@@ -264,8 +256,8 @@ mod tests {
 
         adapter.reconcile(&registry);
 
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 3);
-        assert!(entries.iter().all(|e| !e.removed));
+        let envelopes = live_envelopes(&svc);
+        assert_eq!(envelopes.len(), 3);
+        assert!(envelopes.iter().all(|e| !e.removed));
     }
 }

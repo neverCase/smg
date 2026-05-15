@@ -245,6 +245,7 @@ impl DrainRegistry {
 fn subscriber_capacity_for_prefix(prefix: &str) -> usize {
     match prefix {
         "worker:" => 1000,
+        "cross_region:" => 4096, // ~1k workers: readiness + health + load + latency.
         "policy:" => 100,
         "rl:" => 100,
         "config:" => 100,

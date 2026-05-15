@@ -15,8 +15,6 @@ pub struct RequestPlaneRuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncPlaneRuntimeConfig {
     pub enabled: bool,
-    pub listen_port: u16,
-    pub full_resync_interval_seconds: u64,
     pub signal_stale_after_seconds: u64,
 }
 
@@ -34,6 +32,7 @@ pub struct CrossRegionMtlsRuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossRegionRuntimeConfig {
     pub region_id: String,
+    pub server_name: String,
     pub realm: String,
     pub environment: String,
     pub local_only_on_degraded_sync: bool,
@@ -51,6 +50,7 @@ impl CrossRegionRuntimeConfig {
 
         Ok(Some(Self {
             region_id: required("region", config.region_id.as_deref())?.to_string(),
+            server_name: required("server_name", config.server_name.as_deref())?.to_string(),
             realm: required("realm", config.realm.as_deref())?.to_string(),
             environment: required("environment", config.environment.as_deref())?.to_string(),
             local_only_on_degraded_sync: config.local_only_on_degraded_sync,
@@ -63,8 +63,6 @@ impl CrossRegionRuntimeConfig {
             },
             sync_plane: SyncPlaneRuntimeConfig {
                 enabled: config.sync_plane.enabled,
-                listen_port: config.sync_plane.listen_port,
-                full_resync_interval_seconds: config.sync_plane.full_resync_interval_seconds,
                 signal_stale_after_seconds: config.sync_plane.signal_stale_after_seconds,
             },
             mtls: CrossRegionMtlsRuntimeConfig {
@@ -93,6 +91,13 @@ impl CrossRegionRuntimeConfig {
             },
         }))
     }
+}
+
+/// Convert a seconds value to milliseconds, saturating at `i64::MAX` instead
+/// of overflowing. Used by the `/get_loads` cross-region projection
+/// (`signal_stale_after_seconds` → freshness window).
+pub(crate) fn seconds_to_millis_saturating(seconds: u64) -> i64 {
+    i64::try_from(seconds.saturating_mul(1_000)).unwrap_or(i64::MAX)
 }
 
 /// Top-level cross-region runtime context consumed by later service wiring tasks.
@@ -148,6 +153,7 @@ mod tests {
         CrossRegionConfig {
             enabled: true,
             region_id: Some("us-ashburn-1".to_string()),
+            server_name: Some("smg-router-a".to_string()),
             realm: Some("oc1".to_string()),
             environment: Some("prod".to_string()),
             local_only_on_degraded_sync: true,
@@ -188,6 +194,7 @@ mod tests {
             .expect("context should be present");
 
         assert_eq!(context.config.region_id, "us-ashburn-1");
+        assert_eq!(context.config.sync_plane.signal_stale_after_seconds, 30);
         assert!(context.peers.contains_region("us-chicago-1"));
         assert!(context.peers.is_enabled("us-chicago-1"));
     }

@@ -438,8 +438,6 @@ cross_region:
     local_first_tie_break: true
   sync_plane:
     enabled: true
-    listen_port: 9443
-    full_resync_interval_seconds: 300
     signal_stale_after_seconds: 30
   peers:
     - region_id: us-chicago-1
@@ -469,10 +467,8 @@ cross_region:
 | `--cross-region-request-plane-max-platform-retries` | Maximum platform-owned cross-region retries | `5` |
 | `--cross-region-request-plane-default-failover-mode` | Default failover mode: `MANUAL`, `AUTOMATIC`, or `AUTO` | `MANUAL` |
 | `--cross-region-request-plane-local-first-tie-break` | Prefer local region when candidates tie | `true` |
-| `--cross-region-sync-plane-enabled` | Parse and validate signal-sync plane settings for later runtime wiring | `true` |
-| `--cross-region-sync-plane-listen-port` | Private NLB signal-sync listener port | `9443` |
-| `--cross-region-sync-plane-full-resync-interval-seconds` | Full signal resync interval | `300` |
-| `--cross-region-sync-plane-signal-stale-after-seconds` | Remote signal stale-after interval | `30` |
+| `--cross-region-sync-plane-enabled` | Enable mesh-backed cross-region signal sync | `true` |
+| `--cross-region-sync-plane-signal-stale-after-seconds` | Consumer-side freshness window: replica signals older than this are excluded from cross-region rankings | `30` |
 | `--cross-region-peer` | Peer Region Agent mapping | None |
 | `--cross-region-mtls-ca-cert-path` | Cross-region mTLS CA certificate path | Required when enabled |
 | `--cross-region-mtls-server-cert-path` | Cross-region mTLS server certificate path | Required when enabled |

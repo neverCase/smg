@@ -1,10 +1,6 @@
 //! Region-readiness adapter — emits `smg-readiness/{region}/{server_name}`.
 //!
-//! v1 readiness shape is just `ready: bool`. The richer worker-keyed capacity
-//! map called for by design §3a (consumer-side worker dedup) is a follow-up;
-//! the v1 body change would ripple into too many consumer call sites without
-//! producer-side data to populate it yet. This adapter ships the bool and
-//! leaves the capacity map at body level for a later refactor.
+//! Publishes this replica's current `ready` boolean on reconcile.
 
 use std::sync::Arc;
 
@@ -12,17 +8,10 @@ use crate::cross_region::{
     CrossRegionResult, CrossRegionSyncService, SignalKey, SignalKind, SmgReadinessSignal,
 };
 
-/// Default freshness window (design §4): readiness is recomputed every 5 s, so
-/// a 30 s stale-after gives consumers ~6 refresh cycles of cushion before they
-/// gate the signal out at ranking time.
+/// Default freshness window: 30 s with a 5 s reconcile.
 pub const DEFAULT_READINESS_STALE_AFTER_MS: u32 = 30_000;
 
 /// Region-readiness producer.
-///
-/// Holds the sync-service handle plus the freshness window to stamp on every
-/// publish. The reconcile cadence is the caller's responsibility — start
-/// either a periodic tokio task or a hook-driven flow that calls
-/// [`Self::publish_ready`] on relevant state changes.
 #[derive(Debug, Clone)]
 pub struct RegionReadinessAdapter {
     sync: Arc<CrossRegionSyncService>,
@@ -30,8 +19,7 @@ pub struct RegionReadinessAdapter {
 }
 
 impl RegionReadinessAdapter {
-    /// Build an adapter rooted at the given sync service. Uses the default
-    /// stale-after window; call [`Self::with_stale_after_ms`] to override.
+    /// Build an adapter rooted at the given sync service.
     pub fn new(sync: Arc<CrossRegionSyncService>) -> Self {
         Self {
             sync,
@@ -45,8 +33,7 @@ impl RegionReadinessAdapter {
         self
     }
 
-    /// Publish the current readiness state. Adapters typically wire this to
-    /// the gateway's readiness gate plus a periodic reconcile.
+    /// Publish the current readiness state.
     pub fn publish_ready(&self, ready: bool) -> CrossRegionResult<()> {
         let region_id = self.sync.region_id().to_string();
         let server_name = self.sync.server_name().to_string();
@@ -67,13 +54,7 @@ impl RegionReadinessAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn service() -> Arc<CrossRegionSyncService> {
-        Arc::new(
-            CrossRegionSyncService::new("us-ashburn-1".to_string(), "smg-router-a".to_string())
-                .expect("service constructs"),
-        )
-    }
+    use crate::cross_region::adapters::test_support::{live_envelopes, service, single_live};
 
     #[test]
     fn publish_ready_emits_per_replica_envelope() {
@@ -81,9 +62,7 @@ mod tests {
         let adapter = RegionReadinessAdapter::new(svc.clone());
 
         adapter.publish_ready(true).expect("publish ok");
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 1);
-        let env = &entries[0];
+        let env = single_live(&svc);
         assert!(matches!(env.signal, Some(SignalKind::SmgReadiness(_))));
         match &env.key {
             SignalKey::SmgReadiness {
@@ -105,18 +84,17 @@ mod tests {
         let adapter = RegionReadinessAdapter::new(svc.clone());
 
         adapter.publish_ready(true).unwrap();
+        let first_version = single_live(&svc).version;
         adapter.publish_ready(false).unwrap();
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 2);
-        let ready_values: Vec<bool> = entries
-            .iter()
-            .filter_map(|e| match e.signal.as_ref()? {
-                SignalKind::SmgReadiness(s) => Some(s.ready),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(ready_values, vec![true, false]);
-        assert!(entries[1].version > entries[0].version);
+        let env = single_live(&svc);
+        match env.signal {
+            Some(SignalKind::SmgReadiness(s)) => assert!(!s.ready),
+            other => panic!("unexpected signal: {other:?}"),
+        }
+        assert!(env.version > first_version);
+        // Mesh CRDTs collapse same-key writes, so the namespace only ever
+        // holds one envelope per `SignalKey`.
+        assert_eq!(live_envelopes(&svc).len(), 1);
     }
 
     #[test]
@@ -124,7 +102,6 @@ mod tests {
         let svc = service();
         let adapter = RegionReadinessAdapter::new(svc.clone()).with_stale_after_ms(5_000);
         adapter.publish_ready(true).unwrap();
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries[0].stale_after_ms, 5_000);
+        assert_eq!(single_live(&svc).stale_after_ms, 5_000);
     }
 }

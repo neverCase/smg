@@ -16,6 +16,8 @@ pub mod settled;
 pub mod signals;
 pub mod state;
 pub mod sync;
+pub mod sync_runtime;
+pub mod view;
 
 pub use adapters::{
     ClientLatencyAdapter, CrossRegionProducers, ProducerCadences, ProducerHandles,
@@ -47,7 +49,15 @@ pub use signals::{
     WorkerLoadSignal, SIGNAL_CONTRACT_VERSION,
 };
 pub use state::{CrossRegionState, SignalVersion};
-pub use sync::{CrossRegionSyncService, Cursor, CursorStale, SignalKind, SyncRetention};
+pub use sync::{
+    apply_envelope_to_state, decode_envelope, mesh_path, validate_remote_envelope,
+    CrossRegionSyncService, SignalKind, CROSS_REGION_NAMESPACE_PREFIX,
+};
+pub use sync_runtime::CrossRegionSyncRuntime;
+pub use view::{
+    ClientLatencyProjection, RegionReadinessProjection, RemoteRegionView,
+    RemoteWorkerLoadProjection, WorkerLoadResolution, WorkerProjection, WorkerStatusResolution,
+};
 
 /// Cross-region module result type.
 pub type CrossRegionResult<T> = Result<T, CrossRegionError>;

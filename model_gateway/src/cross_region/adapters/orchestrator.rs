@@ -9,6 +9,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use smg_mesh::StreamNamespace;
 use tokio::task::JoinHandle;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
@@ -18,7 +19,7 @@ use crate::{
     worker::WorkerRegistry,
 };
 
-/// Reconcile cadences. Each value matches the defaults documented in design §4.
+/// Reconcile cadences for local signal producers.
 #[derive(Debug, Clone, Copy)]
 pub struct ProducerCadences {
     pub readiness_reconcile_interval: Duration,
@@ -51,16 +52,25 @@ pub struct CrossRegionProducers {
 }
 
 impl CrossRegionProducers {
-    /// Build adapters wrapping a fresh sync service. The sync service is
-    /// constructed inside this call so the gateway only ever passes
-    /// `region_id` / `server_name` in.
-    pub fn new(region_id: String, server_name: String) -> CrossRegionResult<Self> {
-        let sync = Arc::new(CrossRegionSyncService::new(region_id, server_name)?);
+    /// Build adapters wrapping a fresh sync service that publishes through
+    /// the supplied mesh broadcast stream namespace. The boot path is
+    /// responsible for registering the namespace on the shared `MeshKV`
+    /// and passing the handle in.
+    pub fn new(
+        region_id: String,
+        server_name: String,
+        namespace: Arc<StreamNamespace>,
+    ) -> CrossRegionResult<Self> {
+        let sync = Arc::new(CrossRegionSyncService::new(
+            region_id,
+            server_name,
+            namespace,
+        )?);
         Ok(Self::from_sync(sync))
     }
 
     /// Variant that takes a pre-built sync service. Useful for tests that
-    /// want custom retention windows.
+    /// share a sync service across multiple harness components.
     pub fn from_sync(sync: Arc<CrossRegionSyncService>) -> Self {
         Self {
             region_readiness: RegionReadinessAdapter::new(sync.clone()),

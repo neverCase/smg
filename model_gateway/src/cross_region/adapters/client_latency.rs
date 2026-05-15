@@ -1,11 +1,7 @@
 //! Client-latency adapter — emits `client-latency/{client_region}/{target_region}/{server_name}`.
 //!
-//! Each completed cross-region forward records its target + latency via
-//! [`Self::record_latency`]. A periodic 10 s reconcile drains the per-target
-//! observation buffer, computes p50/p95, and publishes one envelope per
-//! target. v1 keeps the scalar p50/p95 wire shape; the additive-bucket
-//! histogram (design §1) is a follow-up so the per-replica → consumer
-//! aggregation does correct percentile math instead of averaging.
+//! Completed cross-region forwards record target latency. A periodic reconcile
+//! drains samples and publishes per-target p50/p95.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -15,7 +11,7 @@ use crate::cross_region::{
     ClientLatencySignal, CrossRegionResult, CrossRegionSyncService, SignalKey, SignalKind,
 };
 
-/// Default freshness window (design §4): 30 s with a 10 s reconcile.
+/// Default freshness window: 30 s with a 10 s reconcile.
 pub const DEFAULT_CLIENT_LATENCY_STALE_AFTER_MS: u32 = 30_000;
 
 /// Per-target rolling observation buffer.
@@ -29,8 +25,7 @@ impl TargetObservations {
         self.samples_ms.push(latency_ms);
     }
 
-    /// Drain samples and compute p50/p95. Returns `None` if no samples are
-    /// buffered (so the adapter skips publishing a stale-only signal).
+    /// Drain samples and compute p50/p95.
     fn drain_summary(&mut self) -> Option<(u64, u64)> {
         if self.samples_ms.is_empty() {
             return None;
@@ -47,9 +42,6 @@ impl TargetObservations {
 }
 
 /// Client-latency producer.
-///
-/// Cloning is cheap (Arc-wrapped state); the request-plane forwarder can
-/// hold a clone and call [`Self::record_latency`] from any task.
 #[derive(Debug, Clone)]
 pub struct ClientLatencyAdapter {
     sync: Arc<CrossRegionSyncService>,
@@ -79,10 +71,7 @@ impl ClientLatencyAdapter {
             .record(latency_ms);
     }
 
-    /// Drain every per-target observation buffer and publish one envelope
-    /// per target. Invoked by the 10 s reconcile tick. Targets with no
-    /// samples since the previous drain are skipped (their last published
-    /// envelope will age out via `stale_after_ms`).
+    /// Drain per-target samples and publish one envelope per target.
     pub fn drain_and_publish(&self) -> CrossRegionResult<()> {
         let drained = {
             let mut obs = self.observations.lock();
@@ -96,8 +85,7 @@ impl ClientLatencyAdapter {
         Ok(())
     }
 
-    /// Direct publish — exposed for tests and any path that wants to push a
-    /// precomputed (p50, p95) without going through the observation buffer.
+    /// Publish a precomputed `(p50, p95)` for one target.
     pub fn publish_for(
         &self,
         target_region: &str,
@@ -122,8 +110,7 @@ impl ClientLatencyAdapter {
             .publish_signal(key, SignalKind::ClientLatency(body), self.stale_after_ms)
     }
 
-    /// Drop a tombstone for one target — used when a target region exits
-    /// the allowed-regions config.
+    /// Stop publishing latency for one target.
     pub fn remove_for(&self, target_region: &str) -> CrossRegionResult<()> {
         self.observations.lock().remove(target_region);
         let client_region = self.sync.region_id().to_string();
@@ -140,12 +127,12 @@ impl ClientLatencyAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cross_region::adapters::test_support::{
+        live_envelopes, service_with_identity, single_live,
+    };
 
     fn service() -> Arc<CrossRegionSyncService> {
-        Arc::new(
-            CrossRegionSyncService::new("us-phoenix-1".to_string(), "smg-router-a".to_string())
-                .expect("service constructs"),
-        )
+        service_with_identity("us-phoenix-1", "smg-router-a")
     }
 
     #[test]
@@ -181,9 +168,9 @@ mod tests {
 
         adapter.drain_and_publish().expect("publish ok");
 
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 2);
-        let mut targets: Vec<&str> = entries
+        let envelopes = live_envelopes(&svc);
+        assert_eq!(envelopes.len(), 2);
+        let mut targets: Vec<&str> = envelopes
             .iter()
             .filter_map(|e| match e.signal.as_ref()? {
                 SignalKind::ClientLatency(s) => Some(s.target_region.as_str()),
@@ -200,9 +187,8 @@ mod tests {
         let adapter = ClientLatencyAdapter::new(svc.clone());
         adapter.publish_for("us-chicago-1", 30, 80).unwrap();
 
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 1);
-        match &entries[0].key {
+        let env = single_live(&svc);
+        match &env.key {
             SignalKey::ClientLatency {
                 client_region,
                 target_region,
@@ -212,9 +198,9 @@ mod tests {
                 assert_eq!(target_region, "us-chicago-1");
                 assert_eq!(server_name, "smg-router-a");
             }
-            _ => panic!("unexpected key kind: {:?}", entries[0].key),
+            _ => panic!("unexpected key kind: {:?}", env.key),
         }
-        match &entries[0].signal {
+        match env.signal {
             Some(SignalKind::ClientLatency(s)) => {
                 assert_eq!(s.p50_latency_ms, 30);
                 assert_eq!(s.p95_latency_ms, 80);
@@ -229,13 +215,14 @@ mod tests {
         let adapter = ClientLatencyAdapter::new(svc.clone());
         adapter.record_latency("us-chicago-1", 30);
         adapter.drain_and_publish().unwrap();
-        let (entries_after_first, _) = svc.local_log_snapshot();
-        assert_eq!(entries_after_first.len(), 1);
+        let first = single_live(&svc);
+        assert_eq!(first.version, single_live(&svc).version);
 
-        // No new samples — second drain publishes nothing.
+        // No new samples — second drain publishes nothing, so the namespace
+        // entry stays identical (same version).
         adapter.drain_and_publish().unwrap();
-        let (entries_after_second, _) = svc.local_log_snapshot();
-        assert_eq!(entries_after_second.len(), 1);
+        let second = single_live(&svc);
+        assert_eq!(first.version, second.version);
     }
 
     #[test]
@@ -245,9 +232,13 @@ mod tests {
         adapter.publish_for("us-chicago-1", 30, 80).unwrap();
         adapter.remove_for("us-chicago-1").unwrap();
 
-        let (entries, _) = svc.local_log_snapshot();
-        assert_eq!(entries.len(), 2);
-        assert!(entries[1].removed);
-        assert!(entries[1].version > entries[0].version);
+        // Peers age this out after the producer stops re-emitting.
+        assert!(live_envelopes(&svc).is_empty());
+        let key = SignalKey::ClientLatency {
+            client_region: "us-phoenix-1".to_string(),
+            target_region: "us-chicago-1".to_string(),
+            server_name: "smg-router-a".to_string(),
+        };
+        assert!(svc.outbox_snapshot().iter().all(|env| env.key != key));
     }
 }
