@@ -942,9 +942,14 @@ mod tests {
         remote_state.upsert_readiness(
             SmgReadinessSignal {
                 region_id: "us-chicago-1".to_string(),
+                server_name: "remote-us-chicago-1".to_string(),
                 ready: false,
             },
-            signal_version(NOW_MS),
+            SignalVersion {
+                version: 2,
+                actor: "test-actor".to_string(),
+                updated_at_ms: NOW_MS,
+            },
         );
         add_client_latency(&mut remote_state, "us-chicago-1", 1, NOW_MS);
 
@@ -985,9 +990,14 @@ mod tests {
         remote_state.upsert_readiness(
             SmgReadinessSignal {
                 region_id: "us-chicago-1".to_string(),
+                server_name: "remote-us-chicago-1".to_string(),
                 ready: false,
             },
-            signal_version(NOW_MS),
+            SignalVersion {
+                version: 2,
+                actor: "test-actor".to_string(),
+                updated_at_ms: NOW_MS,
+            },
         );
 
         let target_region = route_target_region(
@@ -2389,6 +2399,7 @@ mod tests {
             crate::cross_region::ClientLatencySignal {
                 client_region: "iad".to_string(),
                 target_region: target_region.to_string(),
+                server_name: "remote-iad".to_string(),
                 p50_latency_ms,
                 p95_latency_ms: p50_latency_ms.saturating_mul(2),
             },
