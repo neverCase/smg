@@ -23,6 +23,7 @@ use smg::{
         CrossRegionContext, CrossRegionSyncRuntime, CrossRegionSyncService, SignalEnvelope,
         SignalKey, SignalKind, SmgReadinessSignal,
     },
+    server::ReadinessGate,
     worker::WorkerRegistry,
 };
 use smg_mesh::MeshKV;
@@ -83,8 +84,9 @@ async fn boot_starts_runtime_with_live_producers_and_publishable_sync_handle() {
     let context = build_context();
     let registry = Arc::new(WorkerRegistry::new());
     let mesh_kv = make_mesh_kv();
+    let gate: ReadinessGate = Arc::new(|| true);
 
-    let runtime = CrossRegionSyncRuntime::start_with_mesh_kv(&context, &mesh_kv, registry)
+    let runtime = CrossRegionSyncRuntime::start_with_mesh_kv(&context, &mesh_kv, registry, gate)
         .expect("sync runtime should start");
 
     // sync() exposes a live handle stamped with the resolved identity.
@@ -127,8 +129,9 @@ async fn boot_reconcile_loop_publishes_readiness_without_manual_intervention() {
     let context = build_context();
     let registry = Arc::new(WorkerRegistry::new());
     let mesh_kv = make_mesh_kv();
+    let gate: ReadinessGate = Arc::new(|| true);
 
-    let runtime = CrossRegionSyncRuntime::start_with_mesh_kv(&context, &mesh_kv, registry)
+    let runtime = CrossRegionSyncRuntime::start_with_mesh_kv(&context, &mesh_kv, registry, gate)
         .expect("sync runtime should start");
     let sync = runtime.sync();
 
