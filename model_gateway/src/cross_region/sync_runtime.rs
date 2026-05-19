@@ -14,7 +14,7 @@ use super::{
     decode_envelope, CrossRegionContext, CrossRegionResult, CrossRegionState,
     CrossRegionSyncService, RegionPeerRegistry, CROSS_REGION_NAMESPACE_PREFIX,
 };
-use crate::worker::WorkerRegistry;
+use crate::{server::ReadinessGate, worker::WorkerRegistry};
 
 /// Required by `StreamConfig`; broadcast drain traffic does not use it.
 const CROSS_REGION_STREAM_BUFFER_BYTES: usize = 16 * 1024 * 1024;
@@ -45,11 +45,13 @@ impl CrossRegionSyncRuntime {
         context: &CrossRegionContext,
         namespace: Arc<StreamNamespace>,
         worker_registry: Arc<WorkerRegistry>,
+        readiness_gate: ReadinessGate,
     ) -> CrossRegionResult<Self> {
         let producers = CrossRegionProducers::new(
             context.config.region_id.clone(),
             context.config.server_name.clone(),
             namespace.clone(),
+            readiness_gate,
         )?;
         let handles = producers.start(worker_registry, ProducerCadences::default());
         let subscriber = spawn_subscriber(producers.sync.clone());
@@ -70,6 +72,7 @@ impl CrossRegionSyncRuntime {
         context: &CrossRegionContext,
         mesh_kv: &Arc<MeshKV>,
         worker_registry: Arc<WorkerRegistry>,
+        readiness_gate: ReadinessGate,
     ) -> CrossRegionResult<Self> {
         let namespace = mesh_kv.configure_stream_prefix(
             CROSS_REGION_NAMESPACE_PREFIX,
@@ -78,7 +81,7 @@ impl CrossRegionSyncRuntime {
                 routing: StreamRouting::Broadcast,
             },
         );
-        Self::start(context, namespace, worker_registry)
+        Self::start(context, namespace, worker_registry, readiness_gate)
     }
 
     /// Shared sync service handle for routing/projection consumers.

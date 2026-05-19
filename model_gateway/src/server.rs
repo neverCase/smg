@@ -111,6 +111,7 @@ use crate::{
     worker::{
         manager::{WorkerManager, WorkerManagerConfig},
         worker::WorkerType,
+        WorkerRegistry,
     },
     workflow::{
         job_queue::{JobQueue, JobQueueConfig},
@@ -551,6 +552,7 @@ async fn forward_unresolved_to_remote_attempt(
     };
     let target_region = plan.output.decision.target_region.clone();
     let attempt = plan.output.commit.attempt;
+    let started_at = std::time::Instant::now();
 
     match CrossRegionForwarder::forward_to_target(&client, target, request).await {
         Ok(response) => {
@@ -566,6 +568,17 @@ async fn forward_unresolved_to_remote_attempt(
                 state.cross_region_breaker.record_failure(&target_region);
             } else if !is_retryable_response_after_stream_start(status, streaming_started) {
                 state.cross_region_breaker.record_success(&target_region);
+                // Latency sampling tracks the same "success" classification
+                // the breaker uses — only forwards that did not require a
+                // retry contribute to p50/p95.
+                if let Some(runtime) = state.cross_region_sync.as_ref() {
+                    let elapsed_ms =
+                        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    runtime
+                        .producers()
+                        .client_latency
+                        .record_latency(&target_region, elapsed_ms);
+                }
             }
             RemoteForwardAttemptResult {
                 response,
@@ -615,36 +628,67 @@ async fn liveness() -> Response {
     (StatusCode::OK, "OK").into_response()
 }
 
-async fn readiness(State(state): State<Arc<AppState>>) -> Response {
-    let workers = state.context.worker_registry.get_all();
-    let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
-
-    let is_ready = if state.context.router_config.enable_igw {
-        !healthy_workers.is_empty()
+/// Snapshot whether this gateway should serve traffic right now.
+///
+/// Reads the live worker registry against the configured routing mode and
+/// returns `true` iff the gateway has enough healthy workers to honor a
+/// request. This is the single source of truth for "am I ready" — the
+/// k8s `/readiness` probe and every cross-subsystem readiness consumer
+/// (cross-region signal producer today; future mesh health checks) read
+/// the same boolean.
+pub fn compute_local_readiness(registry: &WorkerRegistry, config: &RouterConfig) -> bool {
+    let workers = registry.get_all();
+    let healthy: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
+    if config.enable_igw {
+        !healthy.is_empty()
     } else {
-        match &state.context.router_config.mode {
+        match &config.mode {
             RoutingMode::PrefillDecode { .. } => {
-                let has_prefill = healthy_workers
+                let has_prefill = healthy
                     .iter()
                     .any(|w| matches!(w.worker_type(), WorkerType::Prefill));
-                let has_decode = healthy_workers
+                let has_decode = healthy
                     .iter()
                     .any(|w| matches!(w.worker_type(), WorkerType::Decode));
                 has_prefill && has_decode
             }
-            RoutingMode::Regular { .. } => !healthy_workers.is_empty(),
-            RoutingMode::OpenAI { .. } => !healthy_workers.is_empty(),
-            RoutingMode::Anthropic { .. } => !healthy_workers.is_empty(),
-            RoutingMode::Gemini { .. } => !healthy_workers.is_empty(),
+            RoutingMode::Regular { .. } => !healthy.is_empty(),
+            RoutingMode::OpenAI { .. } => !healthy.is_empty(),
+            RoutingMode::Anthropic { .. } => !healthy.is_empty(),
+            RoutingMode::Gemini { .. } => !healthy.is_empty(),
         }
-    };
+    }
+}
+
+/// Cheap callable handed to readiness consumers that need to ask the
+/// readiness question off the hot HTTP path — e.g. the cross-region
+/// signal reconcile loop, which calls this on each tick to decide what
+/// to publish. Captures the dependencies once at boot so the call site
+/// stays parameter-less.
+pub type ReadinessGate = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Build a [`ReadinessGate`] that closes over the live worker registry
+/// and router config. Cheap to call; each invocation evaluates
+/// [`compute_local_readiness`] against the current registry contents.
+pub fn make_readiness_gate(
+    registry: Arc<WorkerRegistry>,
+    config: Arc<RouterConfig>,
+) -> ReadinessGate {
+    Arc::new(move || compute_local_readiness(&registry, &config))
+}
+
+async fn readiness(State(state): State<Arc<AppState>>) -> Response {
+    let is_ready =
+        compute_local_readiness(&state.context.worker_registry, &state.context.router_config);
 
     if is_ready {
+        let workers = state.context.worker_registry.get_all();
+        let healthy_count = workers.iter().filter(|w| w.is_healthy()).count();
         (
             StatusCode::OK,
             Json(json!({
                 "status": "ready",
-                "healthy_workers": healthy_workers.len(),
+                "healthy_workers": healthy_count,
                 "total_workers": workers.len()
             })),
         )
@@ -2522,10 +2566,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                         context.config.region_id,
                     )
                 })?;
+                let readiness_gate = make_readiness_gate(
+                    app_context.worker_registry.clone(),
+                    Arc::new(app_context.router_config.clone()),
+                );
                 let runtime = CrossRegionSyncRuntime::start_with_mesh_kv(
                     &context,
                     handler.mesh_kv(),
                     app_context.worker_registry.clone(),
+                    readiness_gate,
                 )
                 .map_err(|error| format!("Failed to start cross-region sync runtime: {error}"))?;
                 info!(
@@ -3803,6 +3852,138 @@ mod tests {
             assert!(
                 envelopes.is_empty(),
                 "stale entries must not produce projection envelopes",
+            );
+        }
+    }
+
+    mod readiness_gate {
+        use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
+
+        use super::*;
+        use crate::worker::{BasicWorkerBuilder, Worker};
+
+        fn worker(
+            url: &str,
+            model: &str,
+            status: WorkerStatus,
+            worker_type: WorkerType,
+        ) -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new(model))
+                    .status(status)
+                    .worker_type(worker_type)
+                    .build(),
+            )
+        }
+
+        #[test]
+        fn igw_mode_ready_when_any_healthy_worker_exists() {
+            let registry = WorkerRegistry::new();
+            let mut config = RouterConfig::default();
+            config.enable_igw = true;
+
+            assert!(
+                !compute_local_readiness(&registry, &config),
+                "IGW with no workers must not be ready"
+            );
+
+            registry
+                .register(worker(
+                    "http://w1:8000",
+                    "cohere.command-r-plus",
+                    WorkerStatus::Ready,
+                    WorkerType::Regular,
+                ))
+                .expect("register");
+            assert!(
+                compute_local_readiness(&registry, &config),
+                "IGW with one healthy worker is ready"
+            );
+        }
+
+        #[test]
+        fn prefill_decode_mode_requires_both_halves() {
+            let registry = WorkerRegistry::new();
+            let mut config = RouterConfig::default();
+            config.enable_igw = false;
+            config.mode = RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            };
+            // Compiler check: variants above match the actual schema.
+
+            // Empty registry — not ready.
+            assert!(!compute_local_readiness(&registry, &config));
+
+            // Only a prefill — still not ready.
+            registry
+                .register(worker(
+                    "http://prefill:8000",
+                    "cohere.command-r-plus",
+                    WorkerStatus::Ready,
+                    WorkerType::Prefill,
+                ))
+                .expect("register");
+            assert!(
+                !compute_local_readiness(&registry, &config),
+                "PrefillDecode with only prefill is not ready"
+            );
+
+            // Add a decode — now ready.
+            registry
+                .register(worker(
+                    "http://decode:8000",
+                    "cohere.command-r-plus",
+                    WorkerStatus::Ready,
+                    WorkerType::Decode,
+                ))
+                .expect("register");
+            assert!(
+                compute_local_readiness(&registry, &config),
+                "PrefillDecode with both halves healthy is ready"
+            );
+        }
+
+        #[test]
+        fn regular_mode_requires_one_healthy_worker() {
+            let registry = WorkerRegistry::new();
+            let mut config = RouterConfig::default();
+            config.enable_igw = false;
+            config.mode = RoutingMode::Regular {
+                worker_urls: vec![],
+            };
+
+            assert!(!compute_local_readiness(&registry, &config));
+
+            // A pending worker is NOT healthy yet — registry treats only
+            // Ready as healthy. So readiness stays false.
+            registry
+                .register(worker(
+                    "http://w1:8000",
+                    "cohere.command-r-plus",
+                    WorkerStatus::Pending,
+                    WorkerType::Regular,
+                ))
+                .expect("register");
+            assert!(
+                !compute_local_readiness(&registry, &config),
+                "pending workers don't satisfy readiness"
+            );
+
+            registry
+                .register(worker(
+                    "http://w2:8000",
+                    "cohere.command-r-plus",
+                    WorkerStatus::Ready,
+                    WorkerType::Regular,
+                ))
+                .expect("register");
+            assert!(
+                compute_local_readiness(&registry, &config),
+                "one ready worker satisfies Regular mode"
             );
         }
     }

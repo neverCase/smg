@@ -16,6 +16,7 @@ use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use super::{ClientLatencyAdapter, RegionReadinessAdapter, WorkerHealthAdapter, WorkerLoadAdapter};
 use crate::{
     cross_region::{CrossRegionResult, CrossRegionSyncService},
+    server::ReadinessGate,
     worker::WorkerRegistry,
 };
 
@@ -42,13 +43,27 @@ impl Default for ProducerCadences {
 /// Bundle of the four producer adapters plus the sync service that backs
 /// them. Cheap to clone (everything is `Arc`-wrapped); the gateway holds one
 /// instance and adapters hand out their own clones to call sites.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CrossRegionProducers {
     pub sync: Arc<CrossRegionSyncService>,
     pub region_readiness: RegionReadinessAdapter,
     pub worker_health: WorkerHealthAdapter,
     pub worker_load: WorkerLoadAdapter,
     pub client_latency: ClientLatencyAdapter,
+    readiness_gate: ReadinessGate,
+}
+
+impl std::fmt::Debug for CrossRegionProducers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrossRegionProducers")
+            .field("sync", &self.sync)
+            .field("region_readiness", &self.region_readiness)
+            .field("worker_health", &self.worker_health)
+            .field("worker_load", &self.worker_load)
+            .field("client_latency", &self.client_latency)
+            .field("readiness_gate", &"<fn>")
+            .finish()
+    }
 }
 
 impl CrossRegionProducers {
@@ -60,35 +75,32 @@ impl CrossRegionProducers {
         region_id: String,
         server_name: String,
         namespace: Arc<StreamNamespace>,
+        readiness_gate: ReadinessGate,
     ) -> CrossRegionResult<Self> {
         let sync = Arc::new(CrossRegionSyncService::new(
             region_id,
             server_name,
             namespace,
         )?);
-        Ok(Self::from_sync(sync))
+        Ok(Self::from_sync(sync, readiness_gate))
     }
 
     /// Variant that takes a pre-built sync service. Useful for tests that
     /// share a sync service across multiple harness components.
-    pub fn from_sync(sync: Arc<CrossRegionSyncService>) -> Self {
+    pub fn from_sync(sync: Arc<CrossRegionSyncService>, readiness_gate: ReadinessGate) -> Self {
         Self {
             region_readiness: RegionReadinessAdapter::new(sync.clone()),
             worker_health: WorkerHealthAdapter::new(sync.clone()),
             worker_load: WorkerLoadAdapter::new(sync.clone()),
             client_latency: ClientLatencyAdapter::new(sync.clone()),
             sync,
+            readiness_gate,
         }
     }
 
     /// Spawn the tokio tasks that drive event-driven (worker-health) and
     /// periodic (readiness, load, latency) publication. Returns handles the
     /// caller can drop to stop publication.
-    ///
-    /// Readiness is a placeholder `true` until the real readiness gate is
-    /// plumbed; the gateway should call [`RegionReadinessAdapter::publish_ready`]
-    /// directly from its readiness path once that exists. The periodic task
-    /// keeps the signal fresh in the meantime.
     pub fn start(
         &self,
         worker_registry: Arc<WorkerRegistry>,
@@ -96,6 +108,7 @@ impl CrossRegionProducers {
     ) -> ProducerHandles {
         let readiness_handle = spawn_readiness_loop(
             self.region_readiness.clone(),
+            self.readiness_gate.clone(),
             cadences.readiness_reconcile_interval,
         );
         let health_event_handle =
@@ -161,13 +174,18 @@ impl Drop for ProducerHandles {
     clippy::disallowed_methods,
     reason = "task is bounded by ProducerHandles which aborts on drop"
 )]
-fn spawn_readiness_loop(adapter: RegionReadinessAdapter, interval: Duration) -> JoinHandle<()> {
+fn spawn_readiness_loop(
+    adapter: RegionReadinessAdapter,
+    gate: ReadinessGate,
+    interval: Duration,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            if let Err(err) = adapter.publish_ready(true) {
+            let ready = (gate)();
+            if let Err(err) = adapter.publish_ready(ready) {
                 tracing::warn!(error = %err, "readiness reconcile publish failed");
             }
         }

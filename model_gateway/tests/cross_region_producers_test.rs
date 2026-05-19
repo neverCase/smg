@@ -15,6 +15,7 @@ use smg::{
         CrossRegionProducers, CrossRegionSyncService, ProducerCadences, SignalEnvelope, SignalKey,
         SignalKind, CROSS_REGION_NAMESPACE_PREFIX,
     },
+    server::ReadinessGate,
     worker::{event::WorkerEvent, BasicWorkerBuilder, Worker, WorkerRegistry},
 };
 use smg_mesh::{MeshKV, StreamConfig, StreamRouting};
@@ -40,7 +41,7 @@ fn build_worker(url: &str, model: &str, status: WorkerStatus, load: usize) -> Ar
 }
 
 #[expect(clippy::expect_used, reason = "test helper — fixture is known-valid")]
-fn make_producers() -> CrossRegionProducers {
+fn make_producers_with_gate(gate: ReadinessGate) -> CrossRegionProducers {
     let mesh_kv = Arc::new(MeshKV::new(SERVER.to_string()));
     let namespace = mesh_kv.configure_stream_prefix(
         CROSS_REGION_NAMESPACE_PREFIX,
@@ -49,8 +50,16 @@ fn make_producers() -> CrossRegionProducers {
             routing: StreamRouting::Broadcast,
         },
     );
-    CrossRegionProducers::new(REGION.to_string(), SERVER.to_string(), namespace)
+    CrossRegionProducers::new(REGION.to_string(), SERVER.to_string(), namespace, gate)
         .expect("producers should construct")
+}
+
+fn make_producers() -> CrossRegionProducers {
+    // Always-ready gate: producer-shape assertions in this file don't
+    // care about the gated value, only that the loop publishes something
+    // monotonic. Gate-tracking behavior is exercised separately in
+    // `orchestrator_readiness_publish_tracks_gate_value`.
+    make_producers_with_gate(Arc::new(|| true))
 }
 
 /// Snapshot every envelope currently staged in the producer's outbox (i.e.
@@ -334,6 +343,54 @@ async fn orchestrator_start_publishes_via_periodic_tasks() {
     assert!(
         has_client_latency,
         "periodic client-latency drain publishes recorded sample"
+    );
+}
+
+#[tokio::test]
+async fn orchestrator_readiness_publish_tracks_gate_value() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let ready_flag = Arc::new(AtomicBool::new(false));
+    let flag_for_gate = ready_flag.clone();
+    let gate: ReadinessGate = Arc::new(move || flag_for_gate.load(Ordering::SeqCst));
+    let producers = make_producers_with_gate(gate);
+    let registry = make_registry();
+
+    let cadences = ProducerCadences {
+        readiness_reconcile_interval: Duration::from_millis(20),
+        worker_health_reconcile_interval: Duration::from_secs(3600),
+        worker_load_refresh_interval: Duration::from_secs(3600),
+        client_latency_publish_interval: Duration::from_secs(3600),
+    };
+    let _handles = producers.start(registry, cadences);
+
+    // First reconcile sees `false` — readiness signal must publish a
+    // not-ready envelope.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let entries = live_envelopes(&producers.sync);
+    let initial = entries
+        .iter()
+        .find_map(|e| match e.signal.as_ref()? {
+            SignalKind::SmgReadiness(s) => Some(s.ready),
+            _ => None,
+        })
+        .expect("readiness loop publishes on the first tick");
+    assert!(!initial, "gate=false reflects in published envelope");
+
+    // Flip the gate; the next tick must observe it.
+    ready_flag.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let entries = live_envelopes(&producers.sync);
+    let flipped = entries
+        .iter()
+        .find_map(|e| match e.signal.as_ref()? {
+            SignalKind::SmgReadiness(s) => Some(s.ready),
+            _ => None,
+        })
+        .expect("readiness loop continues to publish after gate flips");
+    assert!(
+        flipped,
+        "gate=true reflects in published envelope after flip"
     );
 }
 
