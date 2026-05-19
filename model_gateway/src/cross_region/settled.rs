@@ -104,14 +104,15 @@ pub fn validate_settled_local_execution(
 mod tests {
     use super::*;
     use crate::cross_region::{
-        CrossRegionCommonHeaders, RegionPeer, RequestMode, SettledRouteMetadata,
+        headers::SUPPORTED_CONTRACT_VERSION, CrossRegionCommonHeaders, RegionPeer, RequestMode,
+        SettledRouteMetadata,
     };
 
     /// Build a valid settled request context for validation tests.
     fn settled_context() -> SettledRequestContext {
         SettledRequestContext {
             common: CrossRegionCommonHeaders {
-                contract_version: 1,
+                contract_version: SUPPORTED_CONTRACT_VERSION.to_string(),
                 source_service: "smg".to_string(),
                 opc_request_id: "opc-request-1".to_string(),
                 entry_region: "us-chicago-1".to_string(),

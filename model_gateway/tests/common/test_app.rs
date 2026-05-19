@@ -6,6 +6,7 @@ use reqwest::Client;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
+    cross_region::CrossRegionBreaker,
     middleware::{AuthConfig, TokenBucket},
     policies::PolicyRegistry,
     routers::RouterTrait,
@@ -107,6 +108,7 @@ pub fn create_test_app(
         router_manager: None,
         mesh_handler: None,
         cross_region_sync: None,
+        cross_region_breaker: CrossRegionBreaker::new(),
     });
 
     // Configure request ID headers (use defaults if not specified)
@@ -150,6 +152,7 @@ pub fn create_test_app_with_context(
         router_manager: None,
         mesh_handler: None,
         cross_region_sync: None,
+        cross_region_breaker: CrossRegionBreaker::new(),
     });
 
     // Get config from the context

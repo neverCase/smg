@@ -13,6 +13,7 @@ use openai_protocol::chat::ChatCompletionRequest;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
+    cross_region::CrossRegionBreaker,
     middleware::{wasm_middleware, TenantRequestMeta},
     routers::RouterTrait,
     server::AppState,
@@ -80,6 +81,7 @@ fn bench_wasm_middleware_buffering(c: &mut Criterion) {
         router_manager: None,
         mesh_handler: None,
         cross_region_sync: None,
+        cross_region_breaker: CrossRegionBreaker::new(),
     });
 
     c.bench_function("wasm_middleware_pre_fix_latency", |b| {

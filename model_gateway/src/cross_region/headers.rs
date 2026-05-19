@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use http::{HeaderMap, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -9,7 +9,7 @@ use super::{
 use crate::config::CrossRegionFailoverMode;
 
 /// Supported cross-region header contract version.
-pub const SUPPORTED_CONTRACT_VERSION: u32 = 1;
+pub const SUPPORTED_CONTRACT_VERSION: &str = "v1";
 
 /// Header carrying the cross-region header contract version.
 pub const CONTRACT_VERSION_HEADER: &str = "x-contract-version";
@@ -61,6 +61,12 @@ pub const REQUEST_MODE_UNRESOLVED: &str = "UNRESOLVED";
 
 /// Header value that means the entry SMG already committed the target region.
 pub const REQUEST_MODE_SETTLED: &str = "SETTLED";
+
+/// Trusted source-service value for unresolved DP-API delegated requests.
+pub const TRUSTED_UNRESOLVED_SOURCE_SERVICE: &str = "dp-api";
+
+/// Source-service value used by SMG when forwarding settled requests.
+pub const SETTLED_SOURCE_SERVICE: &str = "smg";
 
 /// Request mode carried by the cross-region header contract.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -117,7 +123,7 @@ pub struct SettledRouteMetadata {
 /// Common headers required for both unresolved and settled cross-region requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrossRegionCommonHeaders {
-    pub contract_version: u32,
+    pub contract_version: String,
     pub source_service: String,
     pub opc_request_id: String,
     pub entry_region: String,
@@ -151,7 +157,7 @@ impl CrossRegionHeaders {
     pub fn from_request_mode(value: &str) -> CrossRegionResult<Self> {
         let request_mode = value.parse()?;
         let common = CrossRegionCommonHeaders {
-            contract_version: SUPPORTED_CONTRACT_VERSION,
+            contract_version: SUPPORTED_CONTRACT_VERSION.to_string(),
             source_service: "unknown".to_string(),
             opc_request_id: "unknown".to_string(),
             entry_region: "unknown".to_string(),
@@ -189,6 +195,7 @@ impl CrossRegionHeaders {
 
         match common.request_mode {
             RequestMode::Unresolved => {
+                validate_unresolved_source_service(&common.source_service)?;
                 reject_settled_headers_on_unresolved(headers)?;
                 let profile = parse_unresolved_profile(headers, platform_max_retry)?;
                 Ok(Self::Unresolved(UnresolvedRequestContext {
@@ -197,6 +204,7 @@ impl CrossRegionHeaders {
                 }))
             }
             RequestMode::Settled => {
+                validate_settled_source_service(&common.source_service)?;
                 reject_profile_headers_on_settled(headers)?;
                 let route = parse_settled_metadata(headers)?;
                 Ok(Self::Settled(SettledRequestContext { common, route }))
@@ -267,18 +275,15 @@ fn parse_common_headers(headers: &HeaderMap) -> CrossRegionResult<CrossRegionCom
 }
 
 /// Parse and validate the cross-region contract version header.
-fn parse_contract_version(headers: &HeaderMap) -> CrossRegionResult<u32> {
+fn parse_contract_version(headers: &HeaderMap) -> CrossRegionResult<String> {
     let version = required_header(headers, CONTRACT_VERSION_HEADER)?;
-    let parsed = version
-        .parse::<u32>()
-        .map_err(|_| invalid_header(CONTRACT_VERSION_HEADER, "must be an integer"))?;
-    if parsed != SUPPORTED_CONTRACT_VERSION {
+    if version != SUPPORTED_CONTRACT_VERSION {
         return Err(invalid_header(
             CONTRACT_VERSION_HEADER,
             &format!("must be {SUPPORTED_CONTRACT_VERSION}"),
         ));
     }
-    Ok(parsed)
+    Ok(version)
 }
 
 /// Parse the request-mode header into the typed enum.
@@ -286,9 +291,35 @@ fn parse_request_mode(headers: &HeaderMap) -> CrossRegionResult<RequestMode> {
     required_header(headers, REQUEST_MODE_HEADER)?.parse()
 }
 
-/// Parse the failover-mode header into the shared config enum.
+/// Validate that unresolved requests came from the trusted DP-API service.
+fn validate_unresolved_source_service(source_service: &str) -> CrossRegionResult<()> {
+    if source_service != TRUSTED_UNRESOLVED_SOURCE_SERVICE {
+        return Err(invalid_header(
+            SOURCE_SERVICE_HEADER,
+            &format!("must be {TRUSTED_UNRESOLVED_SOURCE_SERVICE} for UNRESOLVED requests"),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that settled requests came from another SMG forwarding hop.
+fn validate_settled_source_service(source_service: &str) -> CrossRegionResult<()> {
+    if source_service != SETTLED_SOURCE_SERVICE {
+        return Err(invalid_header(
+            SOURCE_SERVICE_HEADER,
+            &format!("must be {SETTLED_SOURCE_SERVICE} for SETTLED requests"),
+        ));
+    }
+    Ok(())
+}
+
+/// Parse the failover-mode header, defaulting absent values to conservative manual mode.
 fn parse_failover_mode(headers: &HeaderMap) -> CrossRegionResult<CrossRegionFailoverMode> {
-    required_header(headers, FAILOVER_MODE_HEADER)?
+    let Some(value) = optional_header(headers, FAILOVER_MODE_HEADER)? else {
+        return Ok(CrossRegionFailoverMode::Manual);
+    };
+
+    value
         .parse()
         .map_err(|e: String| invalid_header(FAILOVER_MODE_HEADER, &e))
 }
@@ -338,6 +369,12 @@ fn parse_unresolved_profile(
 /// Parse comma-separated header values into trimmed non-empty strings.
 fn parse_csv_header(headers: &HeaderMap, name: &'static str) -> CrossRegionResult<Vec<String>> {
     let raw = required_header(headers, name)?;
+    if raw.trim_start().starts_with('[') {
+        return Err(invalid_header(
+            name,
+            "must be comma-separated values, not a JSON array",
+        ));
+    }
     let values = raw
         .split(',')
         .map(str::trim)
@@ -351,6 +388,34 @@ fn parse_csv_header(headers: &HeaderMap, name: &'static str) -> CrossRegionResul
         ));
     }
     Ok(values)
+}
+
+/// Attach committed route metadata to a response header map.
+pub fn attach_committed_route_metadata_headers(
+    headers: &mut HeaderMap,
+    route: &SettledRouteMetadata,
+) -> CrossRegionResult<()> {
+    insert_route_metadata_header(headers, TARGET_REGION_HEADER, &route.target_region)?;
+    insert_route_metadata_header(headers, COMMITTED_MODEL_HEADER, &route.committed_model)?;
+    insert_route_metadata_header(headers, ROUTE_ID_HEADER, &route.route_id)?;
+    insert_route_metadata_header(headers, ATTEMPT_HEADER, &route.attempt.to_string())?;
+    Ok(())
+}
+
+/// Insert one committed route metadata header after validating its value.
+fn insert_route_metadata_header(
+    headers: &mut HeaderMap,
+    name: &'static str,
+    value: &str,
+) -> CrossRegionResult<()> {
+    let value = HeaderValue::from_str(value).map_err(|error| {
+        invalid_header(
+            name,
+            &format!("response route metadata value is invalid: {error}"),
+        )
+    })?;
+    headers.insert(name, value);
+    Ok(())
 }
 
 /// Parse settled-only route metadata without requiring routing profile headers.
@@ -456,10 +521,14 @@ mod tests {
     /// Build valid unresolved headers for parser tests.
     fn unresolved_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
-        insert(&mut headers, CONTRACT_VERSION_HEADER, "1");
+        insert(&mut headers, CONTRACT_VERSION_HEADER, "v1");
         insert(&mut headers, REQUEST_MODE_HEADER, REQUEST_MODE_UNRESOLVED);
         insert(&mut headers, ENTRY_REGION_HEADER, "us-ashburn-1");
-        insert(&mut headers, SOURCE_SERVICE_HEADER, "dp-api");
+        insert(
+            &mut headers,
+            SOURCE_SERVICE_HEADER,
+            TRUSTED_UNRESOLVED_SOURCE_SERVICE,
+        );
         insert(&mut headers, OPC_REQUEST_ID_HEADER, "opc-request-1");
         insert(
             &mut headers,
@@ -477,10 +546,10 @@ mod tests {
     /// Build valid settled headers for parser tests.
     fn settled_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
-        insert(&mut headers, CONTRACT_VERSION_HEADER, "1");
+        insert(&mut headers, CONTRACT_VERSION_HEADER, "v1");
         insert(&mut headers, REQUEST_MODE_HEADER, REQUEST_MODE_SETTLED);
         insert(&mut headers, ENTRY_REGION_HEADER, "us-ashburn-1");
-        insert(&mut headers, SOURCE_SERVICE_HEADER, "smg");
+        insert(&mut headers, SOURCE_SERVICE_HEADER, SETTLED_SOURCE_SERVICE);
         insert(&mut headers, OPC_REQUEST_ID_HEADER, "opc-request-1");
         insert(&mut headers, TARGET_REGION_HEADER, "us-chicago-1");
         insert(
@@ -533,6 +602,10 @@ mod tests {
         assert_eq!(context.common.request_mode, RequestMode::Unresolved);
         assert_eq!(context.common.entry_region, "us-ashburn-1");
         assert_eq!(
+            context.common.source_service,
+            TRUSTED_UNRESOLVED_SOURCE_SERVICE
+        );
+        assert_eq!(
             context.profile.allowed_regions,
             vec!["us-ashburn-1".to_string(), "us-chicago-1".to_string()]
         );
@@ -564,13 +637,15 @@ mod tests {
     }
 
     #[test]
-    fn invalid_contract_version_is_rejected() {
-        let mut headers = unresolved_headers();
-        insert(&mut headers, CONTRACT_VERSION_HEADER, "2");
+    fn unsupported_contract_versions_are_rejected() {
+        for version in ["1", "v2", "version-one"] {
+            let mut headers = unresolved_headers();
+            insert(&mut headers, CONTRACT_VERSION_HEADER, version);
 
-        let error = CrossRegionHeaders::parse(&headers, 3).expect_err("invalid version");
+            let error = CrossRegionHeaders::parse(&headers, 3).expect_err("invalid version");
 
-        assert!(error.to_string().contains("must be 1"));
+            assert!(error.to_string().contains("must be v1"));
+        }
     }
 
     #[test]
@@ -591,6 +666,56 @@ mod tests {
         let error = CrossRegionHeaders::parse(&headers, 3).expect_err("missing allowed regions");
 
         assert!(error.to_string().contains(ALLOWED_REGIONS_HEADER));
+    }
+
+    #[test]
+    fn allowed_region_csv_rejects_empty_entries() {
+        let mut headers = unresolved_headers();
+        insert(
+            &mut headers,
+            ALLOWED_REGIONS_HEADER,
+            "us-ashburn-1, , us-chicago-1",
+        );
+
+        let error = CrossRegionHeaders::parse(&headers, 3).expect_err("empty allowed region");
+
+        assert!(error.to_string().contains(ALLOWED_REGIONS_HEADER));
+    }
+
+    #[test]
+    fn list_headers_reject_json_array_values() {
+        for header in [ALLOWED_REGIONS_HEADER, ALLOWED_MODELS_HEADER] {
+            let mut headers = unresolved_headers();
+            insert(&mut headers, header, r#"["cohere.command-r-plus"]"#);
+
+            let error = CrossRegionHeaders::parse(&headers, 3).expect_err("json array");
+
+            assert!(error.to_string().contains("comma-separated"));
+        }
+    }
+
+    #[test]
+    fn unresolved_source_service_must_be_trusted_dp_api() {
+        let mut headers = unresolved_headers();
+        insert(&mut headers, SOURCE_SERVICE_HEADER, "other-service");
+
+        let error = CrossRegionHeaders::parse(&headers, 3).expect_err("untrusted source service");
+
+        assert!(error.to_string().contains(SOURCE_SERVICE_HEADER));
+        assert!(error
+            .to_string()
+            .contains(TRUSTED_UNRESOLVED_SOURCE_SERVICE));
+    }
+
+    #[test]
+    fn settled_source_service_must_be_smg() {
+        let mut headers = settled_headers();
+        insert(&mut headers, SOURCE_SERVICE_HEADER, "dp-api");
+
+        let error = CrossRegionHeaders::parse(&headers, 3).expect_err("unsupported settled source");
+
+        assert!(error.to_string().contains(SOURCE_SERVICE_HEADER));
+        assert!(error.to_string().contains(SETTLED_SOURCE_SERVICE));
     }
 
     #[test]
@@ -624,6 +749,47 @@ mod tests {
         let profile = parsed.profile().expect("unresolved profile");
 
         assert_eq!(profile.failover_policy.max_retry, 2);
+    }
+
+    #[test]
+    fn missing_failover_mode_defaults_to_manual() {
+        let mut headers = unresolved_headers();
+        headers.remove(FAILOVER_MODE_HEADER);
+
+        let parsed = CrossRegionHeaders::parse(&headers, 3).expect("headers should parse");
+        let profile = parsed.profile().expect("unresolved profile");
+
+        assert_eq!(
+            profile.failover_policy.failover_mode,
+            CrossRegionFailoverMode::Manual
+        );
+    }
+
+    #[test]
+    fn explicit_failover_modes_are_parsed() {
+        for (value, expected) in [
+            ("MANUAL", CrossRegionFailoverMode::Manual),
+            ("AUTO", CrossRegionFailoverMode::Automatic),
+            ("AUTOMATIC", CrossRegionFailoverMode::Automatic),
+        ] {
+            let mut headers = unresolved_headers();
+            insert(&mut headers, FAILOVER_MODE_HEADER, value);
+
+            let parsed = CrossRegionHeaders::parse(&headers, 3).expect("headers should parse");
+            let profile = parsed.profile().expect("unresolved profile");
+
+            assert_eq!(profile.failover_policy.failover_mode, expected);
+        }
+    }
+
+    #[test]
+    fn invalid_explicit_failover_mode_is_rejected() {
+        let mut headers = unresolved_headers();
+        insert(&mut headers, FAILOVER_MODE_HEADER, "sometimes");
+
+        let error = CrossRegionHeaders::parse(&headers, 3).expect_err("invalid failover mode");
+
+        assert!(error.to_string().contains(FAILOVER_MODE_HEADER));
     }
 
     #[test]
@@ -715,6 +881,45 @@ mod tests {
                 .expect("settled route metadata")
                 .target_region,
             "us-chicago-1"
+        );
+    }
+
+    #[test]
+    fn committed_route_metadata_headers_are_attached_to_response_headers() {
+        let mut headers = HeaderMap::new();
+        let route = SettledRouteMetadata {
+            target_region: "us-chicago-1".to_string(),
+            committed_model: "cohere.command-r-plus".to_string(),
+            route_id: "route-1".to_string(),
+            attempt: 2,
+        };
+
+        attach_committed_route_metadata_headers(&mut headers, &route)
+            .expect("metadata headers should attach");
+
+        assert_eq!(
+            headers
+                .get(TARGET_REGION_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("us-chicago-1")
+        );
+        assert_eq!(
+            headers
+                .get(COMMITTED_MODEL_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("cohere.command-r-plus")
+        );
+        assert_eq!(
+            headers
+                .get(ROUTE_ID_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("route-1")
+        );
+        assert_eq!(
+            headers
+                .get(ATTEMPT_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("2")
         );
     }
 }

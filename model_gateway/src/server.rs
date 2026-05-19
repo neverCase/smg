@@ -74,17 +74,17 @@ use crate::{
         build_request_forwarding_http_client,
         config::seconds_to_millis_saturating,
         forwarding::{
-            is_streaming_remote_forward_response, should_failover_remote_forward,
-            should_record_remote_forward_failure,
+            is_retryable_remote_forward_status, is_streaming_remote_forward_response,
+            should_failover_remote_forward, should_record_remote_forward_failure,
         },
-        headers::REQUEST_MODE_HEADER,
+        headers::{attach_committed_route_metadata_headers, REQUEST_MODE_HEADER},
         validate_settled_local_execution, AuthenticatedPeerIdentity, CandidateCalculationInput,
         CandidateCalculator, CrossRegionBreaker, CrossRegionContext, CrossRegionError,
         CrossRegionForwarder, CrossRegionHeaders, CrossRegionRuntimeConfig, CrossRegionState,
         CrossRegionSyncRuntime, ExecutionTarget, FailoverPolicy, ForwardingRequest,
         ForwardingTarget, RegionPeer, RegionPeerRegistry, RemoteRegionView, RouteCalculationInput,
-        RouteCalculationOutput, RoutingProfileContext, SettledRequestContext,
-        UnresolvedRequestContext,
+        RouteCalculationOutput, RouteCommit, RoutingProfileContext, SettledRequestContext,
+        SettledRouteMetadata, UnresolvedRequestContext,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -500,6 +500,40 @@ fn serialize_forwarding_body<T: Serialize>(body: &T) -> Result<Vec<u8>, Inferenc
     })
 }
 
+/// Convert a route commit into response-safe route metadata headers.
+fn settled_route_metadata_from_commit(commit: &RouteCommit) -> SettledRouteMetadata {
+    SettledRouteMetadata {
+        target_region: commit.target_region.clone(),
+        committed_model: commit.model_id.clone(),
+        route_id: commit.route_id.clone(),
+        attempt: commit.attempt,
+    }
+}
+
+/// Attach committed route metadata to an inference response.
+fn response_with_committed_route_metadata(
+    mut response: Response,
+    commit: &RouteCommit,
+) -> Response {
+    let metadata = settled_route_metadata_from_commit(commit);
+    if let Err(error) = attach_committed_route_metadata_headers(response.headers_mut(), &metadata) {
+        return InferenceDispatchError::from(error).into_response();
+    }
+    response
+}
+
+/// Build a remote forwarding attempt result after adding route metadata headers.
+fn remote_forward_attempt_result(
+    response: Response,
+    should_failover: bool,
+    commit: &RouteCommit,
+) -> RemoteForwardAttemptResult {
+    RemoteForwardAttemptResult {
+        response: response_with_committed_route_metadata(response, commit),
+        should_failover,
+    }
+}
+
 /// Build the outbound mTLS HTTP client for a specific remote Region Agent target.
 async fn request_forwarding_client(
     router_config: &RouterConfig,
@@ -526,28 +560,31 @@ async fn forward_unresolved_to_remote_attempt(
     {
         Ok(request) => request,
         Err(error) => {
-            return RemoteForwardAttemptResult {
-                response: InferenceDispatchError::from(error).into_response(),
-                should_failover: false,
-            };
+            return remote_forward_attempt_result(
+                InferenceDispatchError::from(error).into_response(),
+                false,
+                &plan.output.commit,
+            );
         }
     };
     let target = match forwarder.forwarding_target_for_decision(&plan.output.decision, &request) {
         Ok(target) => target,
         Err(error) => {
-            return RemoteForwardAttemptResult {
-                response: InferenceDispatchError::from(error).into_response(),
-                should_failover: false,
-            };
+            return remote_forward_attempt_result(
+                InferenceDispatchError::from(error).into_response(),
+                false,
+                &plan.output.commit,
+            );
         }
     };
     let client = match request_forwarding_client(&state.context.router_config, &target).await {
         Ok(client) => client,
         Err(error) => {
-            return RemoteForwardAttemptResult {
-                response: error.into_response(),
-                should_failover: false,
-            };
+            return remote_forward_attempt_result(
+                error.into_response(),
+                false,
+                &plan.output.commit,
+            );
         }
     };
     let target_region = plan.output.decision.target_region.clone();
@@ -559,7 +596,7 @@ async fn forward_unresolved_to_remote_attempt(
             let status = response.status();
             let streaming_started = is_streaming_remote_forward_response(&response);
             let should_failover = should_failover_remote_forward(
-                &plan.failover_policy,
+                plan.failover_policy,
                 status,
                 streaming_started,
                 attempt,
@@ -580,30 +617,23 @@ async fn forward_unresolved_to_remote_attempt(
                         .record_latency(&target_region, elapsed_ms);
                 }
             }
-            RemoteForwardAttemptResult {
-                response,
-                should_failover,
-            }
+            remote_forward_attempt_result(response, should_failover, &plan.output.commit)
         }
         Err(error) => {
             state.cross_region_breaker.record_failure(&target_region);
             let status = error.http_status();
-            RemoteForwardAttemptResult {
-                response: InferenceDispatchError::from(error).into_response(),
-                should_failover: should_failover_remote_forward(
-                    &plan.failover_policy,
-                    status,
-                    false,
-                    attempt,
-                ),
-            }
+            remote_forward_attempt_result(
+                InferenceDispatchError::from(error).into_response(),
+                should_failover_remote_forward(plan.failover_policy, status, false, attempt),
+                &plan.output.commit,
+            )
         }
     }
 }
 
 /// Return true for retryable responses whose streaming body already started.
 fn is_retryable_response_after_stream_start(status: StatusCode, streaming_started: bool) -> bool {
-    streaming_started && crate::cross_region::forwarding::is_retryable_remote_forward_status(status)
+    streaming_started && is_retryable_remote_forward_status(status)
 }
 
 async fn parse_function_call(
@@ -988,10 +1018,11 @@ async fn unresolved_chat_request_plane_response(
                     model = %plan.output.decision.model_id,
                     "executing unresolved cross-region chat request locally after route commit"
                 );
-                return state
+                let response = state
                     .router
                     .route_chat(Some(&headers), &tenant_meta, &body, &body.model)
                     .await;
+                return response_with_committed_route_metadata(response, &plan.output.commit);
             }
             ExecutionTarget::RemoteRegion { region_id } => {
                 debug!(
@@ -1067,10 +1098,11 @@ async fn unresolved_responses_request_plane_response(
                     model = %plan.output.decision.model_id,
                     "executing unresolved cross-region responses request locally after route commit"
                 );
-                return state
+                let response = state
                     .router
                     .route_responses(Some(&headers), &tenant_meta, &body, &body.model)
                     .await;
+                return response_with_committed_route_metadata(response, &plan.output.commit);
             }
             ExecutionTarget::RemoteRegion { region_id } => {
                 debug!(
@@ -2908,7 +2940,8 @@ mod tests {
     use http::HeaderValue;
     use llm_tokenizer::registry::TokenizerRegistry;
     use openai_protocol::{
-        chat::ChatCompletionRequest, responses::ResponsesRequest, validated::ValidatedJson,
+        chat::ChatCompletionRequest, model_card::ModelCard, responses::ResponsesRequest,
+        validated::ValidatedJson, worker::WorkerStatus,
     };
     use smg_data_connector::{
         current_request_context, MemoryConversationItemStorage, MemoryConversationStorage,
@@ -2918,16 +2951,20 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::CrossRegionPeerConfig,
-        cross_region::headers::{
-            ALLOWED_MODELS_HEADER, ALLOWED_REGIONS_HEADER, ATTEMPT_HEADER, COMMITTED_MODEL_HEADER,
-            CONTRACT_VERSION_HEADER, ENTRY_REGION_HEADER, FAILOVER_MODE_HEADER, MAX_RETRY_HEADER,
-            OPC_REQUEST_ID_HEADER, REQUEST_MODE_HEADER, REQUEST_MODE_SETTLED,
-            REQUEST_MODE_UNRESOLVED, ROUTE_ID_HEADER, SOURCE_SERVICE_HEADER, TARGET_REGION_HEADER,
+        config::{CrossRegionFailoverMode, CrossRegionPeerConfig},
+        cross_region::{
+            headers::{
+                ALLOWED_MODELS_HEADER, ALLOWED_REGIONS_HEADER, ATTEMPT_HEADER,
+                COMMITTED_MODEL_HEADER, CONTRACT_VERSION_HEADER, ENTRY_REGION_HEADER,
+                FAILOVER_MODE_HEADER, MAX_RETRY_HEADER, OPC_REQUEST_ID_HEADER, REQUEST_MODE_HEADER,
+                REQUEST_MODE_SETTLED, REQUEST_MODE_UNRESOLVED, ROUTE_ID_HEADER,
+                SOURCE_SERVICE_HEADER, TARGET_REGION_HEADER,
+            },
+            ModalityPolicy, RegionRouteDecision, RequestMode, RouteCommit, RouteDecisionLogContext,
         },
         policies::PolicyRegistry,
         tenant::{canonical_tenant_key, TenantIdentity},
-        worker::WorkerRegistry,
+        worker::{BasicWorkerBuilder, WorkerRegistry},
     };
 
     #[derive(Debug, Default)]
@@ -2991,6 +3028,15 @@ mod tests {
         router: Arc<DispatchSpyRouter>,
         configure: impl FnOnce(&mut RouterConfig),
     ) -> Arc<AppState> {
+        test_state_with_router_config_and_local_worker(router, configure, false)
+    }
+
+    /// Build a minimal app state with an optional local candidate worker.
+    fn test_state_with_router_config_and_local_worker(
+        router: Arc<DispatchSpyRouter>,
+        configure: impl FnOnce(&mut RouterConfig),
+        register_local_worker: bool,
+    ) -> Arc<AppState> {
         let mut router_config = RouterConfig::default();
         router_config.cross_region.enabled = true;
         router_config.cross_region.region_id = Some("us-ashburn-1".to_string());
@@ -3006,6 +3052,17 @@ mod tests {
         configure(&mut router_config);
 
         let worker_registry = Arc::new(WorkerRegistry::new());
+        if register_local_worker {
+            let worker = Arc::new(
+                BasicWorkerBuilder::new("http://local-worker:8000")
+                    .model(ModelCard::new("cohere.command-r-plus"))
+                    .status(WorkerStatus::Ready)
+                    .build(),
+            );
+            worker_registry
+                .register(worker)
+                .expect("local worker should register");
+        }
         let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
 
         let context = Arc::new(
@@ -3040,6 +3097,11 @@ mod tests {
             cross_region_sync: None,
             cross_region_breaker: CrossRegionBreaker::new(),
         })
+    }
+
+    /// Build a test state with one ready local worker for route-commit tests.
+    fn test_state_with_local_worker(router: Arc<DispatchSpyRouter>) -> Arc<AppState> {
+        test_state_with_router_config_and_local_worker(router, |_| {}, true)
     }
 
     /// Build tenant metadata for direct handler calls.
@@ -3163,7 +3225,7 @@ mod tests {
     /// Build valid unresolved cross-region headers.
     fn unresolved_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
-        insert(&mut headers, CONTRACT_VERSION_HEADER, "1");
+        insert(&mut headers, CONTRACT_VERSION_HEADER, "v1");
         insert(&mut headers, REQUEST_MODE_HEADER, REQUEST_MODE_UNRESOLVED);
         insert(&mut headers, ENTRY_REGION_HEADER, "us-ashburn-1");
         insert(&mut headers, SOURCE_SERVICE_HEADER, "dp-api");
@@ -3182,7 +3244,7 @@ mod tests {
     /// Build valid settled cross-region headers.
     fn settled_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
-        insert(&mut headers, CONTRACT_VERSION_HEADER, "1");
+        insert(&mut headers, CONTRACT_VERSION_HEADER, "v1");
         insert(&mut headers, REQUEST_MODE_HEADER, REQUEST_MODE_SETTLED);
         insert(&mut headers, ENTRY_REGION_HEADER, "us-chicago-1");
         insert(&mut headers, SOURCE_SERVICE_HEADER, "smg");
@@ -3204,6 +3266,89 @@ mod tests {
             .await
             .expect("response body should read");
         String::from_utf8(bytes.to_vec()).expect("response body should be UTF-8")
+    }
+
+    /// Assert a response carries the committed route metadata headers.
+    fn assert_committed_route_headers(
+        response: &Response,
+        target_region: &str,
+        committed_model: &str,
+        attempt: &str,
+    ) {
+        assert_eq!(
+            response
+                .headers()
+                .get(TARGET_REGION_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(target_region)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(COMMITTED_MODEL_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(committed_model)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(ATTEMPT_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(attempt)
+        );
+        let route_id = response
+            .headers()
+            .get(ROUTE_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("route id response header should be present");
+        assert!(!route_id.is_empty());
+    }
+
+    /// Build a remote route plan fixture for remote response-boundary tests.
+    fn remote_route_plan() -> UnresolvedRoutePlan {
+        let decision = RegionRouteDecision {
+            route_id: "route-remote-1".to_string(),
+            target_region: "us-chicago-1".to_string(),
+            model_id: "cohere.command-r-plus".to_string(),
+            execution_target: ExecutionTarget::RemoteRegion {
+                region_id: "us-chicago-1".to_string(),
+            },
+        };
+        let commit = RouteCommit::from_decision(
+            decision.clone(),
+            "us-ashburn-1",
+            RequestMode::Settled,
+            1,
+            CrossRegionFailoverMode::Automatic,
+        );
+        let profile = RoutingProfileContext::new(
+            vec!["us-ashburn-1".to_string(), "us-chicago-1".to_string()],
+            vec!["cohere.command-r-plus".to_string()],
+            FailoverPolicy::new(CrossRegionFailoverMode::Automatic, 1),
+            ModalityPolicy::default(),
+        )
+        .expect("profile should build");
+        let peer = RegionPeer::new(
+            "us-chicago-1",
+            "https://smg-region-agent.us-chicago-1.internal:8443",
+            "https://smg-region-agent.us-chicago-1.internal:9443",
+            "oc1",
+            "prod",
+            None,
+        )
+        .expect("peer should build");
+
+        UnresolvedRoutePlan {
+            output: RouteCalculationOutput {
+                decision,
+                log_context: RouteDecisionLogContext::from_commit(&commit),
+                commit,
+            },
+            peer_registry: RegionPeerRegistry::new(vec![peer]).expect("peer registry should build"),
+            profile,
+            entry_region: "us-ashburn-1".to_string(),
+            failover_policy: FailoverPolicy::new(CrossRegionFailoverMode::Automatic, 1),
+        }
     }
 
     /// Build an HTTP request for exercising the forwarding Axum app.
@@ -3307,6 +3452,25 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.contains("no eligible cross-region candidate"));
         assert_eq!(router.chat_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unresolved_chat_local_route_returns_committed_route_headers() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state_with_local_worker(router.clone());
+
+        let response = v1_chat_completions(
+            State(state),
+            unresolved_headers(),
+            Extension(tenant_meta()),
+            ValidatedJson(chat_request()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_committed_route_headers(&response, "us-ashburn-1", "cohere.command-r-plus", "1");
+        assert_eq!(body_text(response).await, "local chat");
+        assert_eq!(router.chat_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -3493,6 +3657,51 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.contains("no eligible cross-region candidate"));
         assert_eq!(router.responses_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unresolved_responses_local_route_returns_committed_route_headers() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state_with_local_worker(router.clone());
+
+        let response = v1_responses(
+            State(state),
+            unresolved_headers(),
+            Extension(tenant_meta()),
+            ValidatedJson(responses_request()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_committed_route_headers(&response, "us-ashburn-1", "cohere.command-r-plus", "1");
+        assert_eq!(body_text(response).await, "local responses");
+        assert_eq!(router.responses_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_forward_attempt_returns_committed_route_headers_on_chat_and_responses() {
+        let router = Arc::new(DispatchSpyRouter::default());
+        let state = test_state(router);
+
+        for path in ["/v1/chat/completions", "/v1/responses"] {
+            let plan = remote_route_plan();
+            let result = forward_unresolved_to_remote_attempt(
+                &state,
+                &unresolved_headers(),
+                path,
+                br#"{"model":"cohere.command-r-plus"}"#.to_vec(),
+                &plan,
+            )
+            .await;
+
+            assert!(!result.should_failover);
+            assert_committed_route_headers(
+                &result.response,
+                "us-chicago-1",
+                "cohere.command-r-plus",
+                "1",
+            );
+        }
     }
 
     #[tokio::test]

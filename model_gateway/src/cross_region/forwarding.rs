@@ -9,8 +9,8 @@ use super::{
     headers::{
         ALLOWED_MODELS_HEADER, ALLOWED_REGIONS_HEADER, ATTEMPT_HEADER, COMMITTED_MODEL_HEADER,
         FAILOVER_MODE_HEADER, INPUT_MODALITY_HEADER, MAX_RETRY_HEADER, OUTPUT_MODALITY_HEADER,
-        REQUEST_MODE_HEADER, REQUEST_MODE_SETTLED, ROUTE_ID_HEADER, SOURCE_SERVICE_HEADER,
-        TARGET_REGION_HEADER,
+        REQUEST_MODE_HEADER, REQUEST_MODE_SETTLED, ROUTE_ID_HEADER, SETTLED_SOURCE_SERVICE,
+        SOURCE_SERVICE_HEADER, TARGET_REGION_HEADER,
     },
     peers::RegionPeerRequestTarget,
     CrossRegionError, CrossRegionMtlsRuntimeConfig, CrossRegionResult, ExecutionTarget,
@@ -147,7 +147,7 @@ fn settled_forwarding_headers(
     remove_local_worker_selection_headers(&mut headers);
     remove_transport_headers(&mut headers);
     insert_static_header(&mut headers, REQUEST_MODE_HEADER, REQUEST_MODE_SETTLED);
-    insert_static_header(&mut headers, SOURCE_SERVICE_HEADER, "smg");
+    insert_static_header(&mut headers, SOURCE_SERVICE_HEADER, SETTLED_SOURCE_SERVICE);
     insert_header(&mut headers, TARGET_REGION_HEADER, &commit.target_region)?;
     insert_header(&mut headers, COMMITTED_MODEL_HEADER, &commit.model_id)?;
     insert_header(&mut headers, ROUTE_ID_HEADER, &commit.route_id)?;
@@ -244,7 +244,7 @@ pub(crate) fn is_streaming_remote_forward_response(response: &Response) -> bool 
 /// the initial committed forwarding attempt, so attempt 1 may fail over when
 /// `max_retry >= 1`.
 pub(crate) fn should_failover_remote_forward(
-    policy: &FailoverPolicy,
+    policy: FailoverPolicy,
     status: StatusCode,
     streaming_response_started: bool,
     attempt: u32,
@@ -404,7 +404,7 @@ mod tests {
     use std::sync::Arc;
 
     use axum::{body::Bytes, extract::State, routing::post, Router};
-    use tokio::sync::oneshot;
+    use tokio::sync::{oneshot, Mutex};
 
     use super::*;
     use crate::cross_region::{
@@ -412,7 +412,8 @@ mod tests {
             ALLOWED_MODELS_HEADER, ALLOWED_REGIONS_HEADER, ATTEMPT_HEADER, COMMITTED_MODEL_HEADER,
             CONTRACT_VERSION_HEADER, ENTRY_REGION_HEADER, FAILOVER_MODE_HEADER, MAX_RETRY_HEADER,
             OPC_REQUEST_ID_HEADER, REQUEST_MODE_HEADER, REQUEST_MODE_SETTLED,
-            REQUEST_MODE_UNRESOLVED, ROUTE_ID_HEADER, SOURCE_SERVICE_HEADER, TARGET_REGION_HEADER,
+            REQUEST_MODE_UNRESOLVED, ROUTE_ID_HEADER, SETTLED_SOURCE_SERVICE,
+            SOURCE_SERVICE_HEADER, TARGET_REGION_HEADER,
         },
         RegionPeer, RequestMode, RouteCommit,
     };
@@ -445,7 +446,7 @@ mod tests {
     /// Build unresolved headers as received from DP-API before route commitment.
     fn unresolved_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
-        insert(&mut headers, CONTRACT_VERSION_HEADER, "1");
+        insert(&mut headers, CONTRACT_VERSION_HEADER, "v1");
         insert(&mut headers, REQUEST_MODE_HEADER, REQUEST_MODE_UNRESOLVED);
         insert(&mut headers, ENTRY_REGION_HEADER, "us-ashburn-1");
         insert(&mut headers, SOURCE_SERVICE_HEADER, "dp-api");
@@ -485,7 +486,7 @@ mod tests {
         );
         assert_eq!(
             request.headers().get(SOURCE_SERVICE_HEADER),
-            Some(&HeaderValue::from_static("smg"))
+            Some(&HeaderValue::from_static(SETTLED_SOURCE_SERVICE))
         );
         assert_eq!(
             request.headers().get(TARGET_REGION_HEADER),
@@ -513,9 +514,13 @@ mod tests {
         assert_eq!(request.body(), br#"{"model":"cohere.command-r-plus"}"#);
     }
 
+    type CapturedForwardedRequest = (HeaderMap, Bytes);
+    type CapturedForwardedRequestSender = oneshot::Sender<CapturedForwardedRequest>;
+    type SharedCapturedForwardedRequestSender = Arc<Mutex<Option<CapturedForwardedRequestSender>>>;
+
     #[derive(Clone)]
     struct CaptureState {
-        sender: Arc<tokio::sync::Mutex<Option<oneshot::Sender<(HeaderMap, Bytes)>>>>,
+        sender: SharedCapturedForwardedRequestSender,
     }
 
     /// Capture the headers and body sent to the fake remote Region Agent.
@@ -543,7 +548,7 @@ mod tests {
         let app = Router::new()
             .route(path, post(capture_forwarded_request))
             .with_state(CaptureState {
-                sender: Arc::new(tokio::sync::Mutex::new(Some(sender))),
+                sender: Arc::new(Mutex::new(Some(sender))),
             });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -835,7 +840,7 @@ mod tests {
         let policy = FailoverPolicy::new(CrossRegionFailoverMode::Manual, 3);
 
         assert!(!should_failover_remote_forward(
-            &policy,
+            policy,
             StatusCode::SERVICE_UNAVAILABLE,
             false,
             1
@@ -851,13 +856,13 @@ mod tests {
         let policy = FailoverPolicy::new(CrossRegionFailoverMode::Automatic, 1);
 
         assert!(should_failover_remote_forward(
-            &policy,
+            policy,
             StatusCode::SERVICE_UNAVAILABLE,
             false,
             1
         ));
         assert!(!should_failover_remote_forward(
-            &policy,
+            policy,
             StatusCode::SERVICE_UNAVAILABLE,
             false,
             2
@@ -873,7 +878,7 @@ mod tests {
         let policy = FailoverPolicy::new(CrossRegionFailoverMode::Automatic, 3);
 
         assert!(!should_failover_remote_forward(
-            &policy,
+            policy,
             StatusCode::SERVICE_UNAVAILABLE,
             true,
             1
@@ -893,7 +898,7 @@ mod tests {
             let breaker = crate::cross_region::CrossRegionBreaker::with_failure_threshold(1);
 
             assert!(!should_failover_remote_forward(
-                &policy,
+                policy,
                 StatusCode::SERVICE_UNAVAILABLE,
                 false,
                 1

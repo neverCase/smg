@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, RwLockWriteGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -110,10 +110,7 @@ impl CrossRegionBreaker {
 
     /// Return the current state for a region; the skeleton defaults to closed.
     pub fn state_for(&self, region_id: &str) -> BreakerState {
-        let mut regions = self
-            .regions
-            .write()
-            .expect("cross-region breaker lock should not be poisoned");
+        let mut regions = self.write_regions();
         let Some(region) = regions.get_mut(region_id) else {
             return self.default_state;
         };
@@ -128,10 +125,7 @@ impl CrossRegionBreaker {
 
     /// Record a successful request-forward attempt for a target region.
     pub fn record_success(&self, region_id: &str) {
-        let mut regions = self
-            .regions
-            .write()
-            .expect("cross-region breaker lock should not be poisoned");
+        let mut regions = self.write_regions();
         let region = regions
             .entry(region_id.to_string())
             .or_insert_with(|| RegionBreakerState::new(self.default_state));
@@ -153,10 +147,7 @@ impl CrossRegionBreaker {
 
     /// Record a failed request-forward attempt for a target region.
     pub fn record_failure(&self, region_id: &str) {
-        let mut regions = self
-            .regions
-            .write()
-            .expect("cross-region breaker lock should not be poisoned");
+        let mut regions = self.write_regions();
         let region = regions
             .entry(region_id.to_string())
             .or_insert_with(|| RegionBreakerState::new(self.default_state));
@@ -172,6 +163,14 @@ impl CrossRegionBreaker {
                 }
             }
             BreakerState::Open => {}
+        }
+    }
+
+    /// Return the region-state write guard, recovering advisory breaker state after lock poisoning.
+    fn write_regions(&self) -> RwLockWriteGuard<'_, HashMap<String, RegionBreakerState>> {
+        match self.regions.write() {
+            Ok(regions) => regions,
+            Err(poisoned) => poisoned.into_inner(),
         }
     }
 

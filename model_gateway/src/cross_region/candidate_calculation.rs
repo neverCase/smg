@@ -74,7 +74,9 @@ pub struct RegionCandidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_latency_hint_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_load: Option<isize>,
+    pub ready_worker_load_sum: Option<isize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_worker_load_average_millis: Option<isize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freshness_age_ms: Option<i64>,
 }
@@ -365,7 +367,7 @@ impl CandidateCalculator {
     /// Return the comparable worker-load rank for a candidate.
     fn worker_load_rank(&self, candidate: &RegionCandidate) -> isize {
         candidate
-            .worker_load
+            .ready_worker_load_average_millis
             .unwrap_or(self.ranking_config.missing_worker_load)
     }
 
@@ -376,9 +378,9 @@ impl CandidateCalculator {
     ) -> Result<RegionCandidate, CandidateRejectionReason> {
         let model_workers = input
             .local_worker_registry
-            .get_all()
+            .get_all_with_ids()
             .into_iter()
-            .filter(|worker| worker.supports_model(model_id))
+            .filter(|(_, worker)| worker.supports_model(model_id))
             .collect::<Vec<_>>();
         if model_workers.is_empty() {
             return Err(CandidateRejectionReason::ModelNotAllowed);
@@ -386,7 +388,7 @@ impl CandidateCalculator {
 
         let endpoint_workers = model_workers
             .into_iter()
-            .filter(|worker| worker.supports_endpoint(model_id, input.endpoint_type))
+            .filter(|(_, worker)| worker.supports_endpoint(model_id, input.endpoint_type))
             .collect::<Vec<_>>();
         if endpoint_workers.is_empty() {
             return Err(CandidateRejectionReason::EndpointUnsupported);
@@ -394,20 +396,59 @@ impl CandidateCalculator {
 
         let modality_workers = endpoint_workers
             .into_iter()
-            .filter(|worker| worker_supports_modality(worker, model_id, &input.profile.modality))
+            .filter(|(_, worker)| {
+                worker_supports_modality(worker, model_id, &input.profile.modality)
+            })
             .collect::<Vec<_>>();
         if modality_workers.is_empty() {
             return Err(CandidateRejectionReason::ModalityUnsupported);
         }
 
         let worker_health = worker_health_summary(
-            modality_workers.iter().map(|worker| worker.status()),
+            modality_workers.iter().map(|(_, worker)| worker.status()),
             modality_workers.len(),
         );
-        let worker_load = modality_workers.iter().fold(0isize, |load, worker| {
-            load.saturating_add(usize_to_isize(worker.load()))
-        });
-        let has_capacity = modality_workers.iter().any(|worker| worker.is_available());
+        let has_capacity = modality_workers
+            .iter()
+            .any(|(_, worker)| worker.is_available());
+        let mut ready_worker_load_sum = 0isize;
+        let mut ready_worker_count = 0usize;
+        for (worker_id, worker) in &modality_workers {
+            let status = worker.status();
+            let load = usize_to_isize(worker.load());
+            let included_in_average = status.is_routable();
+            let exclusion_reason = if included_in_average {
+                "none"
+            } else {
+                "not_routable"
+            };
+            tracing::trace!(
+                region_id = %input.local_region,
+                model_id,
+                worker_id = %worker_id.as_str(),
+                status = %status,
+                load = load,
+                included_in_average = included_in_average,
+                exclusion_reason = exclusion_reason,
+                "local candidate worker load"
+            );
+            if included_in_average {
+                ready_worker_load_sum = ready_worker_load_sum.saturating_add(load);
+                ready_worker_count += 1;
+            }
+        }
+        let ready_worker_load_sum = (ready_worker_count > 0).then_some(ready_worker_load_sum);
+        let ready_worker_load_average_millis =
+            ready_worker_load_average_millis(ready_worker_load_sum, ready_worker_count);
+        tracing::debug!(
+            region_id = %input.local_region,
+            model_id,
+            eligible_worker_count = modality_workers.len(),
+            ready_worker_count = ready_worker_count,
+            ready_worker_load_sum = ?ready_worker_load_sum,
+            ready_worker_load_average_millis = ?ready_worker_load_average_millis,
+            "built local candidate worker load summary"
+        );
 
         Ok(RegionCandidate {
             region_id: input.local_region.clone(),
@@ -419,7 +460,8 @@ impl CandidateCalculator {
             healthy: worker_health.ready_workers > 0,
             has_capacity,
             client_latency_hint_ms: None,
-            worker_load: Some(worker_load),
+            ready_worker_load_sum,
+            ready_worker_load_average_millis,
             freshness_age_ms: None,
         })
     }
@@ -475,7 +517,8 @@ impl CandidateCalculator {
         }
 
         let mut selected_statuses = Vec::new();
-        let mut selected_load = 0isize;
+        let mut ready_worker_load_sum = 0isize;
+        let mut ready_worker_count = 0usize;
         let mut saw_model_mismatch = false;
         let mut saw_stale_signal = false;
 
@@ -509,8 +552,32 @@ impl CandidateCalculator {
                 freshness_age_ms = freshness_age_ms.max(age);
             }
 
+            let included_in_average = status.is_routable();
+            let exclusion_reason = if included_in_average {
+                "none"
+            } else {
+                "not_routable"
+            };
+            let worker_freshness_age_ms = max_optional_i64(
+                load_resolution.freshness_age_ms,
+                status_resolution.freshness_age_ms,
+            );
+            tracing::trace!(
+                region_id,
+                model_id,
+                worker_id = %projection.worker_id(),
+                status = %status,
+                load = load_total,
+                included_in_average = included_in_average,
+                exclusion_reason = exclusion_reason,
+                freshness_age_ms = ?worker_freshness_age_ms,
+                "remote candidate worker load"
+            );
             selected_statuses.push(status);
-            selected_load = selected_load.saturating_add(load_total);
+            if included_in_average {
+                ready_worker_load_sum = ready_worker_load_sum.saturating_add(load_total);
+                ready_worker_count += 1;
+            }
         }
 
         if selected_statuses.is_empty() {
@@ -541,6 +608,18 @@ impl CandidateCalculator {
         let total_workers = selected_statuses.len();
         let worker_health = worker_health_summary(selected_statuses, total_workers);
         let healthy = readiness_ready && worker_health.ready_workers > 0;
+        let ready_worker_load_sum = (ready_worker_count > 0).then_some(ready_worker_load_sum);
+        let ready_worker_load_average_millis =
+            ready_worker_load_average_millis(ready_worker_load_sum, ready_worker_count);
+        tracing::debug!(
+            region_id,
+            model_id,
+            eligible_worker_count = total_workers,
+            ready_worker_count = ready_worker_count,
+            ready_worker_load_sum = ?ready_worker_load_sum,
+            ready_worker_load_average_millis = ?ready_worker_load_average_millis,
+            "built remote candidate worker load summary"
+        );
 
         Ok(RegionCandidate {
             region_id: region_id.to_string(),
@@ -552,9 +631,37 @@ impl CandidateCalculator {
             healthy,
             has_capacity: worker_health.ready_workers > 0,
             client_latency_hint_ms,
-            worker_load: Some(selected_load),
+            ready_worker_load_sum,
+            ready_worker_load_average_millis,
             freshness_age_ms: Some(freshness_age_ms),
         })
+    }
+}
+
+/// Calculate fixed-point average load for ready workers, in thousandths.
+fn ready_worker_load_average_millis(
+    ready_worker_load_sum: Option<isize>,
+    ready_worker_count: usize,
+) -> Option<isize> {
+    let ready_worker_load_sum = ready_worker_load_sum?;
+    let ready_worker_count = usize_to_isize(ready_worker_count);
+    if ready_worker_count == 0 {
+        return None;
+    }
+    Some(
+        ready_worker_load_sum
+            .saturating_mul(1_000)
+            .saturating_div(ready_worker_count),
+    )
+}
+
+/// Return the maximum of two optional age values.
+fn max_optional_i64(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
     }
 }
 
@@ -1109,6 +1216,61 @@ mod tests {
     }
 
     #[test]
+    fn lower_average_worker_load_wins_over_lower_raw_sum() {
+        let registry = registry_with_worker(
+            "http://local-worker:8000",
+            model_card("cohere.command-r-plus", ModelType::LLM),
+            WorkerStatus::Ready,
+            0,
+        );
+        let mut remote_state = CrossRegionState::new();
+        add_remote_worker(
+            &mut remote_state,
+            "us-chicago-1",
+            "remote-worker-ord",
+            Some("cohere.command-r-plus"),
+            WorkerStatus::Ready,
+            5,
+            NOW_MS,
+        );
+        add_remote_worker(
+            &mut remote_state,
+            "us-phoenix-1",
+            "remote-worker-phx-a",
+            Some("cohere.command-r-plus"),
+            WorkerStatus::Ready,
+            4,
+            NOW_MS,
+        );
+        add_remote_worker(
+            &mut remote_state,
+            "us-phoenix-1",
+            "remote-worker-phx-b",
+            Some("cohere.command-r-plus"),
+            WorkerStatus::Ready,
+            4,
+            NOW_MS,
+        );
+        add_client_latency(&mut remote_state, "us-chicago-1", 20, NOW_MS);
+        add_client_latency(&mut remote_state, "us-phoenix-1", 20, NOW_MS);
+
+        let target_region = route_target_region(
+            &registry,
+            &remote_state,
+            peer_registry(&["us-chicago-1", "us-phoenix-1"]),
+            CrossRegionBreaker::new(),
+            profile(
+                &["us-chicago-1", "us-phoenix-1"],
+                "cohere.command-r-plus",
+                ModalityPolicy::default(),
+            ),
+            Endpoint::Chat,
+        );
+
+        assert_eq!(target_region, "us-phoenix-1");
+    }
+
+    #[test]
     fn local_first_tie_break_applies_only_to_equivalent_outcomes() {
         let registry = registry_with_worker(
             "http://local-worker:8000",
@@ -1601,7 +1763,8 @@ mod tests {
 
         assert_eq!(candidate.region_id, "us-ashburn-1");
         assert_eq!(candidate.model_id, "cohere.command-r-plus");
-        assert_eq!(candidate.worker_load, Some(3));
+        assert_eq!(candidate.ready_worker_load_sum, Some(3));
+        assert_eq!(candidate.ready_worker_load_average_millis, Some(3_000));
         assert!(!json.contains("worker_url"));
         assert!(!json.contains("local-worker"));
     }
@@ -1681,7 +1844,8 @@ mod tests {
             .iter()
             .find(|candidate| candidate.region_id == "us-chicago-1")
             .expect("remote candidate should be built");
-        assert_eq!(remote.worker_load, Some(7));
+        assert_eq!(remote.ready_worker_load_sum, Some(7));
+        assert_eq!(remote.ready_worker_load_average_millis, Some(7_000));
         assert_eq!(remote.client_latency_hint_ms, Some(34));
         assert_eq!(remote.freshness_age_ms, Some(0));
     }
@@ -1864,7 +2028,8 @@ mod tests {
 
         assert_eq!(candidate.worker_health.ready_workers, 1);
         assert_eq!(candidate.worker_health.total_workers, 2);
-        assert_eq!(candidate.worker_load, Some(7));
+        assert_eq!(candidate.ready_worker_load_sum, Some(2));
+        assert_eq!(candidate.ready_worker_load_average_millis, Some(2_000));
         assert!(candidate.healthy);
         assert!(candidate.has_capacity);
     }
@@ -1896,7 +2061,8 @@ mod tests {
 
         assert_eq!(candidate.worker_health.ready_workers, 0);
         assert_eq!(candidate.worker_health.total_workers, 1);
-        assert_eq!(candidate.worker_load, Some(4));
+        assert_eq!(candidate.ready_worker_load_sum, None);
+        assert_eq!(candidate.ready_worker_load_average_millis, None);
         assert!(!candidate.healthy);
         assert!(!candidate.has_capacity);
     }
@@ -1948,7 +2114,8 @@ mod tests {
 
         assert_eq!(remote.worker_health.ready_workers, 1);
         assert_eq!(remote.worker_health.total_workers, 2);
-        assert_eq!(remote.worker_load, Some(13));
+        assert_eq!(remote.ready_worker_load_sum, Some(4));
+        assert_eq!(remote.ready_worker_load_average_millis, Some(4_000));
         assert!(remote.healthy);
         assert!(remote.has_capacity);
     }
@@ -2067,10 +2234,11 @@ mod tests {
         );
         assert_eq!(remote.worker_health.total_workers, 1);
         assert_eq!(
-            remote.worker_load,
+            remote.ready_worker_load_sum,
             Some(9),
             "loads from two replicas observing the same worker must sum (4 + 5)",
         );
+        assert_eq!(remote.ready_worker_load_average_millis, Some(9_000));
     }
 
     #[test]

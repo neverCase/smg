@@ -19,6 +19,7 @@ use llm_tokenizer::TokenizerRegistry;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
+    cross_region::CrossRegionBreaker,
     policies::PolicyRegistry,
     routers::RouterFactory,
     server::{build_app, AppState},
@@ -197,6 +198,7 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         router_manager: None,
         mesh_handler: None,
         cross_region_sync: None,
+        cross_region_breaker: CrossRegionBreaker::new(),
     });
 
     let request_id_headers = vec!["x-request-id".to_string(), "x-correlation-id".to_string()];

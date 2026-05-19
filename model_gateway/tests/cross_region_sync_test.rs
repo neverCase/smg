@@ -565,8 +565,13 @@ fn remote_region_view_projects_consistently_with_candidate_ranking() {
         "candidate readiness matches view readiness",
     );
     assert_eq!(
-        remote.worker_load, view_load.total,
-        "candidate load matches view sum",
+        remote.ready_worker_load_sum, view_load.total,
+        "candidate ready-worker load sum matches view sum",
+    );
+    assert_eq!(
+        remote.ready_worker_load_average_millis,
+        view_load.total.map(|load| load.saturating_mul(1_000)),
+        "single ready worker average matches view sum",
     );
     assert!(
         remote.has_capacity,
