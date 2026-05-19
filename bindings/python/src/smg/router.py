@@ -340,6 +340,31 @@ class Router:
             "jwt_audience",
             "jwt_jwks_uri",
             "jwt_role_mapping",
+            # Cross-region fields. Parsed by argparse so operators can pass
+            # --cross-region-* through the Python launcher, but the PyO3 binding
+            # does not yet forward them to RouterConfig.cross_region. Strip
+            # before constructing _Router to avoid "unexpected keyword" errors.
+            # TODO: wire these into bindings/python/src/lib.rs _Router::new and
+            # then drop them from this strip list.
+            "cross_region_enabled",
+            "cross_region_region_id",
+            "cross_region_realm",
+            "cross_region_environment",
+            "cross_region_server_name",
+            "cross_region_local_only_on_degraded_sync",
+            "cross_region_request_plane_enabled",
+            "cross_region_request_plane_listen_port",
+            "cross_region_request_plane_max_platform_retries",
+            "cross_region_request_plane_default_failover_mode",
+            "cross_region_request_plane_local_first_tie_break",
+            "cross_region_sync_plane_enabled",
+            "cross_region_sync_plane_signal_stale_after_seconds",
+            "cross_region_mtls_ca_cert_path",
+            "cross_region_mtls_server_cert_path",
+            "cross_region_mtls_server_key_path",
+            "cross_region_mtls_client_cert_path",
+            "cross_region_mtls_client_key_path",
+            "cross_region_peers",
         ]
         for field in fields_to_remove:
             args_dict.pop(field, None)

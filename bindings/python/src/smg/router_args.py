@@ -165,6 +165,34 @@ class RouterArgs:
     mesh_port: int = 39527
     mesh_peer_urls: list[str] = dataclasses.field(default_factory=list)
 
+    # Cross-region smart-router configuration. The Rust binary (model_gateway
+    # main.rs) consumes these directly; the PyO3 Router binding does not yet
+    # forward them. `Router.from_args` strips these before calling _Router(),
+    # so they're currently inert from the Python entrypoint. TODO: extend
+    # bindings/python/src/lib.rs _Router::new to accept these and inject them
+    # into RouterConfig.cross_region.
+    cross_region_enabled: bool = False
+    cross_region_region_id: str | None = None
+    cross_region_realm: str | None = None
+    cross_region_environment: str | None = None
+    cross_region_server_name: str | None = None
+    cross_region_local_only_on_degraded_sync: bool | None = None
+    cross_region_request_plane_enabled: bool | None = None
+    cross_region_request_plane_listen_port: int | None = None
+    cross_region_request_plane_max_platform_retries: int | None = None
+    cross_region_request_plane_default_failover_mode: str | None = None
+    cross_region_request_plane_local_first_tie_break: bool | None = None
+    cross_region_sync_plane_enabled: bool | None = None
+    cross_region_sync_plane_signal_stale_after_seconds: int | None = None
+    cross_region_mtls_ca_cert_path: str | None = None
+    cross_region_mtls_server_cert_path: str | None = None
+    cross_region_mtls_server_key_path: str | None = None
+    cross_region_mtls_client_cert_path: str | None = None
+    cross_region_mtls_client_key_path: str | None = None
+    # Each peer entry is a comma-separated kv string:
+    # "region_id=...,realm=...,environment=...,request_url=...,sync_url=...,enabled=true"
+    cross_region_peers: list[str] = dataclasses.field(default_factory=list)
+
     @staticmethod
     def add_cli_args(
         parser: argparse.ArgumentParser,
@@ -1104,6 +1132,134 @@ class RouterArgs:
             nargs="*",
             default=[],
             help="Peer mesh server addresses to join (format: host:port)",
+        )
+
+        # Cross-region smart-router configuration. Mirrors the Rust binary's
+        # --cross-region-* flags so the helm chart can drive both Python and
+        # Rust entrypoints identically. Currently inert from the Python
+        # entrypoint until the PyO3 binding forwards them (see RouterArgs).
+        xr_group = parser.add_argument_group(
+            "Cross-Region Smart Router",
+            "Multi-region routing, peer registry, and mTLS plumbing",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-enabled",
+            action="store_true",
+            default=False,
+            help="Enable cross-region smart-router config",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-region-id",
+            type=str,
+            default=None,
+            help="Local OCI region id, for example us-ashburn-1",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-realm",
+            type=str,
+            default=None,
+            help="Local OCI realm, for example oc1",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-environment",
+            type=str,
+            default=None,
+            help="Local deployment environment, for example prod",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-server-name",
+            type=str,
+            default=None,
+            help="This replica's identifier for cross-region signals",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-local-only-on-degraded-sync",
+            type=lambda v: v.lower() in ("1", "true", "yes"),
+            default=None,
+            help="Keep serving local-only when synced remote state is degraded (true/false)",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-request-plane-enabled",
+            type=lambda v: v.lower() in ("1", "true", "yes"),
+            default=None,
+            help="Enable the cross-region request-forwarding plane (true/false)",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-request-plane-listen-port",
+            type=int,
+            default=None,
+            help="Private NLB request-forwarding listener port",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-request-plane-max-platform-retries",
+            type=int,
+            default=None,
+            help="Maximum platform-owned cross-region retries",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-request-plane-default-failover-mode",
+            type=str,
+            default=None,
+            choices=["MANUAL", "AUTOMATIC"],
+            help="Default cross-region failover mode",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-request-plane-local-first-tie-break",
+            type=lambda v: v.lower() in ("1", "true", "yes"),
+            default=None,
+            help="Prefer local region when candidates tie (true/false)",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-sync-plane-enabled",
+            type=lambda v: v.lower() in ("1", "true", "yes"),
+            default=None,
+            help="Enable the cross-region signal sync plane (true/false)",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-sync-plane-signal-stale-after-seconds",
+            type=int,
+            default=None,
+            help="Signal freshness window in seconds",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-mtls-ca-cert-path",
+            type=str,
+            default=None,
+            help="Cross-region mTLS CA certificate path",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-mtls-server-cert-path",
+            type=str,
+            default=None,
+            help="Cross-region mTLS server certificate path",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-mtls-server-key-path",
+            type=str,
+            default=None,
+            help="Cross-region mTLS server private key path",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-mtls-client-cert-path",
+            type=str,
+            default=None,
+            help="Cross-region mTLS client certificate path",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-mtls-client-key-path",
+            type=str,
+            default=None,
+            help="Cross-region mTLS client private key path",
+        )
+        xr_group.add_argument(
+            f"--{prefix}cross-region-peer",
+            dest=f"{prefix.replace('-', '_')}cross_region_peers",
+            action="append",
+            default=[],
+            help=(
+                "Peer region. Repeat once per peer. Format: "
+                "region_id=...,realm=...,environment=...,request_url=...,sync_url=...,enabled=true"
+            ),
         )
 
     @classmethod
