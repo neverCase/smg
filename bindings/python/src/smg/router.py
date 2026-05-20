@@ -7,6 +7,8 @@ from smg.smg_rs import (
     PolicyType,
     PyApiKeyEntry,
     PyControlPlaneAuthConfig,
+    PyCrossRegionConfig,
+    PyCrossRegionPeerConfig,
     PyJwtConfig,
     PyOracleConfig,
     PyPostgresConfig,
@@ -79,6 +81,71 @@ def role_from_str(role_str: str) -> PyRole:
     if role_str.lower() == "admin":
         return PyRole.Admin
     return PyRole.User
+
+
+def _parse_cross_region_peer(entry: str) -> PyCrossRegionPeerConfig:
+    """Parse a single --cross-region-peer value (key=value,...) into a peer config."""
+    fields: dict[str, str] = {}
+    for part in entry.split(","):
+        if "=" not in part:
+            raise ValueError(
+                f"invalid cross-region peer entry '{part}', expected key=value"
+            )
+        key, value = part.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if not value:
+            raise ValueError(f"cross-region peer field '{key}' must not be empty")
+        fields[key] = value
+
+    enabled_raw = fields.pop("enabled", "true").lower()
+    return PyCrossRegionPeerConfig(
+        region_id=fields.pop("region_id", None) or fields.pop("region", None),
+        request_url=fields.pop("request_url", None),
+        sync_url=fields.pop("sync_url", None),
+        realm=fields.pop("realm", None),
+        environment=fields.pop("environment", None) or fields.pop("env", None),
+        expected_mtls_identity=fields.pop("expected_mtls_identity", None)
+        or fields.pop("mtls_identity", None),
+        enabled=enabled_raw in ("1", "true", "yes"),
+    )
+
+
+def build_cross_region_config(args_dict: dict) -> PyCrossRegionConfig | None:
+    """Build the cross-region config from parsed RouterArgs fields.
+
+    Returns None when cross-region is disabled, so the Rust binding falls
+    through to CrossRegionConfig::default().
+    """
+    if not args_dict.get("cross_region_enabled"):
+        return None
+    peers = [
+        _parse_cross_region_peer(entry)
+        for entry in args_dict.get("cross_region_peers", []) or []
+    ]
+    return PyCrossRegionConfig(
+        enabled=True,
+        region_id=args_dict.get("cross_region_region_id"),
+        server_name=args_dict.get("cross_region_server_name"),
+        realm=args_dict.get("cross_region_realm"),
+        environment=args_dict.get("cross_region_environment"),
+        request_plane_enabled=args_dict.get("cross_region_request_plane_enabled"),
+        request_plane_listen_port=args_dict.get(
+            "cross_region_request_plane_listen_port"
+        ),
+        request_plane_max_platform_retries=args_dict.get(
+            "cross_region_request_plane_max_platform_retries"
+        ),
+        sync_plane_enabled=args_dict.get("cross_region_sync_plane_enabled"),
+        sync_plane_signal_stale_after_seconds=args_dict.get(
+            "cross_region_sync_plane_signal_stale_after_seconds"
+        ),
+        mtls_ca_cert_path=args_dict.get("cross_region_mtls_ca_cert_path"),
+        mtls_server_cert_path=args_dict.get("cross_region_mtls_server_cert_path"),
+        mtls_server_key_path=args_dict.get("cross_region_mtls_server_key_path"),
+        mtls_client_cert_path=args_dict.get("cross_region_mtls_client_cert_path"),
+        mtls_client_key_path=args_dict.get("cross_region_mtls_client_key_path"),
+        peers=peers,
+    )
 
 
 def build_control_plane_auth_config(
@@ -340,23 +407,22 @@ class Router:
             "jwt_audience",
             "jwt_jwks_uri",
             "jwt_role_mapping",
-            # Cross-region fields. Parsed by argparse so operators can pass
-            # --cross-region-* through the Python launcher, but the PyO3 binding
-            # does not yet forward them to RouterConfig.cross_region. Strip
-            # before constructing _Router to avoid "unexpected keyword" errors.
-            # TODO: wire these into bindings/python/src/lib.rs _Router::new and
-            # then drop them from this strip list.
+            # Cross-region dataclass fields are converted to a single
+            # PyCrossRegionConfig kwarg below; strip the flat fields so they
+            # don't reach _Router as unknown kwargs.
             "cross_region_enabled",
             "cross_region_region_id",
             "cross_region_realm",
             "cross_region_environment",
             "cross_region_server_name",
+            # The three fields below have CLI flags but no home in
+            # CrossRegionConfig yet; parsed for forward compatibility and dropped.
             "cross_region_local_only_on_degraded_sync",
+            "cross_region_request_plane_default_failover_mode",
+            "cross_region_request_plane_local_first_tie_break",
             "cross_region_request_plane_enabled",
             "cross_region_request_plane_listen_port",
             "cross_region_request_plane_max_platform_retries",
-            "cross_region_request_plane_default_failover_mode",
-            "cross_region_request_plane_local_first_tie_break",
             "cross_region_sync_plane_enabled",
             "cross_region_sync_plane_signal_stale_after_seconds",
             "cross_region_mtls_ca_cert_path",
@@ -366,6 +432,7 @@ class Router:
             "cross_region_mtls_client_key_path",
             "cross_region_peers",
         ]
+        args_dict["cross_region_config"] = build_cross_region_config(args_dict)
         for field in fields_to_remove:
             args_dict.pop(field, None)
 

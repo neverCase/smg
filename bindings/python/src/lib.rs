@@ -467,6 +467,210 @@ struct Router {
     mesh_advertise_host: Option<String>,
     mesh_port: u16,
     mesh_peer_urls: Vec<String>,
+    // Cross-region smart router
+    cross_region_config: Option<PyCrossRegionConfig>,
+}
+
+#[pyclass(from_py_object)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PyCrossRegionPeerConfig {
+    #[pyo3(get, set)]
+    pub region_id: Option<String>,
+    #[pyo3(get, set)]
+    pub request_url: Option<String>,
+    #[pyo3(get, set)]
+    pub sync_url: Option<String>,
+    #[pyo3(get, set)]
+    pub realm: Option<String>,
+    #[pyo3(get, set)]
+    pub environment: Option<String>,
+    #[pyo3(get, set)]
+    pub expected_mtls_identity: Option<String>,
+    #[pyo3(get, set)]
+    pub enabled: bool,
+}
+
+#[pymethods]
+impl PyCrossRegionPeerConfig {
+    #[expect(clippy::too_many_arguments)]
+    #[new]
+    #[pyo3(signature = (
+        region_id = None,
+        request_url = None,
+        sync_url = None,
+        realm = None,
+        environment = None,
+        expected_mtls_identity = None,
+        enabled = true,
+    ))]
+    fn new(
+        region_id: Option<String>,
+        request_url: Option<String>,
+        sync_url: Option<String>,
+        realm: Option<String>,
+        environment: Option<String>,
+        expected_mtls_identity: Option<String>,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            region_id,
+            request_url,
+            sync_url,
+            realm,
+            environment,
+            expected_mtls_identity,
+            enabled,
+        }
+    }
+}
+
+impl PyCrossRegionPeerConfig {
+    fn to_config(&self) -> config::CrossRegionPeerConfig {
+        config::CrossRegionPeerConfig {
+            region_id: self.region_id.clone(),
+            request_url: self.request_url.clone(),
+            sync_url: self.sync_url.clone(),
+            realm: self.realm.clone(),
+            environment: self.environment.clone(),
+            expected_mtls_identity: self.expected_mtls_identity.clone(),
+            enabled: self.enabled,
+        }
+    }
+}
+
+#[pyclass(from_py_object)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PyCrossRegionConfig {
+    #[pyo3(get, set)]
+    pub enabled: bool,
+    #[pyo3(get, set)]
+    pub region_id: Option<String>,
+    #[pyo3(get, set)]
+    pub server_name: Option<String>,
+    #[pyo3(get, set)]
+    pub realm: Option<String>,
+    #[pyo3(get, set)]
+    pub environment: Option<String>,
+    #[pyo3(get, set)]
+    pub request_plane_enabled: Option<bool>,
+    #[pyo3(get, set)]
+    pub request_plane_listen_port: Option<u16>,
+    #[pyo3(get, set)]
+    pub request_plane_max_platform_retries: Option<u32>,
+    #[pyo3(get, set)]
+    pub sync_plane_enabled: Option<bool>,
+    #[pyo3(get, set)]
+    pub sync_plane_signal_stale_after_seconds: Option<u64>,
+    #[pyo3(get, set)]
+    pub mtls_ca_cert_path: Option<String>,
+    #[pyo3(get, set)]
+    pub mtls_server_cert_path: Option<String>,
+    #[pyo3(get, set)]
+    pub mtls_server_key_path: Option<String>,
+    #[pyo3(get, set)]
+    pub mtls_client_cert_path: Option<String>,
+    #[pyo3(get, set)]
+    pub mtls_client_key_path: Option<String>,
+    #[pyo3(get, set)]
+    pub peers: Vec<PyCrossRegionPeerConfig>,
+}
+
+#[pymethods]
+impl PyCrossRegionConfig {
+    #[expect(clippy::too_many_arguments)]
+    #[new]
+    #[pyo3(signature = (
+        enabled = false,
+        region_id = None,
+        server_name = None,
+        realm = None,
+        environment = None,
+        request_plane_enabled = None,
+        request_plane_listen_port = None,
+        request_plane_max_platform_retries = None,
+        sync_plane_enabled = None,
+        sync_plane_signal_stale_after_seconds = None,
+        mtls_ca_cert_path = None,
+        mtls_server_cert_path = None,
+        mtls_server_key_path = None,
+        mtls_client_cert_path = None,
+        mtls_client_key_path = None,
+        peers = vec![],
+    ))]
+    fn new(
+        enabled: bool,
+        region_id: Option<String>,
+        server_name: Option<String>,
+        realm: Option<String>,
+        environment: Option<String>,
+        request_plane_enabled: Option<bool>,
+        request_plane_listen_port: Option<u16>,
+        request_plane_max_platform_retries: Option<u32>,
+        sync_plane_enabled: Option<bool>,
+        sync_plane_signal_stale_after_seconds: Option<u64>,
+        mtls_ca_cert_path: Option<String>,
+        mtls_server_cert_path: Option<String>,
+        mtls_server_key_path: Option<String>,
+        mtls_client_cert_path: Option<String>,
+        mtls_client_key_path: Option<String>,
+        peers: Vec<PyCrossRegionPeerConfig>,
+    ) -> Self {
+        Self {
+            enabled,
+            region_id,
+            server_name,
+            realm,
+            environment,
+            request_plane_enabled,
+            request_plane_listen_port,
+            request_plane_max_platform_retries,
+            sync_plane_enabled,
+            sync_plane_signal_stale_after_seconds,
+            mtls_ca_cert_path,
+            mtls_server_cert_path,
+            mtls_server_key_path,
+            mtls_client_cert_path,
+            mtls_client_key_path,
+            peers,
+        }
+    }
+}
+
+impl PyCrossRegionConfig {
+    fn to_config(&self) -> config::CrossRegionConfig {
+        let rp_defaults = config::CrossRegionRequestPlaneConfig::default();
+        let sp_defaults = config::CrossRegionSyncPlaneConfig::default();
+        config::CrossRegionConfig {
+            enabled: self.enabled,
+            region_id: self.region_id.clone(),
+            server_name: self.server_name.clone(),
+            realm: self.realm.clone(),
+            environment: self.environment.clone(),
+            request_plane: config::CrossRegionRequestPlaneConfig {
+                enabled: self.request_plane_enabled.unwrap_or(rp_defaults.enabled),
+                listen_port: self
+                    .request_plane_listen_port
+                    .unwrap_or(rp_defaults.listen_port),
+                max_platform_retries: self
+                    .request_plane_max_platform_retries
+                    .unwrap_or(rp_defaults.max_platform_retries),
+            },
+            sync_plane: config::CrossRegionSyncPlaneConfig {
+                enabled: self.sync_plane_enabled.unwrap_or(sp_defaults.enabled),
+                signal_stale_after_seconds: self
+                    .sync_plane_signal_stale_after_seconds
+                    .unwrap_or(sp_defaults.signal_stale_after_seconds),
+            },
+            peers: self.peers.iter().map(|p| p.to_config()).collect(),
+            mtls: config::CrossRegionMtlsConfig {
+                ca_cert_path: self.mtls_ca_cert_path.clone(),
+                server_cert_path: self.mtls_server_cert_path.clone(),
+                server_key_path: self.mtls_server_key_path.clone(),
+                client_cert_path: self.mtls_client_cert_path.clone(),
+                client_key_path: self.mtls_client_key_path.clone(),
+            },
+        }
+    }
 }
 
 impl Router {
@@ -745,6 +949,12 @@ impl Router {
                 self.server_key_path.as_ref(),
             )
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
+            .cross_region_config(
+                self.cross_region_config
+                    .as_ref()
+                    .map(|c| c.to_config())
+                    .unwrap_or_default(),
+            )
             .build()
     }
 }
@@ -855,6 +1065,7 @@ impl Router {
         mesh_port = 39527u16,
         mesh_peer_urls = vec![],
         mesh_advertise_host = None,
+        cross_region_config = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -964,6 +1175,7 @@ impl Router {
         mesh_port: u16,
         mesh_peer_urls: Vec<String>,
         mesh_advertise_host: Option<String>,
+        cross_region_config: Option<PyCrossRegionConfig>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1083,6 +1295,7 @@ impl Router {
             mesh_advertise_host,
             mesh_port,
             mesh_peer_urls,
+            cross_region_config,
         })
     }
 
@@ -1268,6 +1481,8 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyOracleConfig>()?;
     m.add_class::<PyPostgresConfig>()?;
     m.add_class::<PyRedisConfig>()?;
+    m.add_class::<PyCrossRegionPeerConfig>()?;
+    m.add_class::<PyCrossRegionConfig>()?;
     m.add_class::<Router>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;

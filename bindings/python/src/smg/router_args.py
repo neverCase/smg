@@ -1174,13 +1174,17 @@ class RouterArgs:
         )
         xr_group.add_argument(
             f"--{prefix}cross-region-local-only-on-degraded-sync",
-            type=lambda v: v.lower() in ("1", "true", "yes"),
+            nargs="?",
+            const="true",
+            type=lambda v: str(v).lower() in ("1", "true", "yes"),
             default=None,
             help="Keep serving local-only when synced remote state is degraded (true/false)",
         )
         xr_group.add_argument(
             f"--{prefix}cross-region-request-plane-enabled",
-            type=lambda v: v.lower() in ("1", "true", "yes"),
+            nargs="?",
+            const="true",
+            type=lambda v: str(v).lower() in ("1", "true", "yes"),
             default=None,
             help="Enable the cross-region request-forwarding plane (true/false)",
         )
@@ -1205,13 +1209,17 @@ class RouterArgs:
         )
         xr_group.add_argument(
             f"--{prefix}cross-region-request-plane-local-first-tie-break",
-            type=lambda v: v.lower() in ("1", "true", "yes"),
+            nargs="?",
+            const="true",
+            type=lambda v: str(v).lower() in ("1", "true", "yes"),
             default=None,
             help="Prefer local region when candidates tie (true/false)",
         )
         xr_group.add_argument(
             f"--{prefix}cross-region-sync-plane-enabled",
-            type=lambda v: v.lower() in ("1", "true", "yes"),
+            nargs="?",
+            const="true",
+            type=lambda v: str(v).lower() in ("1", "true", "yes"),
             default=None,
             help="Enable the cross-region signal sync plane (true/false)",
         )
