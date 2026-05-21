@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 
 use super::{
     adapters::{CrossRegionProducers, ProducerCadences, ProducerHandles},
-    decode_envelope, CrossRegionContext, CrossRegionResult, CrossRegionState,
+    decode_envelope, envelope_signal_kind, CrossRegionContext, CrossRegionResult, CrossRegionState,
     CrossRegionSyncService, RegionPeerRegistry, CROSS_REGION_NAMESPACE_PREFIX,
 };
 use crate::{server::ReadinessGate, worker::WorkerRegistry};
@@ -47,6 +47,14 @@ impl CrossRegionSyncRuntime {
         worker_registry: Arc<WorkerRegistry>,
         readiness_gate: ReadinessGate,
     ) -> CrossRegionResult<Self> {
+        tracing::info!(
+            region_id = %context.config.region_id,
+            server_name = %context.config.server_name,
+            peer_count = context.peers.regions().len(),
+            signal_stale_after_seconds = context.config.sync_plane.signal_stale_after_seconds,
+            namespace = %namespace.prefix(),
+            "starting cross-region sync runtime"
+        );
         let producers = CrossRegionProducers::new(
             context.config.region_id.clone(),
             context.config.server_name.clone(),
@@ -57,6 +65,14 @@ impl CrossRegionSyncRuntime {
         let subscriber = spawn_subscriber(producers.sync.clone());
         let gc_max_age_ms = gc_max_age_ms(context.config.sync_plane.signal_stale_after_seconds);
         let gc = spawn_gc_loop(producers.sync.state(), GC_INTERVAL, gc_max_age_ms);
+
+        tracing::info!(
+            region_id = %context.config.region_id,
+            server_name = %context.config.server_name,
+            gc_interval_ms = GC_INTERVAL.as_millis(),
+            gc_max_age_ms,
+            "cross-region sync runtime started"
+        );
 
         Ok(Self {
             producers,
@@ -80,6 +96,11 @@ impl CrossRegionSyncRuntime {
                 max_buffer_bytes: CROSS_REGION_STREAM_BUFFER_BYTES,
                 routing: StreamRouting::Broadcast,
             },
+        );
+        tracing::info!(
+            namespace = CROSS_REGION_NAMESPACE_PREFIX,
+            max_buffer_bytes = CROSS_REGION_STREAM_BUFFER_BYTES,
+            "registered cross-region mesh stream namespace"
         );
         Self::start(context, namespace, worker_registry, readiness_gate)
     }
@@ -156,7 +177,7 @@ fn spawn_gc_loop(
             ticker.tick().await;
             let dropped = state.write().gc_stale(now_ms(), max_age_ms);
             if dropped > 0 {
-                tracing::debug!(
+                tracing::info!(
                     dropped,
                     max_age_ms,
                     "cross-region GC swept stale materialized entries"
@@ -183,6 +204,17 @@ fn spawn_subscriber(sync: Arc<CrossRegionSyncService>) -> SubscriberHandle {
             match value {
                 Some(chunks) => match decode_envelope(&chunks) {
                     Ok(envelope) => {
+                        let signal_kind = envelope_signal_kind(&envelope);
+                        tracing::info!(
+                            signal_key = %envelope.key.as_path(),
+                            signal_kind,
+                            region_id = %envelope.key.region_segment(),
+                            server_name = %envelope.key.server_name_segment(),
+                            version = envelope.version,
+                            actor = %envelope.actor,
+                            removed = envelope.removed,
+                            "applying inbound cross-region signal"
+                        );
                         crate::cross_region::apply_envelope_to_state(&mut state.write(), &envelope);
                     }
                     Err(error) => {

@@ -30,6 +30,16 @@ pub enum SignalKind {
     ClientLatency(ClientLatencySignal),
 }
 
+/// Stable log label for signal payload kinds.
+pub fn signal_kind_name(signal: &SignalKind) -> &'static str {
+    match signal {
+        SignalKind::SmgReadiness(_) => "smg_readiness",
+        SignalKind::WorkerHealth(_) => "worker_health",
+        SignalKind::WorkerLoad(_) => "worker_load",
+        SignalKind::ClientLatency(_) => "client_latency",
+    }
+}
+
 /// Local producer state plus remote materialized state.
 pub struct CrossRegionSyncService {
     region_id: String,
@@ -107,8 +117,24 @@ impl CrossRegionSyncService {
         validate_body_against_key(&key, &signal)?;
         let envelope = self.build_envelope(key.clone(), Some(signal), stale_after_ms, false);
         let bytes = encode_envelope(&envelope)?;
+        let signal_kind = envelope_signal_kind(&envelope);
+        let signal_key = envelope.key.as_path();
+        let region_id = envelope.key.region_segment().to_string();
+        let server_name = envelope.key.server_name_segment().to_string();
+        let version = envelope.version;
+        let actor = envelope.actor.clone();
         self.outbox.write().insert(key, bytes);
         apply_envelope_to_state(&mut self.state.write(), &envelope);
+        tracing::info!(
+            signal_key = %signal_key,
+            signal_kind,
+            region_id = %region_id,
+            server_name = %server_name,
+            version,
+            actor = %actor,
+            stale_after_ms,
+            "cross-region signal staged for mesh sync"
+        );
         Ok(())
     }
 
@@ -119,6 +145,14 @@ impl CrossRegionSyncService {
         // Preserve local version ordering for the self-view.
         let envelope = self.build_envelope(key, None, 0, true);
         apply_envelope_to_state(&mut self.state.write(), &envelope);
+        tracing::info!(
+            signal_key = %envelope.key.as_path(),
+            region_id = %envelope.key.region_segment(),
+            server_name = %envelope.key.server_name_segment(),
+            version = envelope.version,
+            actor = %envelope.actor,
+            "cross-region signal removed locally; peers will age out stale copies"
+        );
         Ok(())
     }
 
@@ -198,8 +232,17 @@ fn build_drain_callback(outbox: Arc<RwLock<HashMap<SignalKey, Bytes>>>) -> Strea
     Box::new(move || {
         let mut staged = outbox.write();
         let mut out = Vec::with_capacity(staged.len());
+        let mut drained_keys = Vec::with_capacity(staged.len());
         for (key, bytes) in staged.drain() {
+            drained_keys.push(key.as_path());
             out.push((mesh_path(&key), bytes));
+        }
+        if !out.is_empty() {
+            tracing::info!(
+                signal_count = out.len(),
+                signal_keys = ?drained_keys,
+                "cross-region signal outbox drained to mesh broadcast"
+            );
         }
         out
     })
@@ -225,6 +268,14 @@ pub fn apply_envelope_to_state(
         Some(SignalKind::WorkerLoad(s)) => state.upsert_worker_load(s.as_ref().clone(), version),
         Some(SignalKind::ClientLatency(s)) => state.upsert_client_latency(s.clone(), version),
         None => {}
+    }
+}
+
+pub fn envelope_signal_kind(envelope: &SignalEnvelope<SignalKind>) -> &'static str {
+    match envelope.signal.as_ref() {
+        Some(signal) => signal_kind_name(signal),
+        None if envelope.removed => "removed",
+        None => "missing",
     }
 }
 

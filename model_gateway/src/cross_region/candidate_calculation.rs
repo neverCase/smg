@@ -259,8 +259,33 @@ impl CandidateCalculator {
             };
 
             match candidate {
-                Ok(candidate) => output.candidates.push(candidate),
+                Ok(candidate) => {
+                    tracing::info!(
+                        region_id = %candidate.region_id,
+                        model_id = %candidate.model_id,
+                        endpoint_type = ?candidate.endpoint_type,
+                        readiness = candidate.readiness,
+                        healthy = candidate.healthy,
+                        has_capacity = candidate.has_capacity,
+                        ready_workers = candidate.worker_health.ready_workers,
+                        total_workers = candidate.worker_health.total_workers,
+                        client_latency_hint_ms = ?candidate.client_latency_hint_ms,
+                        ready_worker_load_sum = ?candidate.ready_worker_load_sum,
+                        ready_worker_load_average_millis = ?candidate.ready_worker_load_average_millis,
+                        freshness_age_ms = ?candidate.freshness_age_ms,
+                        is_local = candidate.region_id == input.local_region,
+                        "cross-region candidate accepted"
+                    );
+                    output.candidates.push(candidate);
+                }
                 Err(reason) => {
+                    tracing::info!(
+                        region_id = %region_id,
+                        model_id = %model_id,
+                        reason = ?reason,
+                        is_local = region_id == input.local_region,
+                        "cross-region candidate rejected"
+                    );
                     output
                         .rejections
                         .push(rejection(region_id, model_id.clone(), reason));
@@ -293,10 +318,38 @@ impl CandidateCalculator {
             &local_region,
         );
         let Some(selected_candidate) = maybe_candidate else {
+            tracing::info!(
+                route_id = %input.route_id,
+                entry_region = %input.entry_region,
+                model_id = %model_id,
+                request_mode = ?input.request_mode,
+                attempt = input.attempt,
+                candidate_count = candidate_output.candidates.len(),
+                rejection_count = candidate_output.rejections.len(),
+                "cross-region route candidate selection found no eligible target"
+            );
             return Ok(None);
         };
 
         let target_region = selected_candidate.region_id.clone();
+        tracing::info!(
+            route_id = %input.route_id,
+            entry_region = %input.entry_region,
+            target_region = %target_region,
+            model_id = %model_id,
+            request_mode = ?input.request_mode,
+            attempt = input.attempt,
+            failover_mode = ?failover_mode,
+            healthy = selected_candidate.healthy,
+            has_capacity = selected_candidate.has_capacity,
+            ready_workers = selected_candidate.worker_health.ready_workers,
+            total_workers = selected_candidate.worker_health.total_workers,
+            client_latency_hint_ms = ?selected_candidate.client_latency_hint_ms,
+            ready_worker_load_sum = ?selected_candidate.ready_worker_load_sum,
+            ready_worker_load_average_millis = ?selected_candidate.ready_worker_load_average_millis,
+            freshness_age_ms = ?selected_candidate.freshness_age_ms,
+            "cross-region route candidate selected"
+        );
         let decision = RegionRouteDecision {
             route_id: input.route_id.clone(),
             target_region: target_region.clone(),
@@ -440,7 +493,7 @@ impl CandidateCalculator {
         let ready_worker_load_sum = (ready_worker_count > 0).then_some(ready_worker_load_sum);
         let ready_worker_load_average_millis =
             ready_worker_load_average_millis(ready_worker_load_sum, ready_worker_count);
-        tracing::debug!(
+        tracing::info!(
             region_id = %input.local_region,
             model_id,
             eligible_worker_count = modality_workers.len(),
@@ -611,7 +664,7 @@ impl CandidateCalculator {
         let ready_worker_load_sum = (ready_worker_count > 0).then_some(ready_worker_load_sum);
         let ready_worker_load_average_millis =
             ready_worker_load_average_millis(ready_worker_load_sum, ready_worker_count);
-        tracing::debug!(
+        tracing::info!(
             region_id,
             model_id,
             eligible_worker_count = total_workers,

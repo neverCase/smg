@@ -54,8 +54,8 @@ pub use signals::{
 };
 pub use state::{CrossRegionState, SignalVersion};
 pub use sync::{
-    apply_envelope_to_state, decode_envelope, mesh_path, validate_remote_envelope,
-    CrossRegionSyncService, SignalKind, CROSS_REGION_NAMESPACE_PREFIX,
+    apply_envelope_to_state, decode_envelope, envelope_signal_kind, mesh_path,
+    validate_remote_envelope, CrossRegionSyncService, SignalKind, CROSS_REGION_NAMESPACE_PREFIX,
 };
 pub use sync_runtime::CrossRegionSyncRuntime;
 pub use view::{
