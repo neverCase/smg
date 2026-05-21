@@ -396,6 +396,7 @@ mod tests {
                 load: 0.5,
                 version: 1,
                 spec: vec![],
+                region_id: None,
             },
         );
 

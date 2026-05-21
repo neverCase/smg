@@ -632,6 +632,7 @@ mod tests {
             load,
             version,
             spec: vec![],
+            region_id: None,
         }
     }
 
@@ -973,6 +974,7 @@ mod tests {
                 load: 0.0,
                 version: 5,
                 spec: vec![],
+                region_id: None,
             },
         );
 
@@ -1016,6 +1018,7 @@ mod tests {
                 load: 0.0,
                 version: 3,
                 spec: vec![],
+                region_id: None,
             },
         );
         let _ = stores.worker.insert(
@@ -1028,6 +1031,7 @@ mod tests {
                 load: 0.0,
                 version: 7,
                 spec: vec![],
+                region_id: None,
             },
         );
 

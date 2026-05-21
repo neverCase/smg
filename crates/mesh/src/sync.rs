@@ -125,7 +125,17 @@ impl MeshSyncManager {
         &self.self_name
     }
 
-    /// Sync worker state to mesh stores
+    /// Sync worker state to mesh stores.
+    ///
+    /// `region_id` should be `Some(local_region)` when the gateway is
+    /// cross-region-aware (so peers in other regions can distinguish remote
+    /// workers and filter them out of their local `WorkerRegistry`). Leave
+    /// `None` for legacy / intra-cluster-only deployments — receivers treat
+    /// missing `region_id` as same-region for backward compatibility.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "WorkerState is a flat record; a parameter struct adds churn at every call site without improving the API"
+    )]
     pub fn sync_worker_state(
         &self,
         worker_id: String,
@@ -134,6 +144,7 @@ impl MeshSyncManager {
         health: bool,
         load: f64,
         spec: Vec<u8>,
+        region_id: Option<String>,
     ) {
         let key = worker_id.clone();
 
@@ -151,6 +162,7 @@ impl MeshSyncManager {
                 load,
                 version: new_version,
                 spec,
+                region_id,
             }
         });
 
@@ -219,9 +231,49 @@ impl MeshSyncManager {
         self.stores.worker.get(worker_id)
     }
 
-    /// Get all worker states from mesh stores
+    /// Get all worker states from mesh stores.
+    ///
+    /// Unfiltered — returns entries from every region the local node has
+    /// gossiped with. Callers that route requests or populate a local
+    /// worker registry should use [`Self::get_all_local_worker_states`] to
+    /// avoid pulling remote-region workers in. This unfiltered accessor is
+    /// kept for diagnostics (cluster_state dumps, mesh inspection) where
+    /// cross-region entries are useful context.
     pub fn get_all_worker_states(&self) -> Vec<WorkerState> {
         self.stores.worker.all().into_values().collect()
+    }
+
+    /// Get worker states whose `region_id` matches `local` (or is `None`,
+    /// for backward-compat with legacy nodes that pre-date the region
+    /// stamp). Intended for code paths that should never see a remote-
+    /// region worker — `WorkerRegistry` ingest, local router fan-out.
+    pub fn get_all_local_worker_states(&self, local: &str) -> Vec<WorkerState> {
+        self.stores
+            .worker
+            .all()
+            .into_values()
+            .filter(|state| match state.region_id.as_deref() {
+                None => true,
+                Some(region) => region == local,
+            })
+            .collect()
+    }
+
+    /// Get worker states whose `region_id` is explicitly set and differs
+    /// from `local`. Intended for cross-region projection consumers
+    /// (candidate ranking, `/get_loads` remote view).
+    pub fn get_remote_worker_states(&self, local: &str) -> Vec<WorkerState> {
+        self.stores
+            .worker
+            .all()
+            .into_values()
+            .filter(|state| {
+                state
+                    .region_id
+                    .as_deref()
+                    .is_some_and(|region| region != local)
+            })
+            .collect()
     }
 
     /// Get policy state from mesh stores
@@ -950,6 +1002,7 @@ mod tests {
             true,
             0.5,
             vec![],
+            None,
         );
 
         let state = manager.get_worker_state("worker1").unwrap();
@@ -972,6 +1025,7 @@ mod tests {
             true,
             0.5,
             vec![],
+            None,
         );
 
         manager.sync_worker_state(
@@ -981,6 +1035,7 @@ mod tests {
             false,
             0.8,
             vec![],
+            None,
         );
 
         manager.sync_worker_state(
@@ -990,6 +1045,7 @@ mod tests {
             true,
             0.3,
             vec![],
+            None,
         );
 
         let all_states = manager.get_all_worker_states();
@@ -1019,6 +1075,7 @@ mod tests {
             true,
             0.5,
             vec![],
+            None,
         );
 
         let state1 = manager.get_worker_state("worker1").unwrap();
@@ -1031,6 +1088,7 @@ mod tests {
             false,
             0.8,
             vec![],
+            None,
         );
 
         let state2 = manager.get_worker_state("worker1").unwrap();
@@ -1050,6 +1108,7 @@ mod tests {
             true,
             0.5,
             vec![],
+            None,
         );
 
         assert!(manager.get_worker_state("worker1").is_some());
@@ -1067,6 +1126,103 @@ mod tests {
         // Should not panic
         manager.remove_worker_state("nonexistent");
         assert!(manager.get_worker_state("nonexistent").is_none());
+    }
+
+    #[test]
+    fn sync_worker_state_stamps_region_id() {
+        let manager = create_test_sync_manager();
+        manager.sync_worker_state(
+            "w1".to_string(),
+            "m1".to_string(),
+            "http://w:8000".to_string(),
+            true,
+            0.0,
+            vec![],
+            Some("us-ashburn-1".to_string()),
+        );
+        let state = manager.get_worker_state("w1").expect("present");
+        assert_eq!(state.region_id.as_deref(), Some("us-ashburn-1"));
+    }
+
+    #[test]
+    fn get_all_local_worker_states_filters_by_region() {
+        let manager = create_test_sync_manager();
+        manager.sync_worker_state(
+            "local-w".to_string(),
+            "m1".to_string(),
+            "http://local:8000".to_string(),
+            true,
+            0.0,
+            vec![],
+            Some("us-ashburn-1".to_string()),
+        );
+        manager.sync_worker_state(
+            "remote-w".to_string(),
+            "m1".to_string(),
+            "http://remote:8000".to_string(),
+            true,
+            0.0,
+            vec![],
+            Some("us-chicago-1".to_string()),
+        );
+        manager.sync_worker_state(
+            "legacy-w".to_string(),
+            "m1".to_string(),
+            "http://legacy:8000".to_string(),
+            true,
+            0.0,
+            vec![],
+            None,
+        );
+
+        let mut local: Vec<String> = manager
+            .get_all_local_worker_states("us-ashburn-1")
+            .into_iter()
+            .map(|s| s.worker_id)
+            .collect();
+        local.sort();
+        // Local view includes same-region + legacy-None (backward compat).
+        assert_eq!(local, vec!["legacy-w".to_string(), "local-w".to_string()]);
+    }
+
+    #[test]
+    fn get_remote_worker_states_excludes_local_and_legacy() {
+        let manager = create_test_sync_manager();
+        manager.sync_worker_state(
+            "local-w".to_string(),
+            "m1".to_string(),
+            "http://local:8000".to_string(),
+            true,
+            0.0,
+            vec![],
+            Some("us-ashburn-1".to_string()),
+        );
+        manager.sync_worker_state(
+            "remote-w".to_string(),
+            "m1".to_string(),
+            "http://remote:8000".to_string(),
+            true,
+            0.0,
+            vec![],
+            Some("us-chicago-1".to_string()),
+        );
+        manager.sync_worker_state(
+            "legacy-w".to_string(),
+            "m1".to_string(),
+            "http://legacy:8000".to_string(),
+            true,
+            0.0,
+            vec![],
+            None,
+        );
+        let remote: Vec<String> = manager
+            .get_remote_worker_states("us-ashburn-1")
+            .into_iter()
+            .map(|s| s.worker_id)
+            .collect();
+        // Only entries explicitly tagged with a different region appear.
+        // Legacy-None entries are NOT classified as remote.
+        assert_eq!(remote, vec!["remote-w".to_string()]);
     }
 
     #[test]
@@ -1160,6 +1316,7 @@ mod tests {
             load: 0.5,
             version: 5,
             spec: vec![],
+            region_id: None,
         };
 
         manager.apply_remote_worker_state(remote_state.clone(), Some("node2".to_string()));
@@ -1180,6 +1337,7 @@ mod tests {
             load: 0.6,
             version: 1,
             spec: vec![],
+            region_id: None,
         };
 
         manager.apply_remote_worker_state(remote_state.clone(), None);
@@ -1206,6 +1364,7 @@ mod tests {
             true,
             0.5,
             vec![],
+            None,
         );
 
         // Try to apply older version - should be skipped
@@ -1217,6 +1376,7 @@ mod tests {
             load: 0.8,
             version: 0, // Older version
             spec: vec![],
+            region_id: None,
         };
 
         manager.apply_remote_worker_state(old_state, Some("node2".to_string()));
@@ -1260,6 +1420,7 @@ mod tests {
             true,
             0.5,
             vec![],
+            None,
         );
 
         // Add remote worker
@@ -1271,6 +1432,7 @@ mod tests {
             load: 0.7,
             version: 1,
             spec: vec![],
+            region_id: None,
         };
         manager.apply_remote_worker_state(remote_state, None);
 
@@ -1293,6 +1455,7 @@ mod tests {
             true,
             0.5,
             vec![],
+            None,
         );
 
         // Update state
@@ -1303,6 +1466,7 @@ mod tests {
             false,
             0.9,
             vec![],
+            None,
         );
 
         let state = manager.get_worker_state("worker1").unwrap();
@@ -1679,6 +1843,7 @@ mod tests {
             true,
             0.5,
             vec![],
+            None,
         );
 
         manager.sync_worker_state(
@@ -1688,6 +1853,7 @@ mod tests {
             false,
             0.8,
             vec![],
+            None,
         );
 
         let all_states = manager.get_all_worker_states();

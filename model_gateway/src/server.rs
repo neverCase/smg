@@ -2546,6 +2546,24 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
     }
 
+    // Resolve the local region from cross-region config. Used to:
+    //   1. Stamp outbound `WorkerState` syncs so peers can distinguish
+    //      remote-region workers and filter them out of their own
+    //      `WorkerRegistry`.
+    //   2. Drive the inbound region filter at `on_remote_worker_state`.
+    //   3. Pick the region-aware backfill below.
+    // `None` for deployments without cross-region — preserves legacy
+    // intra-cluster HA behavior where every node shares the region.
+    let local_region = config
+        .router_config
+        .cross_region
+        .enabled
+        .then(|| config.router_config.cross_region.region_id.clone())
+        .flatten();
+    app_context
+        .worker_registry
+        .set_local_region(local_region.clone());
+
     // Set mesh sync manager to worker registry and policy registry if mesh is enabled
     // This allows these components to sync state across mesh nodes when mesh is enabled,
     // but they work independently without mesh when mesh is disabled.
@@ -2558,8 +2576,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .sync_manager
             .register_worker_state_subscriber(app_context.worker_registry.clone());
         // Replay workers already in the CRDT store — they arrived between
-        // mesh server start and subscriber registration above.
-        for state in handle.sync_manager.get_all_worker_states() {
+        // mesh server start and subscriber registration above. When the
+        // gateway is cross-region-aware we backfill only local-region
+        // entries; the legacy path (no cross-region) backfills everything
+        // because all entries are implicitly local.
+        let backfill = match local_region.as_deref() {
+            Some(region) => handle.sync_manager.get_all_local_worker_states(region),
+            None => handle.sync_manager.get_all_worker_states(),
+        };
+        for state in backfill {
             app_context.worker_registry.on_remote_worker_state(&state);
         }
         info!("Mesh sync manager set on worker registry");

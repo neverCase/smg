@@ -37,6 +37,7 @@ async fn test_multi_node_state_synchronization() {
         true,
         0.5,
         vec![],
+        None,
     );
 
     // Simulate synchronization: Node2 and Node3 receive the update
@@ -68,6 +69,7 @@ async fn test_node_join_and_leave() {
         true,
         0.5,
         vec![],
+        None,
     );
 
     manager1.sync_policy_state(
@@ -297,6 +299,7 @@ async fn test_version_conflict_resolution() {
         true,
         0.5,
         vec![],
+        None,
     );
 
     // Node2 tries to apply an older version
@@ -308,6 +311,7 @@ async fn test_version_conflict_resolution() {
         load: 0.8,
         version: 0, // Older version
         spec: vec![],
+        region_id: None,
     };
 
     manager2.apply_remote_worker_state(old_state, Some("node2".to_string()));
@@ -344,6 +348,7 @@ async fn test_concurrent_updates() {
         true,
         0.5,
         vec![],
+        None,
     );
 
     manager2.sync_worker_state(
@@ -353,6 +358,7 @@ async fn test_concurrent_updates() {
         true,
         0.6,
         vec![],
+        None,
     );
 
     manager3.sync_worker_state(
@@ -362,6 +368,7 @@ async fn test_concurrent_updates() {
         true,
         0.7,
         vec![],
+        None,
     );
 
     // Simulate synchronization: all nodes receive all updates

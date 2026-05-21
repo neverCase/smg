@@ -321,6 +321,19 @@ pub struct WorkerState {
     /// gateway). Empty on old nodes that don't populate this field.
     #[serde(default)]
     pub spec: Vec<u8>,
+    /// Region this worker physically belongs to. `Some(region_id)` when the
+    /// publishing gateway is cross-region-aware; `None` for legacy nodes
+    /// that pre-date this field or for intra-cluster-only deployments
+    /// where every node shares the region.
+    ///
+    /// Receivers treat `None` as "trust legacy semantics — assume same
+    /// region" and `Some(other_region)` as "this is a remote-region
+    /// worker, do not pull into the local registry". The region filter is
+    /// enforced by `WorkerRegistry::on_remote_worker_state` and by the
+    /// `get_all_local_worker_states` / `get_remote_worker_states`
+    /// accessors on `MeshSyncManager`.
+    #[serde(default)]
+    pub region_id: Option<String>,
 }
 
 // Implement Hash manually for WorkerState (excluding f64)
@@ -333,6 +346,7 @@ impl std::hash::Hash for WorkerState {
         (self.load as i64).hash(state);
         self.version.hash(state);
         self.spec.hash(state);
+        self.region_id.hash(state);
     }
 }
 
@@ -940,6 +954,7 @@ mod tests {
             load: 0.5,
             version: 1,
             spec: vec![],
+            region_id: None,
         };
 
         let _ = store.insert(key.clone(), state.clone());

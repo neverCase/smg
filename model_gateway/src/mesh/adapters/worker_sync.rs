@@ -172,6 +172,7 @@ mod tests {
             load: 0.25,
             version: 1,
             spec: vec![],
+            region_id: None,
         }
     }
 

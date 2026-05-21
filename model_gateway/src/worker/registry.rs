@@ -106,6 +106,14 @@ pub struct WorkerRegistry {
     /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
     mesh_sync: Arc<RwLock<OptionalMeshSyncManager>>,
 
+    /// Local region identifier — stamped on outbound `WorkerState` syncs so
+    /// peers can distinguish remote-region workers and filter them out of
+    /// their own registry. `Some(local_region)` when the gateway is
+    /// cross-region-aware; `None` for intra-cluster-only / legacy
+    /// deployments where every node shares the region. Set via
+    /// [`Self::set_local_region`] during boot.
+    local_region: Arc<RwLock<Option<String>>>,
+
     /// Per-model retry config (last write wins).
     /// Updated when a worker with non-empty retry overrides registers.
     /// Cleaned up when the last worker for a model is removed.
@@ -135,6 +143,7 @@ impl WorkerRegistry {
             url_to_id: Arc::new(DashMap::new()),
             worker_mutation_locks: Arc::new(DashMap::new()),
             mesh_sync: Arc::new(RwLock::new(None)),
+            local_region: Arc::new(RwLock::new(None)),
             model_retry_configs: Arc::new(DashMap::new()),
             event_tx: broadcast::Sender::new(64),
         }
@@ -704,6 +713,7 @@ impl WorkerRegistry {
                     new_worker.is_healthy(),
                     0.0,
                     bincode::serialize(&new_worker.metadata().spec).unwrap_or_default(),
+                    self.local_region.read().clone(),
                 );
             }
         }
@@ -854,6 +864,21 @@ impl WorkerRegistry {
     pub fn set_mesh_sync(&self, mesh_sync: OptionalMeshSyncManager) {
         let mut guard = self.mesh_sync.write();
         *guard = mesh_sync;
+    }
+
+    /// Set the local region identifier stamped on outbound `WorkerState`
+    /// syncs. Boot path calls this from `server::startup` when the
+    /// cross-region runtime context has resolved the local region. `None`
+    /// leaves outbound syncs region-less (legacy / intra-cluster
+    /// deployments where every node shares the same region).
+    pub fn set_local_region(&self, region_id: Option<String>) {
+        let mut guard = self.local_region.write();
+        *guard = region_id;
+    }
+
+    /// The local region identifier this registry was configured with, if any.
+    pub fn local_region(&self) -> Option<String> {
+        self.local_region.read().clone()
     }
 
     // ───────────────────────────────────────────────────────────────────
@@ -1057,6 +1082,7 @@ impl WorkerRegistry {
                     worker.is_healthy(),
                     0.0,
                     bincode::serialize(&worker.metadata().spec).unwrap_or_default(),
+                    self.local_region.read().clone(),
                 );
             }
         }
@@ -1180,6 +1206,26 @@ impl Default for WorkerRegistry {
 impl smg_mesh::WorkerStateSubscriber for WorkerRegistry {
     fn on_remote_worker_state(&self, state: &smg_mesh::WorkerState) {
         use openai_protocol::model_card::ModelCard;
+
+        // Cross-region filter: when this gateway is cross-region-aware
+        // (has a `local_region` set), reject inbound `WorkerState` entries
+        // stamped with a different region. The local routing pool must
+        // never contain remote-region workers. Entries without a
+        // `region_id` are accepted as legacy / intra-cluster traffic.
+        if let Some(local) = self.local_region.read().as_deref() {
+            if let Some(remote) = state.region_id.as_deref() {
+                if remote != local {
+                    tracing::debug!(
+                        worker_id = %state.worker_id,
+                        url = %state.url,
+                        remote_region = %remote,
+                        local_region = %local,
+                        "Skipping cross-region worker state in local registry",
+                    );
+                    return;
+                }
+            }
+        }
 
         // If worker already exists at this URL, update its health
         // status from the mesh state. Don't re-register — the existing
@@ -1833,6 +1879,7 @@ mod tests {
             load: 0.5,
             version: 1,
             spec: vec![],
+            region_id: None,
         };
 
         // Should register the worker locally
@@ -1888,6 +1935,7 @@ mod tests {
             load: 0.5,
             version: 1,
             spec: vec![],
+            region_id: None,
         };
 
         registry.on_remote_worker_state(&state);
@@ -1938,6 +1986,7 @@ mod tests {
             load: 0.0,
             version: 2,
             spec: vec![],
+            region_id: None,
         };
         registry.on_remote_worker_state(&state);
 
@@ -1985,6 +2034,111 @@ mod tests {
                 assert_eq!(worker.url(), "http://event-worker:8080");
             }
             other => panic!("Expected Removed event, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_region_worker_state_is_rejected_when_local_region_is_set() {
+        use smg_mesh::{WorkerState, WorkerStateSubscriber};
+
+        let registry = WorkerRegistry::new();
+        registry.set_local_region(Some("us-ashburn-1".to_string()));
+
+        let state = WorkerState {
+            worker_id: "remote-w".into(),
+            model_id: "m1".into(),
+            url: "http://remote-w:8000".into(),
+            health: true,
+            load: 0.0,
+            version: 1,
+            spec: vec![],
+            region_id: Some("us-chicago-1".to_string()),
+        };
+        registry.on_remote_worker_state(&state);
+
+        assert!(
+            registry.get_by_url("http://remote-w:8000").is_none(),
+            "remote-region worker must not enter local registry",
+        );
+    }
+
+    #[test]
+    fn same_region_worker_state_is_accepted() {
+        use smg_mesh::{WorkerState, WorkerStateSubscriber};
+
+        let registry = WorkerRegistry::new();
+        registry.set_local_region(Some("us-ashburn-1".to_string()));
+
+        let state = WorkerState {
+            worker_id: "local-w".into(),
+            model_id: "m1".into(),
+            url: "http://local-w:8000".into(),
+            health: true,
+            load: 0.0,
+            version: 1,
+            spec: vec![],
+            region_id: Some("us-ashburn-1".to_string()),
+        };
+        registry.on_remote_worker_state(&state);
+
+        assert!(
+            registry.get_by_url("http://local-w:8000").is_some(),
+            "same-region worker should be registered into the local pool",
+        );
+    }
+
+    #[test]
+    fn legacy_region_id_none_state_is_accepted_for_rolling_upgrade() {
+        use smg_mesh::{WorkerState, WorkerStateSubscriber};
+
+        let registry = WorkerRegistry::new();
+        registry.set_local_region(Some("us-ashburn-1".to_string()));
+
+        let state = WorkerState {
+            worker_id: "legacy-w".into(),
+            model_id: "m1".into(),
+            url: "http://legacy-w:8000".into(),
+            health: true,
+            load: 0.0,
+            version: 1,
+            spec: vec![],
+            region_id: None,
+        };
+        registry.on_remote_worker_state(&state);
+
+        assert!(
+            registry.get_by_url("http://legacy-w:8000").is_some(),
+            "legacy region_id=None must be accepted for rolling-upgrade compat",
+        );
+    }
+
+    #[test]
+    fn legacy_registry_with_no_local_region_accepts_all_states() {
+        use smg_mesh::{WorkerState, WorkerStateSubscriber};
+
+        let registry = WorkerRegistry::new();
+        // Do NOT call set_local_region — pre-cross-region deployment.
+
+        for region in [None, Some("us-ashburn-1"), Some("us-chicago-1")] {
+            let url = format!(
+                "http://w-{}:8000",
+                region.unwrap_or("none").replace('-', "_")
+            );
+            let state = WorkerState {
+                worker_id: format!("w-{}", region.unwrap_or("none")),
+                model_id: "m1".into(),
+                url: url.clone(),
+                health: true,
+                load: 0.0,
+                version: 1,
+                spec: vec![],
+                region_id: region.map(String::from),
+            };
+            registry.on_remote_worker_state(&state);
+            assert!(
+                registry.get_by_url(&url).is_some(),
+                "registry without local_region must accept any state",
+            );
         }
     }
 }
