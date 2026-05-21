@@ -15,23 +15,16 @@ use tonic::{
 };
 use tracing as log;
 
-use crate::transport::limits::MAX_MESSAGE_SIZE;
-
-pub mod gossip {
-    #![allow(unused_qualifications, clippy::absolute_paths)]
-    #![allow(clippy::trivially_copy_pass_by_ref, clippy::allow_attributes)]
-    tonic::include_proto!("mesh.gossip");
-}
-use gossip::{
-    gossip_client, gossip_message, GossipMessage, NodeState, NodeStatus, NodeUpdate, Ping,
-    StateSync,
-};
-
 use crate::{
+    gossip::{
+        gossip_client, gossip_message, GossipMessage, NodeState, NodeStatus, NodeUpdate, Ping,
+        StateSync,
+    },
     gossip_controller::GossipController,
     gossip_service::GossipService,
     mtls::{MTLSConfig, MTLSManager},
     partition::PartitionDetector,
+    transport::limits::MAX_MESSAGE_SIZE,
 };
 
 pub type ClusterState = Arc<RwLock<BTreeMap<String, NodeState>>>;

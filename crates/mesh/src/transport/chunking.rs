@@ -17,8 +17,8 @@ use std::sync::{
 use bytes::Bytes;
 
 use crate::{
+    gossip::{StreamBatch, StreamEntry},
     kv::MeshKV,
-    service::gossip::{StreamBatch, StreamEntry},
 };
 
 /// Monotonic generation counter for stream-batch values. Seeded from

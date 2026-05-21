@@ -34,8 +34,8 @@ use bytes::Bytes;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::{
+    gossip::StreamEntry,
     kv::{MeshKV, StreamConfig, StreamRouting},
-    service::gossip::StreamEntry,
     transport::{
         chunking::{build_stream_batches, chunk_value, dispatch_stream_batch, next_generation},
         limits::{DEFAULT_MAX_CHUNKS_PER_BATCH, MAX_STREAM_CHUNK_BYTES},

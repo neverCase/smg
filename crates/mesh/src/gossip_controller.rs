@@ -18,16 +18,13 @@ use tracing::{instrument, Instrument};
 
 use super::{
     mtls::MTLSManager,
-    service::{
-        broadcast_node_states,
-        gossip::{
-            gossip_client::GossipClient, gossip_message, stream_message::Payload as StreamPayload,
-            NodeState, NodeStatus, Ping, PingReq, StateSync, StreamMessage, StreamMessageType,
-        },
-        try_ping, ClusterState,
-    },
+    service::{broadcast_node_states, try_ping, ClusterState},
 };
 use crate::{
+    gossip::{
+        gossip_client::GossipClient, gossip_message, stream_message::Payload as StreamPayload,
+        NodeState, NodeStatus, Ping, PingReq, StateSync, StreamMessage, StreamMessageType,
+    },
     metrics,
     transport::{
         chunking::{build_stream_batches, chunk_value, dispatch_stream_batch, next_generation},

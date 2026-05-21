@@ -11,7 +11,7 @@ use std::{
 use parking_lot::RwLock;
 use tracing::warn;
 
-use super::service::gossip::{NodeState, NodeStatus};
+use crate::gossip::{NodeState, NodeStatus};
 
 /// Partition detection configuration
 #[derive(Debug, Clone)]
@@ -178,8 +178,7 @@ mod tests {
     use std::{collections::BTreeMap, time::Duration};
 
     use super::*;
-    // Import NodeState and NodeStatus from gossip module
-    use crate::service::gossip::{NodeState, NodeStatus};
+    use crate::gossip::{NodeState, NodeStatus};
 
     fn create_test_config() -> PartitionConfig {
         PartitionConfig {

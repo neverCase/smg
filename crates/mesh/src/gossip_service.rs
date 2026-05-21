@@ -15,15 +15,7 @@ use super::{
     metrics::{record_ack, record_nack, record_peer_reconnect, update_peer_connections},
     mtls::MTLSManager,
     partition::PartitionDetector,
-    service::{
-        gossip::{
-            self,
-            gossip_server::{Gossip, GossipServer},
-            GossipMessage, NodeState, NodeStatus, NodeUpdate, PingReq, StreamMessage,
-            StreamMessageType,
-        },
-        try_ping, ClusterState,
-    },
+    service::{try_ping, ClusterState},
     transport::{
         chunking::{build_stream_batches, chunk_value, dispatch_stream_batch, next_generation},
         limits::{
@@ -31,6 +23,11 @@ use super::{
             STREAM_IDLE_TIMEOUT,
         },
     },
+};
+use crate::gossip::{
+    self,
+    gossip_server::{Gossip, GossipServer},
+    GossipMessage, NodeState, NodeStatus, NodeUpdate, PingReq, StreamMessage, StreamMessageType,
 };
 
 #[derive(Debug)]
