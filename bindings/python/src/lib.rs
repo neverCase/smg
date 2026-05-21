@@ -492,7 +492,6 @@ pub struct PyCrossRegionPeerConfig {
 
 #[pymethods]
 impl PyCrossRegionPeerConfig {
-    #[expect(clippy::too_many_arguments)]
     #[new]
     #[pyo3(signature = (
         region_id = None,
