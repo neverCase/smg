@@ -125,7 +125,7 @@ def build_cross_region_config(args_dict: dict) -> PyCrossRegionConfig | None:
     return PyCrossRegionConfig(
         enabled=True,
         region_id=args_dict.get("cross_region_region_id"),
-        server_name=args_dict.get("cross_region_server_name"),
+        server_name=args_dict.get("mesh_server_name"),
         realm=args_dict.get("cross_region_realm"),
         environment=args_dict.get("cross_region_environment"),
         request_plane_enabled=args_dict.get("cross_region_request_plane_enabled"),
@@ -414,7 +414,6 @@ class Router:
             "cross_region_region_id",
             "cross_region_realm",
             "cross_region_environment",
-            "cross_region_server_name",
             # The three fields below have CLI flags but no home in
             # CrossRegionConfig yet; parsed for forward compatibility and dropped.
             "cross_region_local_only_on_degraded_sync",

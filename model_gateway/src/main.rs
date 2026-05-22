@@ -713,14 +713,6 @@ struct CliArgs {
     #[arg(long, help_heading = "Cross-Region Smart Router")]
     cross_region_sync_plane_signal_stale_after_seconds: Option<u64>,
 
-    /// This replica's identifier for cross-region signals (the `actor` stamped
-    /// on every published envelope and the trailing segment of per-replica
-    /// signal keys). Falls back to `--mesh-server-name` when unset and mesh is
-    /// enabled, otherwise an `smg-<random>` value is generated at boot.
-    /// Must match `[A-Za-z0-9._-]+` to be safe in key path segments.
-    #[arg(long, help_heading = "Cross-Region Smart Router")]
-    cross_region_server_name: Option<String>,
-
     /// Peer Region Agent mapping: region_id=...,request_url=https://host:8443,sync_url=https://host:9443,realm=...,environment=...
     #[arg(long = "cross-region-peer", action = ArgAction::Append, value_parser = parse_cross_region_peer, help_heading = "Cross-Region Smart Router")]
     cross_region_peers: Vec<CrossRegionPeerConfig>,
@@ -980,9 +972,9 @@ impl CliArgs {
         let request_plane_defaults = CrossRegionRequestPlaneConfig::default();
         let sync_plane_defaults = CrossRegionSyncPlaneConfig::default();
         let server_name = if self.cross_region_enabled {
-            Some(self.resolve_cross_region_server_name())
+            self.mesh_server_name.clone()
         } else {
-            self.cross_region_server_name.clone()
+            None
         };
 
         CrossRegionConfig {
@@ -1021,20 +1013,11 @@ impl CliArgs {
         }
     }
 
-    /// Resolve this replica's cross-region `server_name`. Resolution order:
-    /// explicit `--cross-region-server-name` → `--mesh-server-name` →
-    /// generated `smg-<random>` so a co-deployed mesh/cross-region pair shares
-    /// identity by default without forcing the operator to set both flags.
-    fn resolve_cross_region_server_name(&self) -> String {
-        if let Some(name) = &self.cross_region_server_name {
-            return name.to_string();
-        }
-        if let Some(name) = &self.mesh_server_name {
-            return name.to_string();
-        }
-        let mut rng = rand::rng();
-        let random_string: String = (0..4).map(|_| rng.sample(Alphanumeric) as char).collect();
-        format!("smg-{random_string}")
+    fn cross_region_sync_plane_enabled(&self) -> bool {
+        self.cross_region_enabled
+            && self
+                .cross_region_sync_plane_enabled
+                .unwrap_or_else(|| CrossRegionSyncPlaneConfig::default().enabled)
     }
 
     fn parse_mesh_socket_addr(
@@ -1052,12 +1035,18 @@ impl CliArgs {
     }
 
     fn build_mesh_server_config(&self) -> ConfigResult<Option<MeshServerConfig>> {
-        if !self.enable_mesh {
+        if !self.enable_mesh && !self.cross_region_sync_plane_enabled() {
             return Ok(None);
         }
 
         let self_name = if let Some(name) = &self.mesh_server_name {
             name.to_string()
+        } else if self.cross_region_sync_plane_enabled() {
+            return Err(ConfigError::ValidationFailed {
+                reason: "mesh_server_name is required when cross-region sync plane is enabled; \
+                     cross-region signal server_name is derived from mesh_server_name"
+                    .to_string(),
+            });
         } else {
             let mut rng = rand::rng();
             let random_string: String = (0..4).map(|_| rng.sample(Alphanumeric) as char).collect();
@@ -1908,6 +1897,10 @@ mod tests {
             "7",
             "--cross-region-sync-plane-signal-stale-after-seconds",
             "45",
+            "--mesh-server-name",
+            "smg-router-IAD",
+            "--mesh-advertise-host",
+            "10.60.20.20",
             "--cross-region-peer",
             "region_id=us-chicago-1,request_url=https://smg-region-agent.us-chicago-1.internal:8443,sync_url=https://smg-region-agent.us-chicago-1.internal:9443,realm=oc1,environment=prod",
             "--cross-region-mtls-ca-cert-path",
@@ -1940,6 +1933,10 @@ mod tests {
                 .sync_plane
                 .signal_stale_after_seconds,
             45
+        );
+        assert_eq!(
+            router_config.cross_region.server_name.as_deref(),
+            Some("smg-router-IAD")
         );
         assert_eq!(router_config.cross_region.peers.len(), 1);
 

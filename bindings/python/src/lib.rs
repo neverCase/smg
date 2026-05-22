@@ -865,6 +865,18 @@ impl Router {
             None
         };
 
+        let cross_region_config = self
+            .cross_region_config
+            .as_ref()
+            .map(|c| {
+                let mut config = c.to_config();
+                if config.enabled {
+                    config.server_name = self.mesh_server_name.clone();
+                }
+                config
+            })
+            .unwrap_or_default();
+
         config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -948,12 +960,7 @@ impl Router {
                 self.server_key_path.as_ref(),
             )
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
-            .cross_region_config(
-                self.cross_region_config
-                    .as_ref()
-                    .map(|c| c.to_config())
-                    .unwrap_or_default(),
-            )
+            .cross_region_config(cross_region_config)
             .build()
     }
 }
@@ -1352,6 +1359,12 @@ impl Router {
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
+        let cross_region_sync_plane_enabled = self.cross_region_config.as_ref().is_some_and(|c| {
+            c.enabled
+                && c.sync_plane_enabled
+                    .unwrap_or_else(|| config::CrossRegionSyncPlaneConfig::default().enabled)
+        });
+
         runtime.block_on(async move {
             Box::pin(server::startup(server::ServerConfig {
                 host: self.host.clone(),
@@ -1370,14 +1383,21 @@ impl Router {
                     .control_plane_auth
                     .as_ref()
                     .map(|c| c.to_auth_control_plane_config()),
-                mesh_server_config: if self.enable_mesh {
-                    let self_name = self.mesh_server_name.clone().unwrap_or_else(|| {
+                mesh_server_config: if self.enable_mesh || cross_region_sync_plane_enabled {
+                    let self_name = if let Some(name) = self.mesh_server_name.clone() {
+                        name
+                    } else if cross_region_sync_plane_enabled {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "mesh_server_name is required when cross-region sync plane is enabled; \
+                             cross-region signal server_name is derived from mesh_server_name",
+                        ));
+                    } else {
                         use rand::{distr::Alphanumeric, Rng};
                         let random_string: String = (0..4)
                             .map(|_| rand::rng().sample(Alphanumeric) as char)
                             .collect();
                         format!("Mesh_{random_string}")
-                    });
+                    };
                     let peer = self
                         .mesh_peer_urls
                         .first()

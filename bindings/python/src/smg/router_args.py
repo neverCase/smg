@@ -175,7 +175,6 @@ class RouterArgs:
     cross_region_region_id: str | None = None
     cross_region_realm: str | None = None
     cross_region_environment: str | None = None
-    cross_region_server_name: str | None = None
     cross_region_local_only_on_degraded_sync: bool | None = None
     cross_region_request_plane_enabled: bool | None = None
     cross_region_request_plane_listen_port: int | None = None
@@ -1165,12 +1164,6 @@ class RouterArgs:
             type=str,
             default=None,
             help="Local deployment environment, for example prod",
-        )
-        xr_group.add_argument(
-            f"--{prefix}cross-region-server-name",
-            type=str,
-            default=None,
-            help="This replica's identifier for cross-region signals",
         )
         xr_group.add_argument(
             f"--{prefix}cross-region-local-only-on-degraded-sync",
