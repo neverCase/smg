@@ -871,7 +871,7 @@ impl Router {
             .map(|c| {
                 let mut config = c.to_config();
                 if config.enabled {
-                    config.server_name = self.mesh_server_name.clone();
+                    config.server_name.clone_from(&self.mesh_server_name);
                 }
                 config
             })
