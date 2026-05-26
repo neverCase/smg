@@ -103,12 +103,12 @@ impl HarmonyParserAdapter {
                         final_text.push_str(&current_content);
                     }
                     None => {
-                        tracing::warn!(
+                        tracing::debug!(
                             "Dropping incomplete Harmony content without a channel instead of treating it as final text"
                         );
                     }
                     _ => {
-                        tracing::warn!(
+                        tracing::debug!(
                             channel = ?current_channel,
                             "Dropping incomplete Harmony content with unknown channel instead of treating it as final text"
                         );
