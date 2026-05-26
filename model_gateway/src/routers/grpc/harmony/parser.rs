@@ -599,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_messages_preserves_malformed_json_tool_arguments() {
+    fn parse_messages_preserves_non_json_tool_arguments() {
         let messages = vec![Message {
             author: Author {
                 role: Role::Assistant,
