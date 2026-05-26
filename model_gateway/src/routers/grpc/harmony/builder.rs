@@ -233,17 +233,6 @@ fn has_custom_tools(tool_types: &[&str]) -> bool {
     !tool_types.iter().all(|t| BUILTIN_TOOLS.contains(t))
 }
 
-fn parse_chat_reasoning_effort(effort: &str) -> ReasoningEffort {
-    match effort.to_ascii_lowercase().as_str() {
-        "high" => ReasoningEffort::High,
-        "medium" => ReasoningEffort::Medium,
-        "low" => ReasoningEffort::Low,
-        // Harmony does not support minimal reasoning effort.
-        "minimal" => ReasoningEffort::Low,
-        _ => ReasoningEffort::Medium,
-    }
-}
-
 /// Harmony request builder
 ///
 /// Converts OpenAI-format requests into Harmony-encoded format with input_ids,
@@ -413,7 +402,14 @@ impl HarmonyBuilder {
         let reasoning_effort = request
             .reasoning_effort
             .as_deref()
-            .map(parse_chat_reasoning_effort);
+            .map(|effort| match effort {
+                "high" => ReasoningEffort::High,
+                "medium" => ReasoningEffort::Medium,
+                "low" => ReasoningEffort::Low,
+                // Harmony does not support minimal reasoning effort
+                "minimal" => ReasoningEffort::Low,
+                _ => ReasoningEffort::Medium,
+            });
 
         let has_tools = request.tools.is_some();
         self.build_system_message(reasoning_effort, has_tools)
@@ -1395,25 +1391,6 @@ mod tests {
         assert_eq!(message.author.name.as_deref(), Some(function_name));
         assert_eq!(message.recipient.as_deref(), Some("assistant"));
         assert_eq!(message.channel.as_deref(), Some("commentary"));
-    }
-
-    fn assert_reasoning_effort(input: &str, expected: ReasoningEffort) {
-        let actual = parse_chat_reasoning_effort(input);
-        match (actual, expected) {
-            (ReasoningEffort::High, ReasoningEffort::High)
-            | (ReasoningEffort::Medium, ReasoningEffort::Medium)
-            | (ReasoningEffort::Low, ReasoningEffort::Low) => {}
-            _ => panic!("unexpected reasoning effort mapping for {input}"),
-        }
-    }
-
-    #[test]
-    fn chat_reasoning_effort_is_case_insensitive() {
-        assert_reasoning_effort("HIGH", ReasoningEffort::High);
-        assert_reasoning_effort("medium", ReasoningEffort::Medium);
-        assert_reasoning_effort("LOW", ReasoningEffort::Low);
-        assert_reasoning_effort("MiNiMaL", ReasoningEffort::Low);
-        assert_reasoning_effort("unknown", ReasoningEffort::Medium);
     }
 
     #[tokio::test(flavor = "multi_thread")]
