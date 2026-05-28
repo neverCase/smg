@@ -147,6 +147,42 @@ impl MeshController {
                 });
             }
 
+            // Self-incarnation refresh — refute a stale Suspected/Down on the
+            // local node's own entry. SWIM's standard recovery primitive:
+            // when peers (or partition heuristics) mark us non-Alive, the
+            // only way to break the sticky state is for us to broadcast a
+            // higher-version Alive. Without this, once peers' Ping fails (a
+            // transient blip during rollouts or cross-region routing
+            // hiccups), they mark us Down → the peer-picker `retain` below
+            // permanently excludes us → no peer ever Pings us again → we
+            // stay Down forever despite being healthy.
+            {
+                let mut state = init_state.write();
+                if let Some(self_state) = state.get(&self.self_name).cloned() {
+                    if self_state.status != NodeStatus::Alive as i32 {
+                        let new_version = self_state.version.saturating_add(1);
+                        log::info!(
+                            "Self-incarnation refresh: local node {} was marked {:?} (v{}); \
+                             bumping to Alive v{}",
+                            self.self_name,
+                            self_state.status,
+                            self_state.version,
+                            new_version,
+                        );
+                        state.insert(
+                            self.self_name.clone(),
+                            NodeState {
+                                name: self_state.name.clone(),
+                                address: self_state.address.clone(),
+                                status: NodeStatus::Alive as i32,
+                                version: new_version,
+                                metadata: self_state.metadata.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+
             // Get available peers from cluster state
             let mut map = init_state.read().clone();
             map.retain(|k, v| {
