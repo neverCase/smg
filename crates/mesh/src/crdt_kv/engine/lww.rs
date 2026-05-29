@@ -231,9 +231,39 @@ impl LwwEngine {
     }
 
     fn append_op(&self, op: Operation) {
-        self.log
-            .write()
-            .append_with_strategy(op, |_| crate::crdt_kv::MergeStrategy::LastWriterWins);
+        let mut log = self.log.write();
+        log.append(op);
+        if log.len() > OperationLog::AUTO_COMPACT_THRESHOLD {
+            Self::compact_log(&mut log);
+            // Local-write path only: dropping oldest on the remote-merge path
+            // would shed remotely-learned keys (see the helper's docs).
+            let dropped = log.truncate_oldest_over_threshold();
+            if dropped > 0 {
+                tracing::warn!(
+                    dropped,
+                    total = log.len(),
+                    "LwwEngine log over threshold after compaction; dropped oldest \
+                     entries (out-of-spec distinct-key count)"
+                );
+            }
+        }
+    }
+
+    /// LWW per-key fold: the winning op is the one with the maximum
+    /// `(timestamp, replica_id)` tuple. Tombstones and inserts share the
+    /// ordering - the newer wins regardless of kind.
+    fn lww_fold(ops: &[Operation]) -> Option<Operation> {
+        ops.iter()
+            .max_by_key(|op| (op.timestamp(), op.replica_id()))
+            .cloned()
+    }
+
+    /// Compact the log per LWW rules: collapse all ops for a key down to the
+    /// one with maximum `(timestamp, replica_id)`. Never drops keys outright -
+    /// the truncate-oldest safety valve lives only on the `append_op`
+    /// local-write path.
+    fn compact_log(log: &mut OperationLog) {
+        log.compact_by_key(Self::lww_fold);
     }
 }
 
@@ -324,21 +354,30 @@ impl NamespaceCrdtEngine for LwwEngine {
             .map(|op| (op.replica_id(), op.timestamp()))
             .collect();
 
+        // Consume `ops` here so the filter moves each surviving Operation
+        // (including its `Vec<u8>` payload) into `unseen` without cloning.
         let mut unseen: Vec<Operation> = ops
-            .iter()
+            .into_iter()
             .filter(|op| !seen.contains(&(op.replica_id(), op.timestamp())))
-            .cloned()
             .collect();
         unseen.sort_by_key(|op| (op.timestamp(), op.replica_id()));
 
-        // Merge into the log first so subsequent compaction sees the full
-        // set, then compact. Strategy callback is LWW since this engine only
-        // hosts LWW keys.
+        // Nothing new to apply: skip the write lock, compaction, and the
+        // clock/state replay loop entirely.
+        if unseen.is_empty() {
+            return;
+        }
+
+        // LWW op-id collision policy is dedup: an op already in the log by
+        // `(replica_id, timestamp)` is a no-op. `unseen` was already filtered
+        // against the local log above; append it directly and compact (no
+        // truncate - this path must not drop remotely-learned keys).
         {
             let mut log = self.log.write();
-            let incoming = OperationLog::from_operations(ops);
-            log.merge_with_strategy(&incoming, |_| crate::crdt_kv::MergeStrategy::LastWriterWins);
-            log.compact_with_strategy(|_| crate::crdt_kv::MergeStrategy::LastWriterWins);
+            for op in &unseen {
+                log.append(op.clone());
+            }
+            Self::compact_log(&mut log);
         }
 
         // Apply unseen ops to live state. Lamport clock observes each remote
