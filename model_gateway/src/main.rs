@@ -1086,10 +1086,24 @@ impl CliArgs {
         }
 
         let cross_region_config = self.build_cross_region_config();
-        let mesh_peer_authorities = peer
+        // mTLS authority allowlist must cover EVERY peer the mesh will dial,
+        // not just the seed. Without this, peers learned through gossip
+        // (i.e. all peers other than the seed) fail at TLS handshake when
+        // we try to Ping them. Parse every `--mesh-peer-urls` value, not
+        // only `.first()` which is the init_peer seed.
+        let mesh_peer_authorities = self
+            .mesh_peer_urls
             .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<String>>();
+            .map(|url| {
+                url.parse::<std::net::SocketAddr>()
+                    .map(|addr| addr.to_string())
+                    .map_err(|e| ConfigError::InvalidValue {
+                        field: "mesh_peer_urls".to_string(),
+                        value: url.clone(),
+                        reason: format!("invalid socket address: {e}"),
+                    })
+            })
+            .collect::<ConfigResult<Vec<String>>>()?;
         let mtls_config = Self::build_cross_region_mesh_mtls_config(
             &cross_region_config,
             &mesh_peer_authorities,
@@ -1115,7 +1129,10 @@ impl CliArgs {
 
         let mut allowed_peer_identities = Vec::new();
         let mut expected_peer_tls_by_authority = BTreeMap::new();
-        let mut enabled_peer_tls = Vec::new();
+        // First pass: every cross-region peer's sync_url authority maps to
+        // that peer's own SPIFFE identity. This is the authoritative
+        // binding for all addresses we'll ever dial cross-region.
+        let mut peer_tls_by_authority: BTreeMap<String, ExpectedPeerTlsIdentity> = BTreeMap::new();
         for (idx, peer) in cross_region.peers.iter().enumerate() {
             if !peer.enabled {
                 continue;
@@ -1135,18 +1152,33 @@ impl CliArgs {
                 expected_tls.clone(),
                 format!("cross_region.peers[{idx}].sync_url"),
             )?;
+            peer_tls_by_authority.insert(authority, expected_tls);
             allowed_peer_identities.push(identity);
-            enabled_peer_tls.push((idx, expected_tls));
         }
 
-        for (mesh_authority, (idx, expected_tls)) in
-            mesh_peer_authorities.iter().zip(enabled_peer_tls.iter())
-        {
+        // Second pass: cover every `--mesh-peer-urls` authority. Each one
+        // must resolve to the cross-region peer whose own sync_url has the
+        // same authority — that peer's identity is what the mesh listener
+        // on that address will present. Pairing by *position* (zip) is
+        // wrong when the mesh peer list isn't aligned with the
+        // cross-region peer list (e.g. when the seed is the 4th peer but
+        // the zip would bind it to the 1st peer's identity, causing a TLS
+        // mismatch at dial time).
+        for mesh_authority in mesh_peer_authorities {
+            let expected_tls = peer_tls_by_authority
+                .get(mesh_authority)
+                .cloned()
+                .ok_or_else(|| ConfigError::InvalidValue {
+                    field: "mesh_peer_urls".to_string(),
+                    value: mesh_authority.clone(),
+                    reason: "mesh peer authority does not match any cross_region.peers[].sync_url"
+                        .to_string(),
+                })?;
             Self::insert_expected_peer_tls(
                 &mut expected_peer_tls_by_authority,
                 mesh_authority.clone(),
-                expected_tls.clone(),
-                format!("mesh_peer_urls for cross_region.peers[{idx}]"),
+                expected_tls,
+                format!("mesh_peer_urls for {mesh_authority}"),
             )?;
         }
 
@@ -1953,7 +1985,11 @@ mod tests {
     fn cross_region_peer_identities_flow_to_mesh_mtls_config() {
         let args = launch_args(&cross_region_launch_args());
         let router_config = args.to_router_config(Vec::new()).expect("router config");
-        let mesh_peer_authorities = vec!["10.64.20.10:9443".to_string()];
+        // The mesh-peer-urls value must match an existing cross_region peer's
+        // sync_url authority so the mesh dial picks up the right SPIFFE
+        // identity at TLS handshake. In production this is true by
+        // construction (the Helm chart emits sync_url authorities here).
+        let mesh_peer_authorities = vec!["smg-region-agent.us-chicago-1.internal:9443".to_string()];
         let mtls_config = CliArgs::build_cross_region_mesh_mtls_config(
             &router_config.cross_region,
             &mesh_peer_authorities,
@@ -1976,11 +2012,27 @@ mod tests {
             "smg-region-agent.us-chicago-1.internal"
         );
         assert_eq!(sync_tls.spiffe_identity(), &expected_identity);
+    }
 
-        let mesh_tls = mtls_config
-            .expected_peer_tls_for_authority("10.64.20.10:9443")
-            .expect("mesh SocketAddr authority should bridge to sync_url TLS target");
-        assert_eq!(mesh_tls, sync_tls);
+    #[test]
+    fn mesh_peer_authority_unknown_to_cross_region_peers_is_rejected() {
+        // A mesh-peer-urls value that doesn't match any cross_region peer's
+        // sync_url authority cannot possibly TLS-handshake correctly, so
+        // we surface a clear config error at boot instead of letting it
+        // become a runtime "transport error" the first time we dial.
+        let args = launch_args(&cross_region_launch_args());
+        let router_config = args.to_router_config(Vec::new()).expect("router config");
+        let mesh_peer_authorities = vec!["10.64.20.10:9443".to_string()];
+        let err = CliArgs::build_cross_region_mesh_mtls_config(
+            &router_config.cross_region,
+            &mesh_peer_authorities,
+        )
+        .expect_err("unknown authority should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not match any cross_region.peers"),
+            "error message should explain the mismatch: {msg}",
+        );
     }
 
     #[test]

@@ -88,9 +88,7 @@ def _parse_cross_region_peer(entry: str) -> PyCrossRegionPeerConfig:
     fields: dict[str, str] = {}
     for part in entry.split(","):
         if "=" not in part:
-            raise ValueError(
-                f"invalid cross-region peer entry '{part}', expected key=value"
-            )
+            raise ValueError(f"invalid cross-region peer entry '{part}', expected key=value")
         key, value = part.split("=", 1)
         key, value = key.strip(), value.strip()
         if not value:
@@ -119,8 +117,7 @@ def build_cross_region_config(args_dict: dict) -> PyCrossRegionConfig | None:
     if not args_dict.get("cross_region_enabled"):
         return None
     peers = [
-        _parse_cross_region_peer(entry)
-        for entry in args_dict.get("cross_region_peers", []) or []
+        _parse_cross_region_peer(entry) for entry in args_dict.get("cross_region_peers", []) or []
     ]
     return PyCrossRegionConfig(
         enabled=True,
@@ -129,9 +126,7 @@ def build_cross_region_config(args_dict: dict) -> PyCrossRegionConfig | None:
         realm=args_dict.get("cross_region_realm"),
         environment=args_dict.get("cross_region_environment"),
         request_plane_enabled=args_dict.get("cross_region_request_plane_enabled"),
-        request_plane_listen_port=args_dict.get(
-            "cross_region_request_plane_listen_port"
-        ),
+        request_plane_listen_port=args_dict.get("cross_region_request_plane_listen_port"),
         request_plane_max_platform_retries=args_dict.get(
             "cross_region_request_plane_max_platform_retries"
         ),

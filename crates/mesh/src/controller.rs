@@ -191,8 +191,14 @@ impl MeshController {
                     && v.status != NodeStatus::Leaving as i32
             });
 
-            let peer = if cnt == 0 && map.is_empty() {
-                // Only use init_peer if cluster state is empty (no service discovery)
+            let peer = if map.is_empty() {
+                // No live peers in cluster state — keep retrying init_peer
+                // every round until gossip or service discovery populates
+                // membership. The previous behavior (cnt == 0 only) wedged
+                // forever after a single failed dial when init_peer wasn't
+                // yet up — a cold-start race that bit us repeatedly during
+                // multi-region rollouts where regions boot at different
+                // times.
                 self.init_peer.map(|init_peer| NodeState {
                     name: "init_peer".to_string(),
                     address: init_peer.to_string(),
