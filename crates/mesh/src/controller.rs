@@ -22,7 +22,8 @@ use super::{
         broadcast_node_states, configure_mtls_endpoint_for_peer,
         gossip::{
             gossip_client::GossipClient, gossip_message, stream_message::Payload as StreamPayload,
-            NodeState, NodeStatus, Ping, PingReq, StateSync, StreamMessage, StreamMessageType,
+            NodeState, NodeStatus, NodeUpdate, Ping, PingReq, StateSync, StreamMessage,
+            StreamMessageType,
         },
         try_ping, ClusterState,
     },
@@ -66,6 +67,27 @@ pub struct MeshController {
 }
 
 impl MeshController {
+    /// Cadence for Down re-probes: one round in every N. The regular peer
+    /// picker excludes Down nodes, so without this a node marked Down once
+    /// is invisible to the cluster forever. Probing every 10 rounds (~10s)
+    /// is rare enough to not noticeably load the network on a busy cluster
+    /// and frequent enough that a genuinely-back peer recovers within seconds.
+    const DOWN_PROBE_EVERY_N_ROUNDS: u64 = 10;
+
+    /// Pick one random Down peer from the snapshot, excluding self. Returns
+    /// None when the cluster has no Down peers (the common steady-state case).
+    fn pick_down_probe_target(
+        snapshot: &BTreeMap<String, NodeState>,
+        self_name: &str,
+    ) -> Option<NodeState> {
+        let down_peers: Vec<&NodeState> = snapshot
+            .iter()
+            .filter(|(k, v)| k.as_str() != self_name && v.status == NodeStatus::Down as i32)
+            .map(|(_, v)| v)
+            .collect();
+        down_peers.choose(&mut rand::rng()).map(|&v| v.clone())
+    }
+
     /// Create a new MeshController with stores and sync manager
     pub fn new(
         state: ClusterState,
@@ -184,12 +206,29 @@ impl MeshController {
             }
 
             // Get available peers from cluster state
-            let mut map = init_state.read().clone();
+            let snapshot = init_state.read().clone();
+            let mut map = snapshot.clone();
             map.retain(|k, v| {
                 k.ne(&self.self_name.to_string())
                     && v.status != NodeStatus::Down as i32
                     && v.status != NodeStatus::Leaving as i32
             });
+
+            // Down re-probe target: every DOWN_PROBE_EVERY_N_ROUNDS, pick
+            // one random Down peer to ping with our full StateSync. This
+            // closes the sticky-Down trap where a node that's actually back
+            // can never escape Down because (a) our regular picker excludes
+            // Down nodes and (b) PingServer Ack only carries the receiver's
+            // own status, so the remote node never learns it's been marked
+            // Down and never self-refreshes. A successful probe revives the
+            // peer locally via apply_peer_node_update; even on failure, the
+            // remote node merges our state_sync (which includes its own
+            // Down v_n) and triggers its self-incarnation refresh next round.
+            let down_probe_target = if cnt.is_multiple_of(Self::DOWN_PROBE_EVERY_N_ROUNDS) {
+                Self::pick_down_probe_target(&snapshot, &self.self_name)
+            } else {
+                None
+            };
 
             let peer = if map.is_empty() {
                 // No live peers in cluster state — keep retrying init_peer
@@ -368,6 +407,15 @@ impl MeshController {
                     } else {
                         log::info!("No peer address available to connect");
                     }
+
+                    if let Some(down_peer) = down_probe_target {
+                        if let Err(e) = self.probe_down_peer(down_peer).await {
+                            // Probe failures are expected (the peer is Down,
+                            // possibly genuinely unreachable). Log at debug
+                            // so we don't spam warn-level on a known-down peer.
+                            log::debug!("{}", e);
+                        }
+                    }
                 }
             }
         }
@@ -396,43 +444,7 @@ impl MeshController {
         {
             Ok(node_update) => {
                 log::info!("Received NodeUpdate from peer: {:?}", node_update);
-                // Update state for Alive or Leaving status
-                if node_update.status == NodeStatus::Alive as i32
-                    || node_update.status == NodeStatus::Leaving as i32
-                {
-                    let updated_peer = {
-                        let mut s = read_state.write();
-                        let entry = s
-                            .entry(node_update.name.clone())
-                            .and_modify(|e| {
-                                e.status = node_update.status;
-                                e.address.clone_from(&node_update.address);
-                            })
-                            .or_insert_with(|| NodeState {
-                                name: node_update.name.clone(),
-                                address: node_update.address.clone(),
-                                status: node_update.status,
-                                version: 1,
-                                metadata: HashMap::new(),
-                            });
-                        entry.clone()
-                    }; // Lock is released here
-
-                    // If node is Alive, establish sync_stream connection with freshest address.
-                    if node_update.status == NodeStatus::Alive as i32 {
-                        if let Err(e) = self
-                            .start_sync_stream_connection(updated_peer.clone())
-                            .await
-                        {
-                            log::warn!(
-                                "Failed to start sync_stream to {}: {}",
-                                updated_peer.name,
-                                e
-                            );
-                            // Connection failure doesn't affect ping flow, will retry in next cycle
-                        }
-                    }
-                }
+                self.apply_peer_node_update(node_update).await;
             }
             Err(e) => {
                 log::info!("Failed to connect to peer: {}, now try ping-req", e);
@@ -516,6 +528,84 @@ impl MeshController {
 
         log::info!("Successfully connected to peer {}", peer_addr);
 
+        Ok(())
+    }
+
+    /// Apply a NodeUpdate received from a peer to local cluster_state, and
+    /// — if the update is Alive — establish a sync_stream connection. The
+    /// status write is unconditional (no version comparison) because a fresh
+    /// NodeUpdate from the peer itself is authoritative for its own status:
+    /// it's the strongest possible signal that the peer is up. This is the
+    /// only revival path for a node that was previously marked Down locally.
+    /// Shared by `connect_to_peer` (regular Ping) and `probe_down_peer`
+    /// (Down re-probe).
+    async fn apply_peer_node_update(&self, node_update: NodeUpdate) {
+        if node_update.status != NodeStatus::Alive as i32
+            && node_update.status != NodeStatus::Leaving as i32
+        {
+            return;
+        }
+        let updated_peer = {
+            let mut s = self.state.write();
+            let entry = s
+                .entry(node_update.name.clone())
+                .and_modify(|e| {
+                    e.status = node_update.status;
+                    e.address.clone_from(&node_update.address);
+                })
+                .or_insert_with(|| NodeState {
+                    name: node_update.name.clone(),
+                    address: node_update.address.clone(),
+                    status: node_update.status,
+                    version: 1,
+                    metadata: HashMap::new(),
+                });
+            entry.clone()
+        };
+        if node_update.status == NodeStatus::Alive as i32 {
+            if let Err(e) = self
+                .start_sync_stream_connection(updated_peer.clone())
+                .await
+            {
+                log::warn!(
+                    "Failed to start sync_stream to {}: {}",
+                    updated_peer.name,
+                    e
+                );
+            }
+        }
+    }
+
+    /// Send a Ping (with full local StateSync) to a Down peer to give the
+    /// cluster a chance to revive it. On Ack-Alive, the peer is revived via
+    /// `apply_peer_node_update`. On failure, status is left unchanged — Down
+    /// re-probes are best-effort and must not bump the version (which would
+    /// just churn Down→Suspected→Down indefinitely without learning anything).
+    ///
+    /// The Ping carries this node's full view of cluster_state. If the
+    /// remote peer's local self-state is still Alive v1 (stale from boot),
+    /// the incoming `Down v_n` entry for itself will trigger the remote's
+    /// self-incarnation refresh next round, after which a fresh `Alive v(n+1)`
+    /// floods back. This is the recovery loop the cluster needs when a node
+    /// boots into an already-poisoned membership.
+    async fn probe_down_peer(&self, peer: NodeState) -> Result<()> {
+        log::info!("Down-probe: pinging {} at {}", peer.name, peer.address);
+
+        let state_sync = StateSync {
+            nodes: self.state.read().values().cloned().collect(),
+        };
+        let node_update = try_ping(
+            &peer,
+            Some(gossip_message::Payload::Ping(Ping {
+                state_sync: Some(state_sync),
+            })),
+            self.mtls_manager.clone(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Down-probe ping to {} failed: {}", peer.name, e))?;
+
+        log::info!("Down-probe ack from {}: {:?}", peer.name, node_update);
+        self.apply_peer_node_update(node_update).await;
         Ok(())
     }
 
@@ -1351,4 +1441,83 @@ fn get_random_values_refs<K, V>(map: &BTreeMap<K, V>, k: usize) -> Vec<&V> {
     let mut rng = rand::rng();
 
     values.choose_multiple(&mut rng, k).copied().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(name: &str, status: NodeStatus, version: u64) -> NodeState {
+        NodeState {
+            name: name.to_string(),
+            address: format!("10.0.0.1:944{}", version % 10),
+            status: status as i32,
+            version,
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn snapshot(nodes: Vec<NodeState>) -> BTreeMap<String, NodeState> {
+        nodes.into_iter().map(|n| (n.name.clone(), n)).collect()
+    }
+
+    #[test]
+    fn pick_down_probe_target_returns_none_when_empty() {
+        let snap = snapshot(vec![]);
+        assert!(MeshController::pick_down_probe_target(&snap, "self").is_none());
+    }
+
+    #[test]
+    fn pick_down_probe_target_returns_none_when_no_down_peers() {
+        let snap = snapshot(vec![
+            node("self", NodeStatus::Alive, 1),
+            node("a", NodeStatus::Alive, 1),
+            node("b", NodeStatus::Suspected, 2),
+            node("c", NodeStatus::Leaving, 1),
+        ]);
+        assert!(MeshController::pick_down_probe_target(&snap, "self").is_none());
+    }
+
+    #[test]
+    fn pick_down_probe_target_returns_the_one_down_peer() {
+        let snap = snapshot(vec![
+            node("self", NodeStatus::Alive, 1),
+            node("a", NodeStatus::Alive, 1),
+            node("b", NodeStatus::Down, 3),
+        ]);
+        let picked = MeshController::pick_down_probe_target(&snap, "self").unwrap();
+        assert_eq!(picked.name, "b");
+        assert_eq!(picked.status, NodeStatus::Down as i32);
+    }
+
+    #[test]
+    fn pick_down_probe_target_excludes_self_even_if_marked_down() {
+        // Defensive: if the local node ever sees itself as Down (it shouldn't
+        // past self-incarnation refresh, but during the same round a stale
+        // entry could remain), don't probe ourselves.
+        let snap = snapshot(vec![node("self", NodeStatus::Down, 3)]);
+        assert!(MeshController::pick_down_probe_target(&snap, "self").is_none());
+    }
+
+    #[test]
+    fn pick_down_probe_target_picks_only_from_down_when_multiple_present() {
+        let snap = snapshot(vec![
+            node("self", NodeStatus::Alive, 1),
+            node("a", NodeStatus::Down, 3),
+            node("b", NodeStatus::Down, 5),
+            node("c", NodeStatus::Alive, 1),
+            node("d", NodeStatus::Suspected, 2),
+        ]);
+        // Run several iterations so randomness doesn't flake — every pick
+        // must be one of the two Down peers, never the Alive/Suspected ones.
+        for _ in 0..32 {
+            let picked = MeshController::pick_down_probe_target(&snap, "self").unwrap();
+            assert!(
+                picked.name == "a" || picked.name == "b",
+                "picked unexpected peer {} (status {})",
+                picked.name,
+                picked.status,
+            );
+        }
+    }
 }
