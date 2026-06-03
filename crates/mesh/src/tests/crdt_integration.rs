@@ -216,19 +216,19 @@ fn ack_advances_watermark_to_delivered_version() {
     let receiver = MeshKV::new("receiver".to_string());
     receiver.configure_crdt_prefix("worker:", MergeStrategy::LastWriterWins);
 
-    let sent_version = pending_ops(&sender, &CrdtWatermark::new())
+    let sent_op_id = pending_ops(&sender, &CrdtWatermark::new())
         .iter()
         .find(|op| op.key() == "worker:a")
-        .map(|op| op.timestamp())
+        .map(|op| (op.timestamp(), op.replica_id()))
         .expect("worker:a is pending before any ack");
 
     let mut acked = CrdtWatermark::new();
-    assert_eq!(acked.get("worker:a"), 0);
+    assert_eq!(acked.get("worker:a"), None);
     deliver_crdt_watermarked(&sender, &receiver, &mut acked);
     assert_eq!(
         acked.get("worker:a"),
-        sent_version,
-        "ack advances the watermark to the delivered version"
+        Some(sent_op_id),
+        "ack advances the watermark to the delivered op-id"
     );
 }
 

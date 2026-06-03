@@ -115,25 +115,33 @@ pub fn wrap_crdt_batch(batch: CrdtBatch, sequence: u64, self_name: &str) -> Stre
     }
 }
 
-/// Encode a [`CrdtWatermark`] as a wire [`CrdtAck`] — one entry per known key.
+/// Encode a [`CrdtWatermark`] as a wire [`CrdtAck`] — one entry per known key,
+/// carrying the op-id `(version, replica_id)` so the peer can apply the same
+/// `(timestamp, replica_id)` ordering the merge uses.
 pub fn watermark_to_crdt_ack(watermark: &CrdtWatermark) -> CrdtAck {
     CrdtAck {
         entries: watermark
             .iter()
-            .map(|(key, version)| CrdtKeyVersion {
+            .map(|(key, (version, replica))| CrdtKeyVersion {
                 key: key.to_owned(),
                 version,
+                replica_id: replica.to_string(),
             })
             .collect(),
     }
 }
 
 /// Decode a received [`CrdtAck`] into a [`CrdtWatermark`] for merging into the
-/// sender's per-peer send watermark.
+/// sender's per-peer send watermark. Entries with an unparsable `replica_id`
+/// are dropped (mirrors `proto_to_op`).
 pub fn crdt_ack_to_watermark(ack: CrdtAck) -> CrdtWatermark {
     ack.entries
         .into_iter()
-        .map(|entry| (entry.key, entry.version))
+        .filter_map(|entry| {
+            ReplicaId::from_string(&entry.replica_id)
+                .ok()
+                .map(|replica| (entry.key, (entry.version, replica)))
+        })
         .collect()
 }
 
