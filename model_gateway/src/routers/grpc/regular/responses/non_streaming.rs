@@ -336,9 +336,12 @@ pub(super) async fn execute_tool_loop(
                     )
                 })?;
 
-                // Mark as completed but with incomplete details
+                // Mark as completed. `incomplete_details` is now strictly typed
+                // to OpenAI's truncation reasons (`max_output_tokens` /
+                // `content_filter`); a tool-call limit is not one of them and
+                // does not apply to a `completed` response, so it is no longer
+                // attached here.
                 responses_response.status = ResponseStatus::Completed;
-                responses_response.incomplete_details = Some(json!({ "reason": "max_tool_calls" }));
 
                 return Ok(responses_response);
             }
