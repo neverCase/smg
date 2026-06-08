@@ -14,7 +14,7 @@ use openai_protocol::{
         ResponsesResponse, ResponsesUsage,
     },
 };
-use serde_json::to_string;
+use serde_json::{json, to_string};
 use smg_mcp::{McpServerBinding, McpToolSession};
 use tracing::{debug, error, warn};
 
@@ -248,12 +248,19 @@ async fn execute_with_mcp_loop(
                         Arc::new(response_request),
                     );
 
-                    // Mark as completed. `incomplete_details` is now strictly
-                    // typed to OpenAI's truncation reasons
-                    // (`max_output_tokens` / `content_filter`); a tool-call
-                    // limit is not one of them and does not apply to a
-                    // `completed` response, so it is no longer attached here.
-                    response.status = ResponseStatus::Completed;
+                    // Tool-call limit reached before executing the remaining
+                    // calls: this is an aborted run, not a successful answer.
+                    // Per the design, exhausting `max_tool_calls` is a `failed`
+                    // status with an `error` payload (truncation
+                    // `incomplete_details` is reserved for `max_output_tokens` /
+                    // `content_filter`).
+                    response.status = ResponseStatus::Failed;
+                    response.error = Some(json!({
+                        "code": "max_tool_calls_exceeded",
+                        "message": format!(
+                            "Reached the max_tool_calls limit ({effective_limit}) before executing the remaining tool calls."
+                        ),
+                    }));
 
                     // Inject MCP metadata if any calls were executed
                     if mcp_tracking.total_calls() > 0 {
