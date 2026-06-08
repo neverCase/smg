@@ -40,7 +40,7 @@ use smg_skills::{
     build_tier1_listing, collect_manifest_listing_entries, inject_responses_tier1_listing,
     resolve_messages_skill_manifest, resolve_responses_skill_manifest,
     validate_messages_reserved_skill_tool_names, validate_responses_reserved_skill_tool_names,
-    ResolvedSkillManifest, SkillService, SkillsBudgetLimit,
+    ResolvedSkillManifest, SkillService,
 };
 use tracing::{debug, info, warn};
 
@@ -65,10 +65,6 @@ pub struct RouterManager {
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
     default_router: Arc<std::sync::RwLock<Option<RouterId>>>,
     skill_service: Option<Arc<SkillService>>,
-    /// Per-request token budget for the injected Tier-1 skills listing
-    /// (`skills.instruction_budget.per_request_tokens`). Defaults to the
-    /// `SkillsBudgetLimit` default when skills config is absent.
-    skills_instruction_budget: SkillsBudgetLimit,
     enable_igw: bool,
 }
 
@@ -81,7 +77,6 @@ impl RouterManager {
             routers: Arc::new(DashMap::new()),
             default_router: Arc::new(std::sync::RwLock::new(None)),
             skill_service: None,
-            skills_instruction_budget: SkillsBudgetLimit::default(),
             enable_igw: false,
         }
     }
@@ -114,12 +109,6 @@ impl RouterManager {
         );
         manager.enable_igw = config.router_config.enable_igw;
         manager.skill_service.clone_from(&app_context.skill_service);
-        manager.skills_instruction_budget = config
-            .router_config
-            .skills
-            .as_ref()
-            .map(|skills| skills.instruction_budget.per_request_tokens)
-            .unwrap_or_default();
         manager
             .gateway_api_key
             .clone_from(&config.router_config.api_key);
@@ -441,29 +430,28 @@ impl RouterManager {
     /// Build the Tier-1 skills listing for a resolved manifest and inject it
     /// into a clone of the outbound Responses request (#1193).
     ///
-    /// Returns the (possibly modified) request to forward upstream. When the
-    /// manifest yields no describable skills or the listing does not fit the
-    /// configured token budget, the clone is returned unchanged so behavior
-    /// degrades to "no disclosure" rather than failing the request.
+    /// Returns `Some(request)` only when there is something to disclose; when the
+    /// manifest yields no describable skills the caller forwards the original
+    /// request unchanged (no clone), so behavior degrades to "no disclosure"
+    /// rather than failing the request.
     async fn inject_responses_skill_listing(
         &self,
         tenant_id: &str,
         manifest: &ResolvedSkillManifest,
         body: &ResponsesRequest,
-    ) -> ResponsesRequest {
-        let mut outbound_body = body.clone();
+    ) -> Option<ResponsesRequest> {
         let entries =
             collect_manifest_listing_entries(self.skill_service.as_deref(), tenant_id, manifest)
                 .await;
-        if let Some(listing) = build_tier1_listing(&entries, self.skills_instruction_budget) {
-            debug!(
-                tenant_id = %tenant_id,
-                skills = entries.len(),
-                "Injecting Tier-1 skills listing into Responses request"
-            );
-            inject_responses_tier1_listing(&mut outbound_body, &listing);
-        }
-        outbound_body
+        let listing = build_tier1_listing(&entries)?;
+        debug!(
+            tenant_id = %tenant_id,
+            skills = entries.len(),
+            "Injecting Tier-1 skills listing into Responses request"
+        );
+        let mut outbound_body = body.clone();
+        inject_responses_tier1_listing(&mut outbound_body, &listing);
+        Some(outbound_body)
     }
 }
 
@@ -729,8 +717,9 @@ impl RouterTrait for RouterManager {
                 )
                 .await;
             let tenant_meta = tenant_meta.clone().with_extension(skill_manifest);
+            let outbound_ref = outbound_body.as_ref().unwrap_or(body);
             router
-                .route_responses(headers, &tenant_meta, &outbound_body, model_id)
+                .route_responses(headers, &tenant_meta, outbound_ref, model_id)
                 .await
         } else {
             (

@@ -4,20 +4,18 @@
 //! [`ResolvedSkillManifest`], but that manifest has no effect until the gateway
 //! discloses it to the model. This module owns the read-side "Tier-1" disclosure
 //! step for the Responses surface: it formats a compact listing of the attached
-//! skills (name + short description) under a configurable token budget and
-//! prepends it to the request's system `instructions` before the first model
-//! turn (issue #1193).
+//! skills (name + short description) and prepends it to the request's system
+//! `instructions` before the first model turn (issue #1193).
 //!
 //! The async lookups needed to enrich storage-backed refs into displayable
 //! `(name, description)` pairs live in the gateway (it owns the
 //! [`crate::SkillService`]); this module is pure formatting + injection so the
-//! budget math and wire shaping stay unit-testable without IO.
+//! listing shaping stays unit-testable without IO.
 
 use openai_protocol::responses::ResponsesRequest;
 
 use crate::{
     api::SkillService,
-    config::SkillsBudgetLimit,
     resolution::{ResolvedSkillManifest, ResolvedSkillRef},
 };
 
@@ -32,6 +30,14 @@ const TIER1_LISTING_PREAMBLE: &str =
      id, name, and description. When the user's task matches a skill, use the \
      skill's instructions; if read tools are available, call them to load the \
      full SKILL.md before acting.";
+
+/// Maximum number of skills rendered inline in the Tier-1 listing.
+///
+/// Requests realistically attach a handful of skills; this is a generous safety
+/// cap so a pathological request can't blow up the system prompt. Anything
+/// beyond it is summarized with a trailing "+N more" note. (Full token-budgeting
+/// is deferred — see issue #1193.)
+const MAX_LISTED_SKILLS: usize = 50;
 
 /// A single skill rendered into the Tier-1 listing.
 ///
@@ -66,76 +72,27 @@ impl SkillListingEntry {
     }
 }
 
-/// Identify the storage-backed manifest entries whose name/description the
-/// gateway still has to resolve via the [`crate::SkillService`].
+/// Build the compact Tier-1 listing text from already-resolved listing entries.
 ///
-/// Storage-backed refs only carry an id + pinned version at resolution time, so
-/// the gateway must enrich them; this helper exposes the ids that need a lookup
-/// so callers do not have to re-match the enum.
+/// Returns `None` when there is nothing to disclose. At most
+/// [`MAX_LISTED_SKILLS`] entries are rendered inline; any remainder is recorded
+/// with a trailing "+N more" note so the prompt size stays bounded.
 #[must_use]
-pub fn manifest_storage_skill_ids(manifest: &ResolvedSkillManifest) -> Vec<String> {
-    manifest
-        .refs()
-        .iter()
-        .filter_map(|skill_ref| match skill_ref {
-            ResolvedSkillRef::SmgStorage { skill_id, .. } => Some(skill_id.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Build the compact Tier-1 listing text from already-resolved listing entries,
-/// honoring `budget`.
-///
-/// Returns `None` when there is nothing to disclose or the budget is too small
-/// to fit even a single entry. The budget is a *token* budget; we approximate
-/// tokens as `ceil(chars / 4)`, the conventional rough ratio, so this stays
-/// dependency-free and deterministic. Entries are appended in order until the
-/// next one would exceed the budget, at which point the listing is truncated and
-/// a trailing note records how many skills were omitted.
-#[must_use]
-pub fn build_tier1_listing(
-    entries: &[SkillListingEntry],
-    budget: SkillsBudgetLimit,
-) -> Option<String> {
+pub fn build_tier1_listing(entries: &[SkillListingEntry]) -> Option<String> {
     if entries.is_empty() {
         return None;
     }
 
-    let max_tokens = match budget {
-        SkillsBudgetLimit::Unlimited => None,
-        SkillsBudgetLimit::Tokens(0) => return None,
-        SkillsBudgetLimit::Tokens(tokens) => Some(tokens as usize),
-    };
-
-    let header = format!("{TIER1_LISTING_HEADING}\n{TIER1_LISTING_PREAMBLE}");
-    let mut body = String::new();
-    let mut included = 0usize;
-
-    for entry in entries {
-        let candidate_line = entry.render();
-        let projected = format!("{header}\n{body}\n{candidate_line}");
-        if let Some(max_tokens) = max_tokens {
-            if approximate_token_count(&projected) > max_tokens {
-                break;
-            }
-        }
-        body.push('\n');
-        body.push_str(&candidate_line);
-        included += 1;
+    let listed = entries.len().min(MAX_LISTED_SKILLS);
+    let mut listing = format!("{TIER1_LISTING_HEADING}\n{TIER1_LISTING_PREAMBLE}");
+    for entry in &entries[..listed] {
+        listing.push('\n');
+        listing.push_str(&entry.render());
     }
 
-    if included == 0 {
-        // Budget could not fit even the first entry alongside the header.
-        return None;
-    }
-
-    let omitted = entries.len() - included;
-    let mut listing = format!("{header}{body}");
+    let omitted = entries.len() - listed;
     if omitted > 0 {
-        listing.push_str(&format!(
-            "\n- (+{omitted} more skill(s) omitted to fit the instruction budget)"
-        ));
+        listing.push_str(&format!("\n- (+{omitted} more skill(s) not shown)"));
     }
     Some(listing)
 }
@@ -212,12 +169,6 @@ pub fn inject_responses_tier1_listing(request: &mut ResponsesRequest, listing: &
     });
 }
 
-/// Approximate the token count of `text` using the conventional ~4 chars/token
-/// heuristic. Rounds up so a non-empty string always costs at least one token.
-fn approximate_token_count(text: &str) -> usize {
-    text.len().div_ceil(4)
-}
-
 #[cfg(test)]
 mod tests {
     use openai_protocol::responses::{ResponseInput, ResponsesRequest};
@@ -240,8 +191,7 @@ mod tests {
             entry("skill_b", "acme:search", "Search the repo"),
         ];
 
-        let listing = build_tier1_listing(&entries, SkillsBudgetLimit::Unlimited)
-            .expect("listing should be produced");
+        let listing = build_tier1_listing(&entries).expect("listing should be produced");
 
         assert!(listing.contains(TIER1_LISTING_HEADING));
         assert!(listing.contains("acme:map"));
@@ -253,59 +203,32 @@ mod tests {
 
     #[test]
     fn build_listing_returns_none_for_empty_entries() {
-        assert!(build_tier1_listing(&[], SkillsBudgetLimit::Unlimited).is_none());
+        assert!(build_tier1_listing(&[]).is_none());
     }
 
     #[test]
-    fn build_listing_returns_none_for_zero_budget() {
-        let entries = vec![entry("skill_a", "acme:map", "Map the repo")];
-        assert!(build_tier1_listing(&entries, SkillsBudgetLimit::Tokens(0)).is_none());
-    }
+    fn build_listing_caps_entries_and_notes_omitted() {
+        let total = MAX_LISTED_SKILLS + 3;
+        let entries: Vec<SkillListingEntry> = (0..total)
+            .map(|i| entry(&format!("skill_{i}"), &format!("acme:skill{i}"), "desc"))
+            .collect();
 
-    #[test]
-    fn build_listing_truncates_to_budget_and_records_omitted() {
-        let entries = vec![
-            entry(
-                "skill_a",
-                "acme:map",
-                "Map the repo with ripgrep and friends",
-            ),
-            entry("skill_b", "acme:search", "Search the repo thoroughly"),
-            entry("skill_c", "acme:lint", "Lint everything in the repo"),
-        ];
+        let listing = build_tier1_listing(&entries).expect("listing should be produced");
 
-        // A tight budget that fits the header + first entry (~84 tokens) but
-        // not the second (~97 tokens), exercising mid-list truncation.
-        let listing = build_tier1_listing(&entries, SkillsBudgetLimit::Tokens(90))
-            .expect("at least one entry should fit");
-
-        assert!(listing.contains("acme:map"));
+        // First and last in-cap skills are listed; those beyond the cap are not.
+        assert!(listing.contains("acme:skill0"));
+        assert!(listing.contains(&format!("acme:skill{}", MAX_LISTED_SKILLS - 1)));
+        assert!(!listing.contains(&format!("acme:skill{}", total - 1)));
         assert!(
-            listing.contains("more skill(s) omitted"),
-            "expected truncation note, got: {listing}"
+            listing.contains("3 more skill(s) not shown"),
+            "expected omitted note, got: {listing}"
         );
-        // Skills beyond the budget must not appear once truncated.
-        assert!(!listing.contains("acme:search"));
-        assert!(!listing.contains("acme:lint"));
-    }
-
-    #[test]
-    fn build_listing_returns_none_when_budget_cannot_fit_first_entry() {
-        let entries = vec![entry(
-            "skill_a",
-            "acme:map",
-            "Map the repo with ripgrep and friends",
-        )];
-        // Header alone is ~68 tokens; a budget below header+entry0 cannot fit
-        // even the first line, so nothing is disclosed.
-        assert!(build_tier1_listing(&entries, SkillsBudgetLimit::Tokens(70)).is_none());
     }
 
     #[test]
     fn build_listing_handles_missing_description() {
         let entries = vec![entry("skill_a", "acme:map", "")];
-        let listing = build_tier1_listing(&entries, SkillsBudgetLimit::Unlimited)
-            .expect("listing should be produced");
+        let listing = build_tier1_listing(&entries).expect("listing should be produced");
         assert!(listing.contains("acme:map (skill_a)"));
     }
 
@@ -428,30 +351,5 @@ mod tests {
         assert_eq!(entries[0].skill_id, "skill_missing");
         assert_eq!(entries[0].name, "skill_missing");
         assert!(entries[0].description.is_empty());
-    }
-
-    #[test]
-    fn manifest_storage_ids_only_returns_smg_storage_refs() {
-        let manifest = ResolvedSkillManifest::new(vec![
-            ResolvedSkillRef::SmgStorage {
-                skill_id: "skill_storage".to_string(),
-                requested_version: None,
-                pinned: PinnedSkillVersion {
-                    version: "v1".to_string(),
-                    version_number: 1,
-                },
-            },
-            ResolvedSkillRef::ClientLocalPath {
-                name: "repo".to_string(),
-                description: "local".to_string(),
-                path: "/workspace".to_string(),
-            },
-            ResolvedSkillRef::OpenAIProvider {
-                skill_id: "openai-skill".to_string(),
-                raw_version: None,
-            },
-        ]);
-
-        assert_eq!(manifest_storage_skill_ids(&manifest), vec!["skill_storage"]);
     }
 }

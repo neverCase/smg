@@ -31,7 +31,7 @@ pub use config::{
 pub use memory::InMemorySkillStore;
 pub use request_injection::{
     build_tier1_listing, collect_manifest_listing_entries, inject_responses_tier1_listing,
-    manifest_storage_skill_ids, SkillListingEntry,
+    SkillListingEntry,
 };
 pub use resolution::{
     resolve_messages_skill_manifest, resolve_responses_skill_manifest, ResolvedSkillManifest,
