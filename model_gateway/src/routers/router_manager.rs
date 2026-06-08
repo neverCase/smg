@@ -37,9 +37,10 @@ use openai_protocol::{
 };
 use serde_json::Value;
 use smg_skills::{
+    build_tier1_listing, collect_manifest_listing_entries, inject_responses_tier1_listing,
     resolve_messages_skill_manifest, resolve_responses_skill_manifest,
     validate_messages_reserved_skill_tool_names, validate_responses_reserved_skill_tool_names,
-    SkillService,
+    ResolvedSkillManifest, SkillService, SkillsBudgetLimit,
 };
 use tracing::{debug, info, warn};
 
@@ -64,6 +65,10 @@ pub struct RouterManager {
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
     default_router: Arc<std::sync::RwLock<Option<RouterId>>>,
     skill_service: Option<Arc<SkillService>>,
+    /// Per-request token budget for the injected Tier-1 skills listing
+    /// (`skills.instruction_budget.per_request_tokens`). Defaults to the
+    /// `SkillsBudgetLimit` default when skills config is absent.
+    skills_instruction_budget: SkillsBudgetLimit,
     enable_igw: bool,
 }
 
@@ -76,6 +81,7 @@ impl RouterManager {
             routers: Arc::new(DashMap::new()),
             default_router: Arc::new(std::sync::RwLock::new(None)),
             skill_service: None,
+            skills_instruction_budget: SkillsBudgetLimit::default(),
             enable_igw: false,
         }
     }
@@ -108,6 +114,12 @@ impl RouterManager {
         );
         manager.enable_igw = config.router_config.enable_igw;
         manager.skill_service.clone_from(&app_context.skill_service);
+        manager.skills_instruction_budget = config
+            .router_config
+            .skills
+            .as_ref()
+            .map(|skills| skills.instruction_budget.per_request_tokens)
+            .unwrap_or_default();
         manager
             .gateway_api_key
             .clone_from(&config.router_config.api_key);
@@ -425,6 +437,34 @@ impl RouterManager {
             }
         }
     }
+
+    /// Build the Tier-1 skills listing for a resolved manifest and inject it
+    /// into a clone of the outbound Responses request (#1193).
+    ///
+    /// Returns the (possibly modified) request to forward upstream. When the
+    /// manifest yields no describable skills or the listing does not fit the
+    /// configured token budget, the clone is returned unchanged so behavior
+    /// degrades to "no disclosure" rather than failing the request.
+    async fn inject_responses_skill_listing(
+        &self,
+        tenant_id: &str,
+        manifest: &ResolvedSkillManifest,
+        body: &ResponsesRequest,
+    ) -> ResponsesRequest {
+        let mut outbound_body = body.clone();
+        let entries =
+            collect_manifest_listing_entries(self.skill_service.as_deref(), tenant_id, manifest)
+                .await;
+        if let Some(listing) = build_tier1_listing(&entries, self.skills_instruction_budget) {
+            debug!(
+                tenant_id = %tenant_id,
+                skills = entries.len(),
+                "Injecting Tier-1 skills listing into Responses request"
+            );
+            inject_responses_tier1_listing(&mut outbound_body, &listing);
+        }
+        outbound_body
+    }
 }
 
 #[async_trait]
@@ -656,13 +696,41 @@ impl RouterTrait for RouterManager {
                 Ok(manifest) => manifest,
                 Err(error) => return route_error::skill_resolution_error(error),
             };
-            let tenant_meta = if skill_manifest.is_empty() {
-                tenant_meta.clone()
-            } else {
-                tenant_meta.clone().with_extension(skill_manifest)
-            };
+
+            if skill_manifest.is_empty() {
+                return router
+                    .route_responses(headers, tenant_meta, body, model_id)
+                    .await;
+            }
+
+            // Tier-1 disclosure (#1193): build a compact listing of the
+            // attached skills and inject it into the outbound request's system
+            // instructions before the first model turn. Injecting into a cloned
+            // body keeps the caller's request untouched. The resolved manifest
+            // is still attached as an extension so other surfaces / the future
+            // read-tool loop (#1194) can consume it.
+            //
+            // TODO(#1194): read-side tool loop is deferred (see report). The
+            // reserved read tools (`read_skill`/`list_skill_files`/
+            // `read_skill_file`) are intentionally NOT registered onto the
+            // outbound request here: registering them without a loop that
+            // intercepts the model's calls and serves bodies/files from
+            // `SkillService` would forward those internal function calls back to
+            // the client, leaking the internal tool surface. Wiring that
+            // non-leaking loop into both the streaming and non-streaming
+            // Responses handlers (mirroring `openai/mcp/tool_loop.rs`) is the
+            // remaining work; `response_skill_tools()` + a manifest-backed
+            // serving helper are the pieces it will compose.
+            let outbound_body = self
+                .inject_responses_skill_listing(
+                    tenant_meta.tenant_key().as_str(),
+                    &skill_manifest,
+                    body,
+                )
+                .await;
+            let tenant_meta = tenant_meta.clone().with_extension(skill_manifest);
             router
-                .route_responses(headers, &tenant_meta, body, model_id)
+                .route_responses(headers, &tenant_meta, &outbound_body, model_id)
                 .await
         } else {
             (
@@ -1007,6 +1075,162 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Router stub that records the system `instructions` of the
+    /// `ResponsesRequest` it is handed, so tests can assert what the
+    /// router_manager forwards to the model after skill injection.
+    #[derive(Debug, Default)]
+    struct ResponsesCapturingRouter {
+        captured_instructions: std::sync::Mutex<Option<String>>,
+        captured_tool_count: std::sync::Mutex<Option<usize>>,
+    }
+
+    #[async_trait]
+    impl RouterTrait for ResponsesCapturingRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn route_generate(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _body: &GenerateRequest,
+            _model_id: &str,
+        ) -> Response {
+            (StatusCode::OK, "routed").into_response()
+        }
+
+        async fn route_responses(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            body: &ResponsesRequest,
+            _model_id: &str,
+        ) -> Response {
+            *self.captured_instructions.lock().unwrap() = body.instructions.clone();
+            *self.captured_tool_count.lock().unwrap() = body.tools.as_ref().map(Vec::len);
+            (StatusCode::OK, "captured").into_response()
+        }
+
+        fn router_type(&self) -> &'static str {
+            "responses-capture"
+        }
+    }
+
+    async fn skill_service_with_one_skill() -> (tempfile::TempDir, Arc<SkillService>, String) {
+        use smg_skills::{CreateSkillRequest, SkillUpload, UploadedSkillFile};
+
+        let root = tempfile::TempDir::new().unwrap();
+        let blob_store = Arc::new(smg_blob_storage::FilesystemBlobStore::new(root.path()).unwrap());
+        let service = SkillService::in_memory(blob_store);
+        let created = service
+            .create_skill(CreateSkillRequest {
+                tenant_id: "test-tenant".to_string(),
+                upload: SkillUpload::Files(vec![UploadedSkillFile {
+                    relative_path: "SKILL.md".to_string(),
+                    contents:
+                        b"---\nname: acme:map\ndescription: Map the repo with rg\n---\nUse rg."
+                            .to_vec(),
+                    media_type: Some("text/markdown".to_string()),
+                }]),
+            })
+            .await
+            .unwrap();
+        (root, Arc::new(service), created.skill.skill_id)
+    }
+
+    fn responses_request_with_skill(skill_id: &str) -> ResponsesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "model-x",
+            "input": "hi",
+            "instructions": "Be concise.",
+            "tools": [{
+                "type": "code_interpreter",
+                "environment": {
+                    "skills": [{
+                        "type": "skill_reference",
+                        "skill_id": skill_id
+                    }]
+                }
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn route_responses_injects_tier1_listing_when_manifest_present() {
+        let (_root, service, skill_id) = skill_service_with_one_skill().await;
+
+        let mut manager =
+            RouterManager::new(Arc::new(WorkerRegistry::new()), reqwest::Client::new());
+        manager.enable_igw = false;
+        manager.skill_service = Some(service);
+        let manager = Arc::new(manager);
+        let capture = Arc::new(ResponsesCapturingRouter::default());
+        manager.register_router(router_ids::HTTP_REGULAR, capture.clone());
+        manager.set_default_router(router_ids::HTTP_REGULAR);
+
+        let request = responses_request_with_skill(&skill_id);
+        let response = manager
+            .route_responses(None, &test_tenant_meta(), &request, "model-x")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let captured = capture
+            .captured_instructions
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("router should have been handed instructions");
+        // Tier-1 listing is injected above the caller's existing instructions,
+        // proving the resolved manifest now reaches the model.
+        assert!(
+            captured.contains("skills_instructions"),
+            "expected Tier-1 heading, got: {captured}"
+        );
+        assert!(
+            captured.contains("acme:map"),
+            "expected skill name in listing"
+        );
+        assert!(captured.contains(&skill_id), "expected skill id in listing");
+        assert!(
+            captured.contains("Be concise."),
+            "caller's original instructions must be preserved"
+        );
+        let listing_idx = captured.find("skills_instructions").unwrap();
+        let original_idx = captured.find("Be concise.").unwrap();
+        assert!(
+            listing_idx < original_idx,
+            "listing must precede original prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_responses_does_not_modify_request_without_skills() {
+        let mut manager =
+            RouterManager::new(Arc::new(WorkerRegistry::new()), reqwest::Client::new());
+        manager.enable_igw = false;
+        let manager = Arc::new(manager);
+        let capture = Arc::new(ResponsesCapturingRouter::default());
+        manager.register_router(router_ids::HTTP_REGULAR, capture.clone());
+        manager.set_default_router(router_ids::HTTP_REGULAR);
+
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "model-x",
+            "input": "hi",
+            "instructions": "Be concise.",
+        }))
+        .unwrap();
+        let response = manager
+            .route_responses(None, &test_tenant_meta(), &request, "model-x")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // No skills attached: instructions are forwarded verbatim (no listing).
+        let captured = capture.captured_instructions.lock().unwrap().clone();
+        assert_eq!(captured.as_deref(), Some("Be concise."));
     }
 
     #[test]
