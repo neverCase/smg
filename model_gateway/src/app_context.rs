@@ -6,14 +6,11 @@ use std::{
 use llm_tokenizer::registry::TokenizerRegistry;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use reqwest::Client;
-use smg_blob_storage::create_blob_store;
 use smg_data_connector::{
-    backend_supports_memory_writer, create_storage, BackgroundResponseRepository,
-    ConversationItemStorage, ConversationMemoryWriter, ConversationStorage, ResponseStorage,
-    StorageFactoryConfig,
+    create_storage, BackgroundResponseRepository, ConversationItemStorage, ConversationStorage,
+    ResponseStorage, StorageFactoryConfig,
 };
 use smg_mcp::McpOrchestrator;
-use smg_skills::{SkillService, SkillUploadLimits};
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::debug;
 
@@ -64,8 +61,6 @@ pub struct AppContext {
     pub response_storage: Arc<dyn ResponseStorage>,
     pub conversation_storage: Arc<dyn ConversationStorage>,
     pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
-    /// Writer used for long-term-memory persistence (NoOp when backend does not support writes).
-    pub conversation_memory_writer: Arc<dyn ConversationMemoryWriter>,
     pub background_repository: Option<Arc<dyn BackgroundResponseRepository>>,
     pub worker_monitor: Option<Arc<WorkerMonitor>>,
     pub configured_reasoning_parser: Option<String>,
@@ -74,7 +69,6 @@ pub struct AppContext {
     pub workflow_engines: Arc<OnceLock<WorkflowEngines>>,
     pub mcp_orchestrator: Arc<OnceLock<Arc<McpOrchestrator>>>,
     pub mcp_format_registry: FormatRegistry,
-    pub skill_service: Option<Arc<SkillService>>,
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
@@ -107,14 +101,12 @@ pub struct AppContextBuilder {
     response_storage: Option<Arc<dyn ResponseStorage>>,
     conversation_storage: Option<Arc<dyn ConversationStorage>>,
     conversation_item_storage: Option<Arc<dyn ConversationItemStorage>>,
-    conversation_memory_writer: Option<Arc<dyn ConversationMemoryWriter>>,
     background_repository: Option<Arc<dyn BackgroundResponseRepository>>,
     worker_monitor: Option<Arc<WorkerMonitor>>,
     worker_job_queue: Option<Arc<OnceLock<Arc<JobQueue>>>>,
     workflow_engines: Option<Arc<OnceLock<WorkflowEngines>>>,
     mcp_orchestrator: Option<Arc<OnceLock<Arc<McpOrchestrator>>>>,
     mcp_format_registry: Option<FormatRegistry>,
-    skill_service: Option<Arc<SkillService>>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -163,14 +155,12 @@ impl AppContextBuilder {
             response_storage: None,
             conversation_storage: None,
             conversation_item_storage: None,
-            conversation_memory_writer: None,
             background_repository: None,
             worker_monitor: None,
             worker_job_queue: None,
             workflow_engines: None,
             mcp_orchestrator: None,
             mcp_format_registry: None,
-            skill_service: None,
             wasm_manager: None,
             kv_event_monitor: None,
             webrtc_bind_addr: None,
@@ -244,15 +234,6 @@ impl AppContextBuilder {
         conversation_item_storage: Arc<dyn ConversationItemStorage>,
     ) -> Self {
         self.conversation_item_storage = Some(conversation_item_storage);
-        self
-    }
-
-    /// Inject conversation memory writer for long-term-memory store operations.
-    pub fn conversation_memory_writer(
-        mut self,
-        conversation_memory_writer: Arc<dyn ConversationMemoryWriter>,
-    ) -> Self {
-        self.conversation_memory_writer = Some(conversation_memory_writer);
         self
     }
 
@@ -347,9 +328,6 @@ impl AppContextBuilder {
             }
         }
 
-        validate_memory_writer_configuration(&router_config)
-            .map_err(AppContextBuildError::InvalidConfig)?;
-
         let worker_registry = self
             .worker_registry
             .ok_or(AppContextBuildError::MissingField("worker_registry"))?;
@@ -390,9 +368,6 @@ impl AppContextBuilder {
             conversation_item_storage: self.conversation_item_storage.ok_or(
                 AppContextBuildError::MissingField("conversation_item_storage"),
             )?,
-            conversation_memory_writer: self.conversation_memory_writer.ok_or(
-                AppContextBuildError::MissingField("conversation_memory_writer"),
-            )?,
             background_repository: self.background_repository,
             worker_monitor: self.worker_monitor,
             configured_reasoning_parser,
@@ -405,7 +380,6 @@ impl AppContextBuilder {
                 .mcp_orchestrator
                 .ok_or(AppContextBuildError::MissingField("mcp_orchestrator"))?,
             mcp_format_registry: self.mcp_format_registry.unwrap_or_default(),
-            skill_service: self.skill_service,
             wasm_manager: self.wasm_manager,
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
@@ -424,10 +398,6 @@ impl AppContextBuilder {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> Result<Self, String> {
-        // Fail fast before storage initialization to avoid side effects
-        // (e.g., migrations) for invalid memory_runtime/backend combinations.
-        validate_memory_writer_configuration(&router_config)?;
-
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
@@ -443,7 +413,6 @@ impl AppContextBuilder {
             .with_workflow_engines()
             .with_mcp_orchestrator(&router_config)
             .await?
-            .with_skill_service(&router_config)?
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor(&router_config)
             .webrtc_bind_addr(webrtc_bind_addr)
@@ -606,7 +575,6 @@ impl AppContextBuilder {
         self.response_storage = Some(bundle.response_storage);
         self.conversation_storage = Some(bundle.conversation_storage);
         self.conversation_item_storage = Some(bundle.conversation_item_storage);
-        self.conversation_memory_writer = Some(bundle.conversation_memory_writer);
         self.background_repository = bundle.background_repository;
 
         Ok(self)
@@ -682,31 +650,6 @@ impl AppContextBuilder {
         Ok(self)
     }
 
-    fn with_skill_service(mut self, config: &RouterConfig) -> Result<Self, String> {
-        if !config.skills_enabled {
-            self.skill_service = None;
-            return Ok(self);
-        }
-
-        let Some(skills_config) = config.skills.as_ref() else {
-            return Err(
-                "Skills are enabled but no validated skills config was loaded at startup"
-                    .to_string(),
-            );
-        };
-
-        let blob_store =
-            create_blob_store(&skills_config.blob_store, Some(&skills_config.cache))
-                .map_err(|error| format!("Failed to initialize skills blob store: {error}"))?;
-        let upload_limits = SkillUploadLimits::from_config(skills_config)
-            .map_err(|error| format!("Invalid skills upload limits: {error}"))?;
-        self.skill_service = Some(Arc::new(SkillService::in_memory_with_limits(
-            blob_store,
-            upload_limits,
-        )));
-        Ok(self)
-    }
-
     /// Create KV event monitor for event-driven cache-aware routing.
     ///
     /// The monitor is created when the default policy is cache_aware, regardless
@@ -750,58 +693,5 @@ impl AppContextBuilder {
 impl Default for AppContextBuilder {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Enforce runtime-aware constraints for conversation memory writer availability.
-fn validate_memory_writer_configuration(config: &RouterConfig) -> Result<(), String> {
-    let backend_supports_memory_writer = backend_supports_memory_writer(&config.history_backend);
-
-    if config.memory_runtime.enabled && !backend_supports_memory_writer {
-        return Err(
-            "memory_runtime.enabled is true but selected storage backend does not support conversation memory writer".to_string(),
-        );
-    }
-
-    if config.memory_runtime.enabled && config.storage_hook_wasm_path.is_some() {
-        return Err(
-            "memory_runtime.enabled cannot be used with storage_hook_wasm_path until conversation memory writer hooks are implemented".to_string(),
-        );
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use anyhow::{anyhow, Result};
-    use smg_skills::{SkillServiceMode, SkillsConfig};
-    use tempfile::TempDir;
-
-    use super::AppContextBuilder;
-    use crate::config::RouterConfig;
-
-    #[test]
-    fn with_skill_service_builds_single_process_service_when_enabled() -> Result<()> {
-        let blob_root = TempDir::new()?;
-        let cache_root = TempDir::new()?;
-        let mut config = RouterConfig {
-            skills_enabled: true,
-            ..RouterConfig::default()
-        };
-        let mut skills = SkillsConfig::default();
-        skills.blob_store.path = blob_root.path().display().to_string();
-        skills.cache.path = cache_root.path().display().to_string();
-        config.skills = Some(skills);
-
-        let builder = AppContextBuilder::new()
-            .with_skill_service(&config)
-            .map_err(anyhow::Error::msg)?;
-        let service = builder
-            .skill_service
-            .ok_or_else(|| anyhow!("skill service should be built"))?;
-
-        assert_eq!(service.mode(), SkillServiceMode::SingleProcess);
-        Ok(())
     }
 }

@@ -7,16 +7,8 @@ pub use smg_data_connector::{
     HistoryBackend, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
 
-use super::{validation::ConfigValidator, ConfigResult, SkillsConfig};
+use super::{validation::ConfigValidator, ConfigResult};
 use crate::{tenant::DEFAULT_TENANT_HEADER_NAME, worker::ConnectionMode};
-
-/// Runtime feature flags for memory behavior.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MemoryRuntimeConfig {
-    /// Master switch for memory features.
-    pub enabled: bool,
-}
 
 /// Background-mode tuning knobs. Availability is gated by backend capability
 /// (whether the active `history_backend` provides a
@@ -105,8 +97,6 @@ pub struct RouterConfig {
     #[serde(default)]
     pub storage_context_headers: HashMap<String, String>,
     #[serde(default)]
-    pub memory_runtime: MemoryRuntimeConfig,
-    #[serde(default)]
     pub background: BackgroundConfig,
     #[serde(default)]
     pub tenant_resolution: TenantResolutionConfig,
@@ -185,13 +175,6 @@ pub struct RouterConfig {
     /// Loaded from mcp_config_path during config creation
     #[serde(skip)]
     pub mcp_config: Option<smg_mcp::McpConfig>,
-    /// Enables the skills subsystem without forcing the nested skills
-    /// configuration tree into CLI flags.
-    #[serde(default)]
-    pub skills_enabled: bool,
-    /// Loaded from skills_config_path during config creation.
-    #[serde(skip)]
-    pub skills: Option<SkillsConfig>,
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
@@ -680,7 +663,6 @@ impl Default for RouterConfig {
             log_level: None,
             request_id_headers: None,
             storage_context_headers: HashMap::new(),
-            memory_runtime: MemoryRuntimeConfig::default(),
             background: BackgroundConfig::default(),
             tenant_resolution: TenantResolutionConfig::default(),
             max_concurrent_requests: -1,
@@ -714,8 +696,6 @@ impl Default for RouterConfig {
             client_identity: None,
             ca_certificates: vec![],
             mcp_config: None,
-            skills_enabled: false,
-            skills: None,
             enable_wasm: false,
             storage_hook_wasm_path: None,
             server_cert: None,
@@ -821,8 +801,6 @@ mod tests {
             config.tenant_resolution.tenant_header_name,
             DEFAULT_TENANT_HEADER_NAME
         );
-        assert!(!config.skills_enabled);
-        assert!(config.skills.is_none());
     }
 
     #[test]
@@ -946,62 +924,6 @@ stream_retention_secs: 3600
         assert!(deserialized.discovery.is_none());
         assert!(deserialized.metrics.is_none());
         assert!(deserialized.trace_config.is_none());
-        assert!(!deserialized.skills_enabled);
-        assert!(deserialized.skills.is_none());
-    }
-
-    #[test]
-    fn test_router_config_deserializes_skills_enabled_flag() {
-        let deserialized: RouterConfig = serde_json::from_str(
-            r#"{
-                "mode": { "type": "regular", "worker_urls": [] },
-                "policy": { "type": "random" },
-                "host": "0.0.0.0",
-                "port": 3001,
-                "max_payload_size": 1024,
-                "request_timeout_secs": 30,
-                "worker_startup_timeout_secs": 30,
-                "worker_startup_check_interval_secs": 5,
-                "dp_aware": false,
-                "api_key": null,
-                "max_concurrent_requests": -1,
-                "queue_size": 10,
-                "queue_timeout_secs": 5,
-                "cors_allowed_origins": [],
-                "retry": {
-                    "max_retries": 3,
-                    "initial_backoff_ms": 100,
-                    "max_backoff_ms": 1000,
-                    "backoff_multiplier": 2.0,
-                    "jitter_factor": 0.1
-                },
-                "circuit_breaker": {
-                    "failure_threshold": 5,
-                    "success_threshold": 2,
-                    "timeout_duration_secs": 30,
-                    "window_duration_secs": 60
-                },
-                "health_check": {
-                    "failure_threshold": 3,
-                    "success_threshold": 2,
-                    "timeout_secs": 10,
-                    "check_interval_secs": 30,
-                    "endpoint": "/health",
-                    "disable_health_check": false,
-                    "remove_unhealthy_workers": false
-                },
-                "skills_enabled": true
-            }"#,
-        )
-        .unwrap();
-
-        assert!(deserialized.skills_enabled);
-        assert!(deserialized.skills.is_none());
-        assert!(!deserialized.tenant_resolution.trust_tenant_header);
-        assert_eq!(
-            deserialized.tenant_resolution.tenant_header_name,
-            DEFAULT_TENANT_HEADER_NAME
-        );
     }
 
     #[test]

@@ -1297,9 +1297,6 @@ mod tests {
             conversation_item_storage: Arc::new(
                 smg_data_connector::MemoryConversationItemStorage::new(),
             ),
-            conversation_memory_writer: Arc::new(
-                smg_data_connector::NoOpConversationMemoryWriter::new(),
-            ),
             background_repository: None,
             worker_monitor: None,
             configured_reasoning_parser: None,
@@ -1310,7 +1307,6 @@ mod tests {
             mcp_format_registry: openai_bridge::FormatRegistry::new(),
             tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
-            skill_service: None,
             wasm_manager: None,
             worker_service: Arc::new(WorkerService::new(
                 worker_registry,
