@@ -1,4 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -13,6 +16,7 @@ use tracing::{debug, info, warn};
 use super::{BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, PolicyFactory};
 use crate::{
     config::types::PolicyConfig,
+    policies::cache_aware::LoadReceiver,
     worker::{KvEventMonitor, Worker},
 };
 
@@ -38,6 +42,11 @@ pub struct PolicyRegistry {
     /// When set, new CacheAwarePolicy instances are injected with this monitor.
     kv_event_monitor: Arc<RwLock<Option<Arc<KvEventMonitor>>>>,
 
+    /// Optional backend load-snapshot receiver from the `WorkerMonitor`. When
+    /// set, new CacheAwarePolicy instances are injected with it for the KV-usage
+    /// imbalance trigger.
+    load_rx: Arc<RwLock<Option<LoadReceiver>>>,
+
     // DP-rank policy: Supports the selection of dp-rank outside the engine.
     dp_rank_policy: Arc<OnceLock<Arc<dyn DPRankLoadPolicy>>>,
 }
@@ -54,6 +63,7 @@ impl PolicyRegistry {
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
             kv_event_monitor: Arc::new(RwLock::new(None)),
+            load_rx: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
         }
     }
@@ -88,6 +98,32 @@ impl PolicyRegistry {
     ) {
         if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
             cache_aware.set_kv_event_monitor(monitor.cloned());
+        }
+    }
+
+    /// Set the backend load-snapshot receiver (thread-safe, can be called after
+    /// initialization). Propagates to all existing cache-aware policies.
+    pub fn set_load_receiver(&self, rx: Option<LoadReceiver>) {
+        {
+            let mut guard = self.load_rx.write();
+            guard.clone_from(&rx);
+        }
+        Self::maybe_inject_load_rx(&self.default_policy, rx.as_ref());
+        if let Some(p) = self.prefill_policy.get() {
+            Self::maybe_inject_load_rx(p, rx.as_ref());
+        }
+        if let Some(p) = self.decode_policy.get() {
+            Self::maybe_inject_load_rx(p, rx.as_ref());
+        }
+        for entry in self.model_policies.iter() {
+            Self::maybe_inject_load_rx(entry.value(), rx.as_ref());
+        }
+    }
+
+    /// Inject the load receiver into a policy if it's cache-aware.
+    fn maybe_inject_load_rx(policy: &Arc<dyn LoadBalancingPolicy>, rx: Option<&LoadReceiver>) {
+        if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+            cache_aware.set_load_receiver(rx.cloned());
         }
     }
 
@@ -213,6 +249,12 @@ impl PolicyRegistry {
                     cache_aware.set_kv_event_monitor(Some(Arc::clone(monitor)));
                 }
             }
+            {
+                let guard = self.load_rx.read();
+                if let Some(ref rx) = *guard {
+                    cache_aware.set_load_receiver(Some(rx.clone()));
+                }
+            }
             Arc::new(cache_aware)
         } else {
             PolicyFactory::create_by_name(policy_type).unwrap_or_else(|| {
@@ -228,7 +270,7 @@ impl PolicyRegistry {
     }
 
     /// Get current model->policy mappings (for debugging/monitoring)
-    pub fn get_all_mappings(&self) -> std::collections::HashMap<String, String> {
+    pub fn get_all_mappings(&self) -> HashMap<String, String> {
         self.model_policies
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().name().to_string()))
@@ -236,7 +278,7 @@ impl PolicyRegistry {
     }
 
     /// Get worker counts per model
-    pub fn get_worker_counts(&self) -> std::collections::HashMap<String, usize> {
+    pub fn get_worker_counts(&self) -> HashMap<String, usize> {
         self.model_worker_counts
             .iter()
             .map(|entry| (entry.key().clone(), *entry.value()))
@@ -290,12 +332,19 @@ impl PolicyRegistry {
             .unwrap_or_else(|| self.get_default_policy())
     }
 
-    /// Get all PowerOfTwo policies that need load updates (lock-free)
-    pub fn get_all_power_of_two_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
-        let mut power_of_two_policies = Vec::new();
+    /// Get all load-aware policies that need periodic load updates (lock-free).
+    ///
+    /// These are policies whose routing depends on the worker load monitor:
+    /// `power_of_two` and `least_load`.
+    pub fn get_all_load_aware_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
+        fn is_load_aware(name: &str) -> bool {
+            name == "power_of_two" || name == "least_load"
+        }
 
-        if self.default_policy.name() == "power_of_two" {
-            power_of_two_policies.push(Arc::clone(&self.default_policy));
+        let mut policies = Vec::new();
+
+        if is_load_aware(self.default_policy.name()) {
+            policies.push(Arc::clone(&self.default_policy));
         }
 
         // Get prefill and decode policies (lock-free via OnceLock::get)
@@ -303,31 +352,31 @@ impl PolicyRegistry {
         let decode_policy_opt = self.decode_policy.get();
 
         if let Some(policy) = prefill_policy_opt {
-            if policy.name() == "power_of_two" && !Arc::ptr_eq(policy, &self.default_policy) {
-                power_of_two_policies.push(Arc::clone(policy));
+            if is_load_aware(policy.name()) && !Arc::ptr_eq(policy, &self.default_policy) {
+                policies.push(Arc::clone(policy));
             }
         }
 
         if let Some(policy) = decode_policy_opt {
-            if policy.name() == "power_of_two"
+            if is_load_aware(policy.name())
                 && !Arc::ptr_eq(policy, &self.default_policy)
                 && !prefill_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
             {
-                power_of_two_policies.push(Arc::clone(policy));
+                policies.push(Arc::clone(policy));
             }
         }
 
         for entry in self.model_policies.iter() {
             let policy = entry.value();
-            if policy.name() == "power_of_two" {
-                let already_added = power_of_two_policies.iter().any(|p| Arc::ptr_eq(p, policy));
+            if is_load_aware(policy.name()) {
+                let already_added = policies.iter().any(|p| Arc::ptr_eq(p, policy));
                 if !already_added {
-                    power_of_two_policies.push(Arc::clone(policy));
+                    policies.push(Arc::clone(policy));
                 }
             }
         }
 
-        power_of_two_policies
+        policies
     }
 
     /// Initialize cache-aware policy with workers if applicable
@@ -383,6 +432,18 @@ impl PolicyRegistry {
                     }
                 }
             }
+        }
+    }
+
+    /// Drop a removed worker's cached load report from all load-aware policies
+    /// (`power_of_two`, `least_load`).
+    ///
+    /// These policies cache per-worker load reports keyed by URL; without this
+    /// their caches would grow unbounded under worker churn. Called on worker
+    /// removal alongside the cache-aware cleanup above.
+    pub fn remove_worker_from_load_aware(&self, worker_url: &str) {
+        for policy in self.get_all_load_aware_policies() {
+            policy.remove_worker(worker_url);
         }
     }
 

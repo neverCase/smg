@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
-    LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
-    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    LeastLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy,
+    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -19,6 +19,16 @@ impl PolicyFactory {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
+            PolicyConfig::LeastLoad {
+                kv_pressure_weight,
+                mean_prefill_tokens,
+                default_throughput,
+                ..
+            } => Arc::new(LeastLoadPolicy::with_params(
+                *kv_pressure_weight,
+                *mean_prefill_tokens,
+                *default_throughput,
+            )),
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold,
@@ -26,6 +36,8 @@ impl PolicyFactory {
                 eviction_interval_secs,
                 max_tree_size,
                 block_size,
+                balance_token_usage_threshold,
+                overload_token_usage_threshold,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -34,6 +46,8 @@ impl PolicyFactory {
                     eviction_interval_secs: *eviction_interval_secs,
                     max_tree_size: *max_tree_size,
                     block_size: *block_size,
+                    balance_token_usage_threshold: *balance_token_usage_threshold,
+                    overload_token_usage_threshold: *overload_token_usage_threshold,
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
@@ -81,6 +95,7 @@ impl PolicyFactory {
             "random" => Some(Arc::new(RandomPolicy::new())),
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
+            "least_load" | "leastload" => Some(Arc::new(LeastLoadPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "bucket" => Some(Arc::new(BucketPolicy::new())),
             "manual" => Some(Arc::new(ManualPolicy::new())),
@@ -117,6 +132,8 @@ mod tests {
             eviction_interval_secs: 30,
             max_tree_size: 1000,
             block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         });
         assert_eq!(policy.name(), "cache_aware");
 

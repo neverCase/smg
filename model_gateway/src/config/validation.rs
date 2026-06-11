@@ -2,6 +2,21 @@ use axum::http::HeaderName;
 
 use super::*;
 
+/// Validate a user-supplied mesh server name. The name keys rate-limit
+/// shards as `rl:{counter}:{name}`, so an empty name or one containing the
+/// separator would corrupt shard keys; rejecting at config time avoids a
+/// panic at mesh adapter construction during startup.
+pub fn validate_mesh_server_name(name: &str) -> ConfigResult<()> {
+    if name.is_empty() || name.contains(':') {
+        return Err(ConfigError::InvalidValue {
+            field: "mesh_server_name".to_string(),
+            value: name.to_string(),
+            reason: "must be non-empty and must not contain ':'".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 
@@ -43,45 +58,7 @@ impl ConfigValidator {
         }
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
-        Self::validate_background(&config.background)?;
 
-        Ok(())
-    }
-
-    fn validate_background(bg: &BackgroundConfig) -> ConfigResult<()> {
-        let zero_checks = [
-            (
-                "background.worker_concurrency",
-                u64::from(bg.worker_concurrency),
-            ),
-            ("background.max_queue_depth", u64::from(bg.max_queue_depth)),
-            ("background.lease_duration_secs", bg.lease_duration_secs),
-            ("background.max_retries", u64::from(bg.max_retries)),
-            ("background.retry_base_delay_secs", bg.retry_base_delay_secs),
-            ("background.retry_max_delay_secs", bg.retry_max_delay_secs),
-            ("background.sweep_interval_secs", bg.sweep_interval_secs),
-            ("background.poll_interval_ms", bg.poll_interval_ms),
-            ("background.stream_retention_secs", bg.stream_retention_secs),
-        ];
-        for (field, value) in zero_checks {
-            if value == 0 {
-                return Err(ConfigError::InvalidValue {
-                    field: field.to_string(),
-                    value: value.to_string(),
-                    reason: "Must be > 0".to_string(),
-                });
-            }
-        }
-        if bg.retry_base_delay_secs > bg.retry_max_delay_secs {
-            return Err(ConfigError::InvalidValue {
-                field: "background.retry_base_delay_secs".to_string(),
-                value: bg.retry_base_delay_secs.to_string(),
-                reason: format!(
-                    "Must be <= retry_max_delay_secs ({})",
-                    bg.retry_max_delay_secs
-                ),
-            });
-        }
         Ok(())
     }
 
@@ -271,12 +248,30 @@ impl ConfigValidator {
                 eviction_interval_secs,
                 max_tree_size,
                 block_size,
+                balance_token_usage_threshold,
+                overload_token_usage_threshold,
             } => {
                 if *block_size == 0 {
                     return Err(ConfigError::InvalidValue {
                         field: "block_size".to_string(),
                         value: block_size.to_string(),
                         reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *balance_token_usage_threshold <= 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "balance_token_usage_threshold".to_string(),
+                        value: balance_token_usage_threshold.to_string(),
+                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
+                    });
+                }
+
+                if *overload_token_usage_threshold <= 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "overload_token_usage_threshold".to_string(),
+                        value: overload_token_usage_threshold.to_string(),
+                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
                     });
                 }
 
@@ -320,6 +315,44 @@ impl ConfigValidator {
                         field: "load_check_interval_secs".to_string(),
                         value: load_check_interval_secs.to_string(),
                         reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
+            PolicyConfig::LeastLoad {
+                load_check_interval_secs,
+                kv_pressure_weight,
+                mean_prefill_tokens,
+                default_throughput,
+            } => {
+                if *load_check_interval_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "load_check_interval_secs".to_string(),
+                        value: load_check_interval_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if !kv_pressure_weight.is_finite() || *kv_pressure_weight < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "kv_pressure_weight".to_string(),
+                        value: kv_pressure_weight.to_string(),
+                        reason: "Must be finite and >= 0.0".to_string(),
+                    });
+                }
+
+                if *mean_prefill_tokens == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "mean_prefill_tokens".to_string(),
+                        value: mean_prefill_tokens.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if !default_throughput.is_finite() || *default_throughput <= 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "default_throughput".to_string(),
+                        value: default_throughput.to_string(),
+                        reason: "Must be finite and > 0.0".to_string(),
                     });
                 }
             }
@@ -785,6 +818,27 @@ mod tests {
     use crate::worker::ConnectionMode;
 
     #[test]
+    fn mesh_server_name_with_colon_is_rejected() {
+        assert!(matches!(
+            validate_mesh_server_name("node:a"),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "mesh_server_name"
+        ));
+    }
+
+    #[test]
+    fn empty_mesh_server_name_is_rejected() {
+        assert!(matches!(
+            validate_mesh_server_name(""),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "mesh_server_name"
+        ));
+    }
+
+    #[test]
+    fn valid_mesh_server_name_is_accepted() {
+        assert!(validate_mesh_server_name("node-a").is_ok());
+    }
+
+    #[test]
     fn test_validate_regular_mode() {
         let config = RouterConfig::new(
             RoutingMode::Regular {
@@ -859,6 +913,8 @@ mod tests {
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
                 block_size: 16,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
             },
         );
 
@@ -879,6 +935,8 @@ mod tests {
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
                 block_size: 16,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
             },
         );
 
@@ -934,6 +992,8 @@ mod tests {
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
                 block_size: 16,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
             },
         );
 
@@ -979,6 +1039,8 @@ mod tests {
                     eviction_interval_secs: 60,
                     max_tree_size: 1000,
                     block_size: 16,
+                    balance_token_usage_threshold: 1.0,
+                    overload_token_usage_threshold: 1.0,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,

@@ -4,10 +4,10 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use rand::{distr::Alphanumeric, Rng};
 use smg::{
     config::{
-        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, SchemaConfig,
-        TokenizerCacheConfig, TraceConfig,
+        validate_mesh_server_name, CircuitBreakerConfig, ConfigError, ConfigResult,
+        DiscoveryConfig, HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig,
+        OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
+        RoutingMode, SchemaConfig, TokenizerCacheConfig, TraceConfig,
     },
     observability::{
         metrics::PrometheusConfig,
@@ -149,7 +149,7 @@ struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
@@ -163,6 +163,20 @@ struct CliArgs {
     /// Relative threshold for load balancing trigger
     #[arg(long, default_value_t = 1.5, help_heading = "Routing Policy")]
     balance_rel_threshold: f32,
+
+    /// Cache-aware KV-usage spread (hottest minus coldest backend, 0.0-1.0)
+    /// above which cache affinity is abandoned for shortest-queue, even if
+    /// request counts look balanced (catches long-context KV imbalance). Backend
+    /// must report token_usage. >= 1.0 disables it.
+    #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
+    balance_token_usage_threshold: f32,
+
+    /// Cache-aware KV-utilization ceiling (0.0-1.0): when the hottest backend
+    /// exceeds it, shed load off that engine regardless of spread. A safety
+    /// valve for critically-saturated engines, best set high (e.g. 0.9).
+    /// >= 1.0 disables it.
+    #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
+    overload_token_usage_threshold: f32,
 
     /// Interval in seconds between cache eviction operations
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
@@ -192,6 +206,20 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     prefix_hash_load_factor: f64,
 
+    /// KV-pressure weight (seconds) for the least_load policy
+    #[arg(long, default_value_t = 0.15, help_heading = "Routing Policy")]
+    least_load_kv_pressure_weight: f64,
+
+    /// Fallback generation throughput (tokens/s) for least_load when a backend
+    /// reports no live throughput
+    #[arg(long, default_value_t = 2000.0, help_heading = "Routing Policy")]
+    least_load_default_throughput: f64,
+
+    /// Mean prefill tokens for least_load's in-flight estimate when a request's
+    /// token count is unknown at routing
+    #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
+    least_load_mean_prefill_tokens: u32,
+
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
@@ -214,11 +242,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup and registration
@@ -861,6 +889,7 @@ impl CliArgs {
         }
 
         let self_name = if let Some(name) = &self.mesh_server_name {
+            validate_mesh_server_name(name)?;
             name.to_string()
         } else {
             let mut rng = rand::rng();
@@ -924,9 +953,17 @@ impl CliArgs {
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
                 block_size: self.block_size,
+                balance_token_usage_threshold: self.balance_token_usage_threshold,
+                overload_token_usage_threshold: self.overload_token_usage_threshold,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
+            },
+            "least_load" => PolicyConfig::LeastLoad {
+                load_check_interval_secs: 5,
+                kv_pressure_weight: self.least_load_kv_pressure_weight,
+                mean_prefill_tokens: self.least_load_mean_prefill_tokens,
+                default_throughput: self.least_load_default_throughput,
             },
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.prefix_token_count,

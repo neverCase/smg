@@ -995,7 +995,62 @@ pub struct FlushCacheResult {
     pub failed: Vec<(String, String)>,
     pub total_workers: usize,
     pub http_workers: usize,
+    #[serde(default)]
+    pub grpc_workers: usize,
     pub message: String,
+}
+
+/// Options for starting a profiling run on workers.
+///
+/// Mirrors the engines' native profile parameters: serialized verbatim as
+/// the JSON body for HTTP workers and mapped to the `StartProfile` RPC for
+/// gRPC workers. Unset fields fall back to backend defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfileOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_step: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_steps: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activities: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub with_stack: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_shapes: Option<bool>,
+    pub profile_by_stage: bool,
+}
+
+/// Result from profile start/stop operations across workers
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProfileResult {
+    pub successful: Vec<String>,
+    pub failed: Vec<(String, String)>,
+    pub total_workers: usize,
+    pub message: String,
+}
+
+/// Request body for the gateway `/start_profile` route: profile options
+/// plus an optional worker URL to target a single worker (e.g. one
+/// PD-disaggregation role). All workers are profiled when `url` is unset.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StartProfileRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(flatten)]
+    pub options: ProfileOptions,
+}
+
+/// Request body for the gateway `/stop_profile` route: optional worker URL
+/// to target a single worker.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StopProfileRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// Result from getting worker loads
@@ -1017,6 +1072,9 @@ pub struct SchedulerLoadSnapshot {
     pub dp_rank: i32,
     pub num_running_reqs: i32,
     pub num_waiting_reqs: i32,
+    /// Queued token-work: waiting-queue tokens not yet served from cache. 0 when
+    /// the backend does not report it — callers degrade gracefully.
+    pub num_waiting_uncached_tokens: i32,
     pub num_total_reqs: i32,
     pub num_used_tokens: i32,
     pub max_total_num_tokens: i32,
@@ -1049,6 +1107,19 @@ impl WorkerLoadResponse {
     /// Total used tokens summed across all DP ranks.
     pub fn total_used_tokens(&self) -> i64 {
         self.loads.iter().map(|l| l.num_used_tokens as i64).sum()
+    }
+
+    /// Total queued (waiting, uncached) tokens summed across all DP ranks.
+    pub fn total_waiting_uncached_tokens(&self) -> i64 {
+        self.loads
+            .iter()
+            .map(|l| l.num_waiting_uncached_tokens as i64)
+            .sum()
+    }
+
+    /// Total generation throughput (tokens/s) summed across all DP ranks.
+    pub fn total_gen_throughput(&self) -> f64 {
+        self.loads.iter().map(|l| l.gen_throughput).sum()
     }
 
     pub fn dp_rank_loads(&self) -> HashMap<isize, isize> {
@@ -1085,6 +1156,43 @@ impl IntoResponse for FlushCacheResult {
             "message": self.message,
             "workers_flushed": self.successful.len(),
             "total_http_workers": self.http_workers,
+            "total_grpc_workers": self.grpc_workers,
+            "total_workers": self.total_workers
+        });
+
+        if !self.failed.is_empty() {
+            body["successful"] = json!(self.successful);
+            body["failed"] = json!(self
+                .failed
+                .into_iter()
+                .map(|(url, err)| json!({"worker": url, "error": err}))
+                .collect::<Vec<_>>());
+        }
+
+        (status, Json(body)).into_response()
+    }
+}
+
+#[cfg(feature = "axum")]
+impl IntoResponse for ProfileResult {
+    fn into_response(self) -> Response {
+        let status = if self.total_workers == 0 {
+            StatusCode::NOT_FOUND
+        } else if self.failed.is_empty() {
+            StatusCode::OK
+        } else {
+            StatusCode::PARTIAL_CONTENT
+        };
+
+        let status_str = match status {
+            StatusCode::OK => "success",
+            StatusCode::PARTIAL_CONTENT => "partial_success",
+            _ => "error",
+        };
+        let mut body = json!({
+            "status": status_str,
+            "message": self.message,
+            "workers_profiled": self.successful.len(),
             "total_workers": self.total_workers
         });
 

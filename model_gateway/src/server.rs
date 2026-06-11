@@ -32,7 +32,7 @@ use openai_protocol::{
     responses::ResponsesRequest,
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
     validated::ValidatedJson,
-    worker::{WorkerSpec, WorkerUpdateRequest},
+    worker::{StartProfileRequest, StopProfileRequest, WorkerSpec, WorkerUpdateRequest},
 };
 use rustls::crypto::ring;
 use serde::Deserialize;
@@ -45,6 +45,7 @@ use wfaas::LoggingSubscriber;
 use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
+    mesh::MeshAdapters,
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
         logging::{self, LoggingConfig},
@@ -54,12 +55,8 @@ use crate::{
         otel_trace,
     },
     routers::{
-        common::background::create::{handle_background_create, BackgroundCreateDeps},
-        conversations,
-        openai::realtime::ws::RealtimeQueryParams,
-        parse, responses as response_handlers,
-        router_manager::RouterManager,
-        tokenize, RouterTrait,
+        conversations, openai::realtime::ws::RealtimeQueryParams, parse,
+        responses as response_handlers, router_manager::RouterManager, tokenize, RouterTrait,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
@@ -80,6 +77,7 @@ pub struct AppState {
     pub concurrency_queue_tx: Option<mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
+    pub mesh_adapters: Option<Arc<MeshAdapters>>,
 }
 
 async fn parse_function_call(
@@ -284,18 +282,6 @@ async fn v1_responses(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
-    if body.background.unwrap_or(false) {
-        let request_context = smg_data_connector::current_request_context();
-        let deps = BackgroundCreateDeps {
-            repository: state.context.background_repository.as_ref(),
-            response_storage: state.context.response_storage.as_ref(),
-            conversation_storage: state.context.conversation_storage.as_ref(),
-            conversation_item_storage: state.context.conversation_item_storage.as_ref(),
-            background_config: &state.context.router_config.background,
-            request_context: request_context.as_ref(),
-        };
-        return handle_background_create(deps, &body, &body.model).await;
-    }
     cancel
         .guard(
             state
@@ -589,7 +575,31 @@ async fn v1_realtime_transcription_session(
 }
 
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
+    WorkerManager::flush_cache_all(&state.context.worker_registry)
+        .await
+        .into_response()
+}
+
+async fn start_profile(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<StartProfileRequest>>,
+) -> Response {
+    let body = body.map_or_else(StartProfileRequest::default, |Json(body)| body);
+    WorkerManager::start_profile_all(
+        &state.context.worker_registry,
+        &body.options,
+        body.url.as_deref(),
+    )
+    .await
+    .into_response()
+}
+
+async fn stop_profile(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<StopProfileRequest>>,
+) -> Response {
+    let body = body.map_or_else(StopProfileRequest::default, |Json(body)| body);
+    WorkerManager::stop_profile_all(&state.context.worker_registry, body.url.as_deref())
         .await
         .into_response()
 }
@@ -921,6 +931,8 @@ pub fn build_app(
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
+        .route("/start_profile", post(start_profile))
+        .route("/stop_profile", post(stop_profile))
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
@@ -1051,24 +1063,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             (None, None)
         };
 
-    // Initialize mesh server if configured, it will return a handler for mesh management
-    let mesh_handler = if let Some(mesh_server_config) = &config.mesh_server_config {
-        // Create mesh server builder and build with stores
-        let (mesh_server, handler) = MeshServerBuilder::from(mesh_server_config).build();
-
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
-        )]
-        spawn(async move {
-            if let Err(e) = mesh_server.start().await {
-                tracing::error!("Mesh server failed: {}", e);
-            }
-        });
-
-        Some(Arc::new(handler))
-    } else {
-        None
+    // Build the mesh server if configured. Starting gossip is deferred until
+    // MeshAdapters has registered the `worker:`/`rl:` CRDT namespaces below —
+    // a remote op arriving for an unregistered prefix would merge through the
+    // default last-writer-wins engine with the wrong semantics.
+    let (mesh_server, mesh_handler) = match &config.mesh_server_config {
+        Some(mesh_server_config) => {
+            let (server, handler) = MeshServerBuilder::from(mesh_server_config).build();
+            (Some(server), Some(Arc::new(handler)))
+        }
+        None => (None, None),
     };
 
     info!(
@@ -1089,6 +1093,27 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         )
         .await?,
     );
+
+    // Register the CRDT namespaces and start the inbound sync adapters, then
+    // start gossip. Order matters: see the note at the mesh build above.
+    let mesh_adapters = mesh_handler.as_ref().map(|handler| {
+        MeshAdapters::start(
+            handler.mesh_kv(),
+            handler.self_name.clone(),
+            app_context.worker_registry.clone(),
+        )
+    });
+    if let Some(mesh_server) = mesh_server {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
+        )]
+        spawn(async move {
+            if let Err(e) = mesh_server.start().await {
+                tracing::error!("Mesh server failed: {}", e);
+            }
+        });
+    }
 
     if config.prometheus_config.is_some() {
         app_context.inflight_tracker.start_sampler(20);
@@ -1288,12 +1313,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // v1 mesh sync (set_mesh_sync, WorkerStateSubscriber, TreeStateSubscriber)
-    // is removed in this PR. State sync across mesh peers is not wired in this
-    // branch — v2 adapters in `model_gateway/src/mesh/adapters/` are built and
-    // tested but not yet started from `server.rs`. That wiring lands in a
-    // follow-up PR.
-
     // Get mesh cluster state and port before moving mesh_handler into app_state
     let mesh_cluster_state = mesh_handler.as_ref().map(|h| h.state.clone());
     let mesh_port = config
@@ -1307,6 +1326,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         concurrency_queue_tx: limiter.queue_tx.clone(),
         router_manager: Some(router_manager),
         mesh_handler,
+        mesh_adapters,
     });
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {

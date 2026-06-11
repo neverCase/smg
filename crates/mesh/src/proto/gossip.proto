@@ -107,6 +107,7 @@ message CrdtBatch {
 message CrdtKeyVersion {
   string key = 1;
   uint64 version = 2; // highest Lamport timestamp the receiver holds for this key
+  string replica_id = 3; // ReplicaId UUID text; tie-breaks equal versions (matches LWW order)
 }
 
 // Acknowledgement for a received CrdtBatch: the receiver's current version for

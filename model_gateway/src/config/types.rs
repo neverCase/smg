@@ -10,65 +10,6 @@ pub use smg_data_connector::{
 use super::{validation::ConfigValidator, ConfigResult};
 use crate::{tenant::DEFAULT_TENANT_HEADER_NAME, worker::ConnectionMode};
 
-/// Background-mode tuning knobs. Availability is gated by backend capability
-/// (whether the active `history_backend` provides a
-/// `BackgroundResponseRepository`), not by a flag here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct BackgroundConfig {
-    pub worker_concurrency: u32,
-    pub max_queue_depth: u32,
-    pub lease_duration_secs: u64,
-    pub max_retries: u32,
-    pub retry_base_delay_secs: u64,
-    pub retry_max_delay_secs: u64,
-    pub sweep_interval_secs: u64,
-    pub poll_interval_ms: u64,
-    pub stream_retention_secs: u64,
-}
-
-impl Default for BackgroundConfig {
-    fn default() -> Self {
-        Self {
-            worker_concurrency: 16,
-            max_queue_depth: 10_000,
-            lease_duration_secs: 60,
-            max_retries: 3,
-            retry_base_delay_secs: 2,
-            retry_max_delay_secs: 60,
-            sweep_interval_secs: 30,
-            poll_interval_ms: 500,
-            stream_retention_secs: 15 * 60,
-        }
-    }
-}
-
-impl BackgroundConfig {
-    pub fn lease_duration(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.lease_duration_secs)
-    }
-
-    pub fn retry_base_delay(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.retry_base_delay_secs)
-    }
-
-    pub fn retry_max_delay(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.retry_max_delay_secs)
-    }
-
-    pub fn sweep_interval(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.sweep_interval_secs)
-    }
-
-    pub fn poll_interval(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.poll_interval_ms)
-    }
-
-    pub fn stream_retention(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.stream_retention_secs)
-    }
-}
-
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -96,8 +37,6 @@ pub struct RouterConfig {
     pub request_id_headers: Option<Vec<String>>,
     #[serde(default)]
     pub storage_context_headers: HashMap<String, String>,
-    #[serde(default)]
-    pub background: BackgroundConfig,
     #[serde(default)]
     pub tenant_resolution: TenantResolutionConfig,
     /// Set to -1 to disable rate limiting
@@ -368,10 +307,41 @@ pub enum PolicyConfig {
         max_tree_size: usize,
         #[serde(default = "default_block_size")]
         block_size: usize,
+        /// KV-usage spread (hottest minus coldest backend, 0.0–1.0) above which
+        /// cache affinity is abandoned for shortest-queue. `>= 1.0` disables.
+        #[serde(default = "default_balance_token_usage_threshold")]
+        balance_token_usage_threshold: f32,
+        /// Backend KV-utilization ceiling (0.0–1.0): a single engine above it
+        /// triggers shedding regardless of spread. `>= 1.0` disables (default).
+        #[serde(default = "default_balance_token_usage_threshold")]
+        overload_token_usage_threshold: f32,
     },
 
     #[serde(rename = "power_of_two")]
     PowerOfTwo { load_check_interval_secs: u64 },
+
+    /// Least-(token-)work policy: routes to the worker minimizing the expected
+    /// wait `(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`
+    /// — token-work drain time plus a convex KV-cache pressure barrier, computed
+    /// from the load monitor with in-flight correction. See `policies/least_load.rs`.
+    #[serde(rename = "least_load")]
+    LeastLoad {
+        #[serde(default = "default_least_load_interval")]
+        load_check_interval_secs: u64,
+        /// KV-pressure weight `λ_t` (seconds): the time-cost of KV contention,
+        /// commensurate with the expected-queue-wait term.
+        #[serde(default = "default_least_load_kv_pressure_weight")]
+        kv_pressure_weight: f64,
+        /// Mean prefill length (tokens) used to estimate in-flight token-work
+        /// when a request's token count is unknown at routing time.
+        #[serde(default = "default_least_load_mean_prefill")]
+        mean_prefill_tokens: u32,
+        /// Fallback generation throughput (tokens/s) for the expected-wait term
+        /// when a backend reports no live `gen_throughput`. Set to the fleet's
+        /// per-replica generation rate; co-tunes with `kv_pressure_weight`.
+        #[serde(default = "default_least_load_throughput")]
+        default_throughput: f64,
+    },
 
     #[serde(rename = "bucket")]
     Bucket {
@@ -429,6 +399,10 @@ fn default_block_size() -> usize {
     16
 }
 
+fn default_balance_token_usage_threshold() -> f32 {
+    1.0
+}
+
 fn default_prefix_token_count() -> usize {
     256
 }
@@ -445,6 +419,22 @@ fn default_manual_max_idle_secs() -> u64 {
     4 * 3600
 }
 
+fn default_least_load_interval() -> u64 {
+    10
+}
+
+fn default_least_load_kv_pressure_weight() -> f64 {
+    0.15
+}
+
+fn default_least_load_mean_prefill() -> u32 {
+    1024
+}
+
+fn default_least_load_throughput() -> f64 {
+    2000.0
+}
+
 impl PolicyConfig {
     pub fn name(&self) -> &'static str {
         match self {
@@ -452,6 +442,7 @@ impl PolicyConfig {
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
+            PolicyConfig::LeastLoad { .. } => "least_load",
             PolicyConfig::Bucket { .. } => "bucket",
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
@@ -663,7 +654,6 @@ impl Default for RouterConfig {
             log_level: None,
             request_id_headers: None,
             storage_context_headers: HashMap::new(),
-            background: BackgroundConfig::default(),
             tenant_resolution: TenantResolutionConfig::default(),
             max_concurrent_requests: -1,
             queue_size: 100,
@@ -804,82 +794,6 @@ mod tests {
     }
 
     #[test]
-    fn test_background_config_defaults_match_design() {
-        let bg = BackgroundConfig::default();
-        assert_eq!(bg.worker_concurrency, 16);
-        assert_eq!(bg.max_queue_depth, 10_000);
-        assert_eq!(bg.lease_duration_secs, 60);
-        assert_eq!(bg.max_retries, 3);
-        assert_eq!(bg.retry_base_delay_secs, 2);
-        assert_eq!(bg.retry_max_delay_secs, 60);
-        assert_eq!(bg.sweep_interval_secs, 30);
-        assert_eq!(bg.poll_interval_ms, 500);
-        assert_eq!(bg.stream_retention_secs, 15 * 60);
-    }
-
-    #[test]
-    fn test_background_config_accessors_convert_units() {
-        let bg = BackgroundConfig::default();
-        assert_eq!(bg.lease_duration(), std::time::Duration::from_secs(60));
-        assert_eq!(bg.poll_interval(), std::time::Duration::from_millis(500));
-        assert_eq!(bg.stream_retention(), std::time::Duration::from_secs(900));
-    }
-
-    #[test]
-    fn test_validate_rejects_zero_background_fields() {
-        type BgMutator = fn(&mut BackgroundConfig);
-        let cases: &[(&str, BgMutator)] = &[
-            ("worker_concurrency", |b| b.worker_concurrency = 0),
-            ("max_queue_depth", |b| b.max_queue_depth = 0),
-            ("lease_duration_secs", |b| b.lease_duration_secs = 0),
-            ("max_retries", |b| b.max_retries = 0),
-            ("retry_base_delay_secs", |b| b.retry_base_delay_secs = 0),
-            ("retry_max_delay_secs", |b| b.retry_max_delay_secs = 0),
-            ("sweep_interval_secs", |b| b.sweep_interval_secs = 0),
-            ("poll_interval_ms", |b| b.poll_interval_ms = 0),
-            ("stream_retention_secs", |b| b.stream_retention_secs = 0),
-        ];
-        for (field, mutate) in cases {
-            let mut cfg = RouterConfig::default();
-            mutate(&mut cfg.background);
-            let err = cfg.validate().expect_err(field);
-            assert!(
-                format!("{err:?}").contains(field),
-                "{field} validation must fail with field in error: {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_validate_rejects_retry_base_exceeding_max() {
-        let mut cfg = RouterConfig::default();
-        cfg.background.retry_base_delay_secs = 30;
-        cfg.background.retry_max_delay_secs = 10;
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn test_background_config_yaml_round_trip_with_custom_values() {
-        let yaml = r"
-worker_concurrency: 32
-max_queue_depth: 5000
-lease_duration_secs: 120
-max_retries: 5
-retry_base_delay_secs: 4
-retry_max_delay_secs: 300
-sweep_interval_secs: 10
-poll_interval_ms: 250
-stream_retention_secs: 3600
-";
-        let bg: BackgroundConfig = serde_yaml::from_str(yaml).expect("deserialize");
-        assert_eq!(bg.worker_concurrency, 32);
-        assert_eq!(bg.max_queue_depth, 5000);
-        assert_eq!(bg.lease_duration(), std::time::Duration::from_secs(120));
-        assert_eq!(bg.retry_max_delay(), std::time::Duration::from_secs(300));
-        assert_eq!(bg.poll_interval(), std::time::Duration::from_millis(250));
-    }
-
-    #[test]
     fn test_router_config_new() {
         let mode = RoutingMode::Regular {
             worker_urls: vec!["http://worker1".to_string(), "http://worker2".to_string()],
@@ -1007,6 +921,8 @@ stream_retention_secs: 3600
             eviction_interval_secs: 300,
             max_tree_size: 1000,
             block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -1029,6 +945,8 @@ stream_retention_secs: 3600
             eviction_interval_secs: 300,
             max_tree_size: 1000,
             block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -1052,6 +970,8 @@ stream_retention_secs: 3600
             eviction_interval_secs: 600,
             max_tree_size: 5000,
             block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         };
 
         match cache_aware {
@@ -1458,6 +1378,8 @@ stream_retention_secs: 3600
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
                 block_size: 16,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1489,6 +1411,8 @@ stream_retention_secs: 3600
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
                 block_size: 16,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
             }),
             decode_policy: None,
         };
@@ -1546,6 +1470,8 @@ stream_retention_secs: 3600
             eviction_interval_secs: 300,
             max_tree_size: 2000,
             block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         };
 
         match pd.get_prefill_policy(&main_policy) {

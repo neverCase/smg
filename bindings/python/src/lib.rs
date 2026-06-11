@@ -13,6 +13,7 @@ pub enum PolicyType {
     RoundRobin,
     CacheAware,
     PowerOfTwo,
+    LeastLoad,
     Bucket,
     Manual,
     ConsistentHashing,
@@ -376,6 +377,11 @@ struct Router {
     eviction_interval_secs: u64,
     max_tree_size: usize,
     block_size: usize,
+    balance_token_usage_threshold: f32,
+    overload_token_usage_threshold: f32,
+    least_load_kv_pressure_weight: f64,
+    least_load_default_throughput: f64,
+    least_load_mean_prefill_tokens: u32,
     max_idle_secs: u64,
     assignment_mode: String,
     max_payload_size: usize,
@@ -511,9 +517,17 @@ impl Router {
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_tree_size: self.max_tree_size,
                     block_size: self.block_size,
+                    balance_token_usage_threshold: self.balance_token_usage_threshold,
+                    overload_token_usage_threshold: self.overload_token_usage_threshold,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5,
+                },
+                PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad {
+                    load_check_interval_secs: 5,
+                    kv_pressure_weight: self.least_load_kv_pressure_weight,
+                    mean_prefill_tokens: self.least_load_mean_prefill_tokens,
+                    default_throughput: self.least_load_default_throughput,
                 },
                 PolicyType::Bucket => ConfigPolicyConfig::Bucket {
                     balance_abs_threshold: self.balance_abs_threshold,
@@ -770,6 +784,11 @@ impl Router {
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
         block_size = 16,
+        balance_token_usage_threshold = 1.0,
+        overload_token_usage_threshold = 1.0,
+        least_load_kv_pressure_weight = 0.15,
+        least_load_default_throughput = 2000.0,
+        least_load_mean_prefill_tokens = 1024,
         max_idle_secs = 14400,
         assignment_mode = String::from("random"),
         max_payload_size = 512 * 1024 * 1024,
@@ -880,6 +899,11 @@ impl Router {
         eviction_interval_secs: u64,
         max_tree_size: usize,
         block_size: usize,
+        balance_token_usage_threshold: f32,
+        overload_token_usage_threshold: f32,
+        least_load_kv_pressure_weight: f64,
+        least_load_default_throughput: f64,
+        least_load_mean_prefill_tokens: u32,
         max_idle_secs: u64,
         assignment_mode: String,
         max_payload_size: usize,
@@ -999,6 +1023,11 @@ impl Router {
             eviction_interval_secs,
             max_tree_size,
             block_size,
+            balance_token_usage_threshold,
+            overload_token_usage_threshold,
+            least_load_kv_pressure_weight,
+            least_load_default_throughput,
+            least_load_mean_prefill_tokens,
             max_idle_secs,
             assignment_mode,
             max_payload_size,
@@ -1093,7 +1122,7 @@ impl Router {
         })
     }
 
-    fn start(&self) -> PyResult<()> {
+    fn start(&self, py: Python<'_>) -> PyResult<()> {
         use observability::metrics::PrometheusConfig;
 
         let router_config = self.to_router_config().map_err(|e| {
@@ -1147,7 +1176,9 @@ impl Router {
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
-        runtime.block_on(async move {
+        // Release the GIL while the server runs so Python threads can make progress.
+        py.detach(|| {
+            runtime.block_on(async move {
             Box::pin(server::startup(server::ServerConfig {
                 host: self.host.clone(),
                 port: self.port,
@@ -1217,6 +1248,7 @@ impl Router {
             }))
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            })
         })
     }
 }

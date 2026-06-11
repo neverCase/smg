@@ -115,25 +115,44 @@ pub fn wrap_crdt_batch(batch: CrdtBatch, sequence: u64, self_name: &str) -> Stre
     }
 }
 
-/// Encode a [`CrdtWatermark`] as a wire [`CrdtAck`] — one entry per known key.
+/// Encode a [`CrdtWatermark`] as a wire [`CrdtAck`] — one entry per known key,
+/// carrying the op-id `(version, replica_id)` so the peer can apply the same
+/// `(timestamp, replica_id)` ordering the merge uses.
 pub fn watermark_to_crdt_ack(watermark: &CrdtWatermark) -> CrdtAck {
     CrdtAck {
         entries: watermark
             .iter()
-            .map(|(key, version)| CrdtKeyVersion {
+            .map(|(key, (version, replica))| CrdtKeyVersion {
                 key: key.to_owned(),
                 version,
+                replica_id: replica.to_string(),
             })
             .collect(),
     }
 }
 
 /// Decode a received [`CrdtAck`] into a [`CrdtWatermark`] for merging into the
-/// sender's per-peer send watermark.
+/// sender's per-peer send watermark. Entries with an unparsable `replica_id`
+/// are dropped (mirrors `proto_to_op`).
+///
+/// A legacy peer acks without `replica_id` (proto3 decodes the missing field as
+/// `""`); that entry maps to `(version, ReplicaId::MAX)`, which suppresses
+/// every op at or below the acked timestamp — the timestamp-only semantics the
+/// old peer speaks. Dropping it instead would leave the watermark stuck and
+/// re-send the full set every round for the whole rolling-upgrade window. (A
+/// nil sentinel would not help: the acked winner `(v, R)` compares above
+/// `(v, nil)` and would still re-send every round.)
 pub fn crdt_ack_to_watermark(ack: CrdtAck) -> CrdtWatermark {
     ack.entries
         .into_iter()
-        .map(|entry| (entry.key, entry.version))
+        .filter_map(|entry| {
+            let replica = if entry.replica_id.is_empty() {
+                ReplicaId::MAX
+            } else {
+                ReplicaId::from_string(&entry.replica_id).ok()?
+            };
+            Some((entry.key, (entry.version, replica)))
+        })
         .collect()
 }
 
@@ -254,6 +273,40 @@ mod tests {
         ]);
         let back = crdt_ack_to_watermark(watermark_to_crdt_ack(&wm));
         assert_eq!(back, wm);
+    }
+
+    #[test]
+    fn legacy_ack_without_replica_suppresses_by_timestamp() {
+        // A legacy peer acks without replica_id (proto3 -> ""). The entry maps
+        // to (version, ReplicaId::MAX): ops at or below the acked timestamp
+        // are suppressed (no per-key resend every round), newer ops still send.
+        let ack = CrdtAck {
+            entries: vec![CrdtKeyVersion {
+                key: "worker:a".to_string(),
+                version: 5,
+                replica_id: String::new(),
+            }],
+        };
+        let wm = crdt_ack_to_watermark(ack);
+        let replica = ReplicaId::new();
+        let at = Operation::insert("worker:a".to_string(), b"v".to_vec(), 5, replica);
+        let older = Operation::insert("worker:a".to_string(), b"v".to_vec(), 4, replica);
+        let newer = Operation::insert("worker:a".to_string(), b"v".to_vec(), 6, replica);
+        assert!(!wm.allows(&at), "acked timestamp is suppressed");
+        assert!(!wm.allows(&older), "older ops are suppressed");
+        assert!(wm.allows(&newer), "newer ops still send");
+    }
+
+    #[test]
+    fn ack_with_unparsable_replica_id_is_dropped() {
+        let ack = CrdtAck {
+            entries: vec![CrdtKeyVersion {
+                key: "worker:a".to_string(),
+                version: 5,
+                replica_id: "not-a-uuid".to_string(),
+            }],
+        };
+        assert!(crdt_ack_to_watermark(ack).is_empty());
     }
 
     #[test]
