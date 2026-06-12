@@ -34,7 +34,7 @@ use crate::{
         monitor::WorkerMonitor,
         registry::{WorkerDescriptor, WorkerId},
         worker::WorkerTypeExt,
-        ConnectionMode, Worker, WorkerRegistry, WorkerResult, WorkerType,
+        ConnectionMode, Worker, WorkerOrigin, WorkerRegistry, WorkerResult, WorkerType,
     },
     workflow::{Job, JobQueue},
 };
@@ -271,6 +271,7 @@ async fn run_health_loop(
         for removal in removals {
             if let Some(jq) = job_queue.as_ref() {
                 submit_removal_job(
+                    &registry,
                     &removal.worker_id,
                     &removal.url,
                     removal.expected_revision,
@@ -402,7 +403,7 @@ fn queue_due_probes(
             if config.remove_unhealthy {
                 removals.push(RemovalCandidate {
                     worker_id: worker_id.clone(),
-                    url: worker.url().to_string(),
+                    url: worker.base_url().to_string(),
                     expected_revision,
                 });
             }
@@ -502,7 +503,14 @@ async fn apply_probe_completion(
         );
         if new == WorkerStatus::Failed {
             if let Some(jq) = job_queue {
-                submit_removal_job(&worker_id, worker.url(), expected_revision, jq).await;
+                submit_removal_job(
+                    registry,
+                    &worker_id,
+                    worker.base_url(),
+                    expected_revision,
+                    jq,
+                )
+                .await;
             }
         }
     }
@@ -655,12 +663,28 @@ fn compute_next_status(
     }
 }
 
+/// Failed mesh-imported workers stay registered (demoted, unroutable):
+/// they are owner-managed, and a local removal only desynchronizes this
+/// node — the live CRDT key re-imports the worker on the next reconcile,
+/// probes fail again, and the remove/re-import loop churns forever.
+fn should_remove_failed(registry: &Arc<WorkerRegistry>, worker_id: &WorkerId) -> bool {
+    registry.origin_of(worker_id) != Some(WorkerOrigin::Mesh)
+}
+
 async fn submit_removal_job(
+    registry: &Arc<WorkerRegistry>,
     worker_id: &WorkerId,
     worker_url: &str,
     expected_revision: u64,
     job_queue: &Arc<JobQueue>,
 ) {
+    if !should_remove_failed(registry, worker_id) {
+        debug!(
+            worker_id = %worker_id.as_str(),
+            "skipping removal of failed mesh-imported worker (owner-managed)"
+        );
+        return;
+    }
     let url = worker_url.to_string();
     warn!(
         worker_id = %worker_id.as_str(),
@@ -1025,6 +1049,34 @@ mod tests {
     }
 
     #[test]
+    fn failed_mesh_imported_workers_are_not_removed() {
+        let registry = Arc::new(WorkerRegistry::new());
+
+        let local_id = registry
+            .register(make_worker("http://local:1", 1, 1))
+            .unwrap();
+        assert!(
+            should_remove_failed(&registry, &local_id),
+            "failed local workers are removable"
+        );
+
+        registry.on_remote_worker_state(&smg_mesh::WorkerState {
+            worker_id: "peer-w1".to_string(),
+            model_id: "m".to_string(),
+            url: "http://remote:1".to_string(),
+            health: true,
+            load: 0.0,
+            version: 1,
+            spec: vec![],
+        });
+        let mesh_id = registry.get_id_by_url("http://remote:1").unwrap();
+        assert!(
+            !should_remove_failed(&registry, &mesh_id),
+            "failed mesh-imported workers stay registered (owner-managed)"
+        );
+    }
+
+    #[test]
     fn test_state_machine_pending_to_ready_after_success_threshold() {
         let worker = make_worker("http://w:1", 2, 3);
         assert_eq!(worker.status(), WorkerStatus::Pending);
@@ -1160,6 +1212,46 @@ mod tests {
             compute_next_status(&worker, false, &cfg(2, 3)),
             Some(WorkerStatus::NotReady)
         );
+    }
+
+    #[tokio::test]
+    async fn test_removal_candidate_strips_dp_rank_suffix() {
+        // Regression test: a DP-aware worker is registered under
+        // "{base}@{rank}", but the removal workflow prefix-matches
+        // "{url}@" in dp_aware mode. Submitting the registered (suffixed)
+        // URL made the prefix "{base}@{rank}@", which matched nothing, so
+        // unhealthy DP workers were never removed.
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://10.130.99.80:30000")
+                .worker_type(WorkerType::Regular)
+                .health_config(cfg(2, 3))
+                .dp_config(1, 4)
+                .build(),
+        );
+        assert_eq!(worker.url(), "http://10.130.99.80:30000@1");
+        worker.set_status(WorkerStatus::Failed);
+        let worker_id = registry.register(worker).unwrap();
+
+        let mut next_check = HashMap::new();
+        next_check.insert(worker_id, tokio::time::Instant::now());
+        let mut in_flight = HashSet::new();
+        let mut probes: ProbeFutures = FuturesUnordered::new();
+
+        let removals = queue_due_probes(
+            &registry,
+            &WorkerManagerConfig {
+                default_check_interval_secs: 5,
+                remove_unhealthy: true,
+            },
+            &mut next_check,
+            &mut in_flight,
+            &mut probes,
+            tokio::time::Instant::now(),
+        );
+
+        assert_eq!(removals.len(), 1);
+        assert_eq!(removals[0].url, "http://10.130.99.80:30000");
     }
 
     #[test]

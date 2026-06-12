@@ -32,7 +32,9 @@ use openai_protocol::{
     responses::ResponsesRequest,
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
     validated::ValidatedJson,
-    worker::{StartProfileRequest, StopProfileRequest, WorkerSpec, WorkerUpdateRequest},
+    worker::{
+        ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerSpec, WorkerUpdateRequest,
+    },
 };
 use rustls::crypto::ring;
 use serde::Deserialize;
@@ -620,8 +622,15 @@ async fn create_worker(
     }
 }
 
-async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
-    state.context.worker_service.list_workers().into_response()
+async fn list_workers_rest(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListWorkersQuery>,
+) -> Response {
+    state
+        .context
+        .worker_service
+        .list_workers(query.model.as_deref())
+        .into_response()
 }
 
 async fn get_worker(
