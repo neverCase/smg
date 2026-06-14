@@ -175,11 +175,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             "pixel_values"
         )
         logger.info(
-            "Generate request %s: input_type=%s, stream=%s, preprocessed_mm=%s",
+            "Generate request %s: input_type=%s, stream=%s, preprocessed_mm=%s, dp_rank=%s",
             request_id,
             input_type,
             request.stream,
             has_preprocessed_mm,
+            request.data_parallel_rank if request.HasField("data_parallel_rank") else None,
         )
 
         kv_transfer_params: dict | None = None
@@ -222,6 +223,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 sampling_params=sampling_params,
                 request_id=request_id,
                 tokenization_kwargs=tokenization_kwargs,
+                data_parallel_rank=(
+                    request.data_parallel_rank if request.HasField("data_parallel_rank") else None
+                ),
             ):
                 engine_started = True
                 # For streaming, send chunks for EACH completion output (n outputs)
@@ -469,24 +473,20 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         kv_connector = ""
         kv_role = ""
         kv_engine_id = ""
+        parallel = self.engine.vllm_config.parallel_config
         kv_transfer_config = self.engine.vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             kv_connector = kv_transfer_config.kv_connector or ""
             kv_role = kv_transfer_config.kv_role or ""
-            # With DP active the engine cores suffix their connector engine_id
-            # (base_dp{rank}) and the router cannot attribute requests to a
-            # rank — report no id so it falls back to legacy injection
-            parallel = self.engine.vllm_config.parallel_config
-            dp_active = (
-                parallel.data_parallel_size > 1 or getattr(parallel, "data_parallel_rank", 0) > 0
-            )
-            if not dp_active:
-                kv_engine_id = getattr(kv_transfer_config, "engine_id", "") or ""
+            # Base engine_id; with DP the engine cores serve `{id}_dp{rank}` and
+            # the router derives the suffix from the rank it pins per request
+            kv_engine_id = getattr(kv_transfer_config, "engine_id", "") or ""
 
         return vllm_engine_pb2.GetServerInfoResponse(
             kv_connector=kv_connector,
             kv_role=kv_role,
             kv_engine_id=kv_engine_id,
+            data_parallel_size=parallel.data_parallel_size,
         )
 
     async def GetLoads(
