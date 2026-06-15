@@ -8,6 +8,7 @@ pub mod auth;
 pub mod concurrency;
 pub mod logging;
 pub mod metrics;
+pub mod remote_auth;
 pub mod request_id;
 pub mod scheduler;
 pub mod storage_context;
@@ -22,6 +23,7 @@ pub use concurrency::{
 pub use logging::{create_logging_layer, RequestLogger, RequestSpan, ResponseLogger};
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
+pub use remote_auth::{create_remote_auth_client, RemoteAuthClient};
 pub use storage_context::storage_context_middleware;
 pub use tenant_resolution::{
     ordinary_tenant_resolution_middleware, route_request_meta_middleware, TenantResolutionState,

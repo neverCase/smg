@@ -29,6 +29,11 @@ pub struct RouterConfig {
     #[serde(default)]
     pub dp_minimum_tokens_scheduler: bool,
     pub api_key: Option<String>,
+    /// Remote authentication service configuration.
+    /// Always present; an empty `url` means the feature is disabled.
+    /// Use `RemoteAuthConfig::default()` to opt out explicitly.
+    #[serde(default)]
+    pub remote_auth: RemoteAuthConfig,
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
     pub trace_config: Option<TraceConfig>,
@@ -599,6 +604,59 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
+/// Remote authentication service configuration.
+///
+/// When `url` is set on `RouterConfig`, every chat-completion request is verified
+/// against the remote auth service, and `/v1/models` returns only the models the
+/// caller's token is authorized to access.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteAuthConfig {
+    /// Base URL of the auth service (no trailing slash).
+    /// `/verify` and `/allowed-models` are appended at call time.
+    pub url: String,
+    /// HTTP timeout per call. Default: 5 seconds.
+    #[serde(default = "default_remote_auth_timeout")]
+    pub timeout_secs: u64,
+    /// When `true` (default), reject requests if the auth service is unreachable.
+    /// When `false`, allow them through (fail-open).
+    #[serde(default = "default_remote_auth_fail_closed")]
+    pub fail_closed: bool,
+    /// Header name used to extract the bearer token. Default: `authorization`.
+    #[serde(default = "default_remote_auth_token_header")]
+    pub token_header: String,
+}
+
+impl Default for RemoteAuthConfig {
+    fn default() -> Self {
+        // let headers = vec![
+        //     (":method", "POST"),
+        //     (":path", "/auth/validate"),
+        //     (":authority", "auth-service.kubesphere-controls-system.svc.cluster.local:12345"),
+        //     ("content-type", "application/json"),
+        // ];
+
+        Self {
+            url: "http://auth-service.kubesphere-controls-system.svc.cluster.local:12345".to_string(),
+            timeout_secs: default_remote_auth_timeout(),
+            fail_closed: default_remote_auth_fail_closed(),
+            token_header: default_remote_auth_token_header(),
+        }
+    }
+}
+
+fn default_remote_auth_timeout() -> u64 {
+    5
+}
+
+fn default_remote_auth_fail_closed() -> bool {
+    true
+}
+
+fn default_remote_auth_token_header() -> String {
+    "authorization".to_string()
+}
+
 /// Metrics configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsConfig {
@@ -647,6 +705,7 @@ impl Default for RouterConfig {
             dp_aware: false,
             dp_minimum_tokens_scheduler: false,
             api_key: None,
+            remote_auth: RemoteAuthConfig::default(),
             discovery: None,
             metrics: None,
             trace_config: None,

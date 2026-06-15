@@ -16,7 +16,7 @@ use tracing::debug;
 
 use crate::{
     config::RouterConfig,
-    middleware::TokenBucket,
+    middleware::{create_remote_auth_client, RemoteAuthClient, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     routers::{
@@ -73,6 +73,10 @@ pub struct AppContext {
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
+    /// Optional remote-auth HTTP client. When set, every chat-completion-style
+    /// handler verifies the caller's token + model_id against the remote
+    /// service, and `/v1/models` returns only the allowed subset.
+    pub remote_auth_client: Option<Arc<RemoteAuthClient>>,
     /// Bind address for WebRTC UDP sockets (`None` = `0.0.0.0`, auto-detect).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
     /// STUN server for ICE candidate gathering. Defaults to `stun.l.google.com:19302`; `"none"` to disable.
@@ -107,6 +111,7 @@ pub struct AppContextBuilder {
     mcp_format_registry: Option<FormatRegistry>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    remote_auth_client: Option<Arc<RemoteAuthClient>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
 }
@@ -160,6 +165,7 @@ impl AppContextBuilder {
             mcp_format_registry: None,
             wasm_manager: None,
             kv_event_monitor: None,
+            remote_auth_client: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         }
@@ -272,6 +278,14 @@ impl AppContextBuilder {
         self
     }
 
+    pub fn remote_auth_client(
+        mut self,
+        remote_auth_client: Option<Arc<RemoteAuthClient>>,
+    ) -> Self {
+        self.remote_auth_client = remote_auth_client;
+        self
+    }
+
     pub fn webrtc_bind_addr(mut self, addr: Option<std::net::IpAddr>) -> Self {
         self.webrtc_bind_addr = addr;
         self
@@ -373,6 +387,7 @@ impl AppContextBuilder {
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
+            remote_auth_client: self.remote_auth_client,
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server,
         })
@@ -403,6 +418,7 @@ impl AppContextBuilder {
             .await?
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor(&router_config)
+            .with_remote_auth_client(&router_config)
             .webrtc_bind_addr(webrtc_bind_addr)
             .webrtc_stun_server(
                 webrtc_stun_server.or_else(|| Some("stun.l.google.com:19302".to_string())),
@@ -679,6 +695,25 @@ impl AppContextBuilder {
         } else {
             None
         };
+        self
+    }
+
+    /// Initialize the remote-auth HTTP client when configured.
+    ///
+    /// Reuses the gateway's shared `reqwest::Client` (same connection pool /
+    /// TLS settings) and only allocates an `Arc<RemoteAuthClient>` when
+    /// `router_config.remote_auth.url` is non-empty. Otherwise stays `None`.
+    fn with_remote_auth_client(mut self, config: &RouterConfig) -> Self {
+        if let Some(client) = self.client.as_ref() {
+            self.remote_auth_client =
+                create_remote_auth_client(client.clone(), &config.remote_auth);
+            if self.remote_auth_client.is_some() {
+                debug!(
+                    url = %config.remote_auth.url,
+                    "Remote auth client initialized"
+                );
+            }
+        }
         self
     }
 }

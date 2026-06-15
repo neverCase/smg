@@ -41,7 +41,7 @@ use tracing::{debug, info, warn};
 use crate::{
     app_context::AppContext,
     config::RoutingMode,
-    middleware::TenantRequestMeta,
+    middleware::{RemoteAuthClient, TenantRequestMeta},
     routers::{
         common::header_utils::apply_provider_headers,
         error as route_error,
@@ -56,6 +56,9 @@ pub struct RouterManager {
     worker_registry: Arc<WorkerRegistry>,
     client: reqwest::Client,
     gateway_api_key: Option<String>,
+    /// Optional remote auth client; when set, `/v1/models` filters returned
+    /// cards by the caller token's allowed-models list.
+    remote_auth_client: Option<Arc<RemoteAuthClient>>,
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
     default_router: Arc<std::sync::RwLock<Option<RouterId>>>,
     enable_igw: bool,
@@ -67,6 +70,7 @@ impl RouterManager {
             worker_registry,
             client,
             gateway_api_key: None,
+            remote_auth_client: None,
             routers: Arc::new(DashMap::new()),
             default_router: Arc::new(std::sync::RwLock::new(None)),
             enable_igw: false,
@@ -103,6 +107,7 @@ impl RouterManager {
         manager
             .gateway_api_key
             .clone_from(&config.router_config.api_key);
+        manager.remote_auth_client = app_context.remote_auth_client.clone();
         let manager = Arc::new(manager);
 
         if config.router_config.enable_igw {
@@ -331,6 +336,29 @@ impl RouterManager {
         }
     }
 
+    /// Build a registry-models response filtered by an explicit allow-list.
+    /// Returns `404` when no model survives the filter.
+    fn registry_models_response_filtered(&self, allowed: &HashSet<String>) -> Response {
+        let cards: Vec<_> = self
+            .worker_registry
+            .get_all()
+            .iter()
+            .filter(|w| !matches!(w.metadata().spec.runtime_type, RuntimeType::External))
+            .flat_map(|w| w.models())
+            .filter(|c| allowed.contains(&c.id))
+            .collect();
+        if cards.is_empty() {
+            (
+                StatusCode::NOT_FOUND,
+                "No models available for this token",
+            )
+                .into_response()
+        } else {
+            let resp = ListModelsResponse::from_model_cards(cards);
+            (StatusCode::OK, Json(resp)).into_response()
+        }
+    }
+
     /// Fan out to all healthy external upstreams concurrently with the caller's
     /// bearer token and return the first successful model inventory. Returns an
     /// empty vec on total failure.
@@ -472,6 +500,47 @@ impl RouterTrait for RouterManager {
             if is_gateway_key {
                 return self.registry_models_response();
             }
+        }
+
+        // When remote auth is enabled, ask it for the per-token allow-list and
+        // filter both registry and BYOK upstream cards by that set. Missing
+        // token => 401 (we cannot resolve any models for an anonymous caller
+        // when auth gating is active).
+        if let Some(remote_auth) = self.remote_auth_client.as_ref() {
+            let Some(ref token) = bearer_token else {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    "Missing bearer token",
+                )
+                    .into_response();
+            };
+
+            let allowed: HashSet<String> = remote_auth
+                .allowed_models(token)
+                .await
+                .into_iter()
+                .collect();
+            if allowed.is_empty() {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "Token is not authorized for any models",
+                )
+                    .into_response();
+            }
+
+            // Try BYOK upstreams first, then fall back to filtered registry.
+            let upstream_cards: Vec<_> = self
+                .fetch_upstream_models(token)
+                .await
+                .into_iter()
+                .filter(|c| allowed.contains(&c.id))
+                .collect();
+            if !upstream_cards.is_empty() {
+                let resp = ListModelsResponse::from_model_cards(upstream_cards);
+                return (StatusCode::OK, Json(resp)).into_response();
+            }
+
+            return self.registry_models_response_filtered(&allowed);
         }
 
         // If the caller sent a provider token, try to discover models from

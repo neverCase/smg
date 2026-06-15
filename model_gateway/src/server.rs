@@ -195,6 +195,54 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
     state.router.get_model_info(req).await
 }
 
+/// Verify the request against the remote-auth service when configured.
+///
+/// Returns `Ok(())` when:
+/// - No remote-auth client is configured (feature disabled), or
+/// - The remote service approves `(token, model_id)`.
+///
+/// Returns `Err(Response)` ready to be sent to the client when:
+/// - The bearer token is missing from headers, or
+/// - The remote service denies the request, or
+/// - The remote service is unreachable and `fail_closed` is `true`.
+async fn check_remote_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    model_id: &str,
+) -> Result<(), Response> {
+    let Some(client) = state.context.remote_auth_client.as_ref() else {
+        return Ok(());
+    };
+
+    let Some(token) = client.extract_token(headers) else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": {
+                    "message": "Missing bearer token",
+                    "type": "authentication_error",
+                }
+            })),
+        )
+            .into_response());
+    };
+
+    if let Err((status, msg)) = client.verify(&token, model_id).await {
+        return Err((
+            status,
+            Json(json!({
+                "error": {
+                    "message": msg,
+                    "type": "authentication_error",
+                }
+            })),
+        )
+            .into_response());
+    }
+
+    Ok(())
+}
+
 async fn generate(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -218,6 +266,9 @@ async fn v1_chat_completions(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
+    if let Err(resp) = check_remote_auth(&state, &headers, &body.model).await {
+        return resp;
+    }
     cancel
         .guard(
             state
@@ -234,6 +285,9 @@ async fn v1_completions(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CompletionRequest>,
 ) -> Response {
+    if let Err(resp) = check_remote_auth(&state, &headers, &body.model).await {
+        return resp;
+    }
     cancel
         .guard(
             state
@@ -250,6 +304,9 @@ async fn rerank(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<RerankRequest>,
 ) -> Response {
+    if let Err(resp) = check_remote_auth(&state, &headers, &body.model).await {
+        return resp;
+    }
     cancel
         .guard(
             state
@@ -267,6 +324,9 @@ async fn v1_rerank(
     Json(body): Json<V1RerankReqInput>,
 ) -> Response {
     let rerank_body: RerankRequest = body.into();
+    if let Err(resp) = check_remote_auth(&state, &headers, &rerank_body.model).await {
+        return resp;
+    }
     cancel
         .guard(state.router.route_rerank(
             Some(&headers),
@@ -284,6 +344,9 @@ async fn v1_responses(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
+    if let Err(resp) = check_remote_auth(&state, &headers, &body.model).await {
+        return resp;
+    }
     cancel
         .guard(
             state
@@ -317,6 +380,9 @@ async fn v1_embeddings(
     cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<EmbeddingRequest>,
 ) -> Response {
+    if let Err(resp) = check_remote_auth(&state, &headers, &body.model).await {
+        return resp;
+    }
     cancel
         .guard(
             state
@@ -333,6 +399,9 @@ async fn v1_messages(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CreateMessageRequest>,
 ) -> Response {
+    if let Err(resp) = check_remote_auth(&state, &headers, &body.model).await {
+        return resp;
+    }
     cancel
         .guard(
             state
