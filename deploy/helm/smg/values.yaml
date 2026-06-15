@@ -183,7 +183,7 @@ router:
 
   # -- Optional features
   wasm:
-    enabled: true
+    enabled: false
     path: ""
   mcp:
     enabled: false
