@@ -55,12 +55,13 @@ COPY --from=local_src /src /opt/smg
 WORKDIR /opt/smg
 
 # install maturin and build the wheel with vendored OpenSSL
-RUN uv pip install maturin \
-    && cargo clean \
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/opt/smg/target,sharing=locked \
+    uv pip install maturin \
     && rm -rf bindings/python/dist/ \
     && cd bindings/python \
-    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
-    && rm -rf /root/.cache
+    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist
 
 ######################### ROUTER IMAGE #########################
 FROM base AS router-image
@@ -80,9 +81,10 @@ RUN rm -rf /root/.cache dist/ \
 # UID 65532 follows the nonroot convention used by distroless images.
 # UID 1000 is already taken by the 'ubuntu' user in ubuntu:24.04.
 RUN useradd --system --no-log-init --create-home --uid 65532 smg
-USER smg
 
 RUN chown -R smg:smg /opt/smg/plugins
+
+USER smg
 
 # Set the entrypoint to the main command
 ENTRYPOINT ["python3", "-m", "smg.launch_router"]
