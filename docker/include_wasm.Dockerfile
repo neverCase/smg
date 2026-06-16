@@ -68,7 +68,6 @@ FROM base AS router-image
 
 # Copy the built package from the build image
 COPY --from=build-image /opt/smg/bindings/python/dist/*.whl dist/
-COPY target/wasm32-wasip2/release/wasm_guest_auth.component.wasm /opt/smg/plugins/
 
 # Build the package and install
 RUN uv pip install --force-reinstall dist/*.whl
@@ -81,8 +80,6 @@ RUN rm -rf /root/.cache dist/ \
 # UID 65532 follows the nonroot convention used by distroless images.
 # UID 1000 is already taken by the 'ubuntu' user in ubuntu:24.04.
 RUN useradd --system --no-log-init --create-home --uid 65532 smg
-
-RUN chown -R smg:smg /opt/smg/plugins
 
 USER smg
 

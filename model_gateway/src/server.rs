@@ -38,7 +38,7 @@ use openai_protocol::{
 };
 use rustls::crypto::ring;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler};
 use tokio::{signal, spawn, sync::mpsc};
 use tracing::{debug, error, info, warn, Level};
