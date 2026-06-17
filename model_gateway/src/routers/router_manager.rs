@@ -338,15 +338,21 @@ impl RouterManager {
 
     /// Build a registry-models response filtered by an explicit allow-list.
     /// Returns `404` when no model survives the filter.
-    fn registry_models_response_filtered(&self, allowed: &HashSet<String>) -> Response {
+    fn registry_models_response_filtered(
+        &self,
+        allowed: &HashSet<String>,
+        allow_all: bool // 👈 新增参数
+    ) -> Response {
         let cards: Vec<_> = self
             .worker_registry
             .get_all()
             .iter()
             .filter(|w| !matches!(w.metadata().spec.runtime_type, RuntimeType::External))
             .flat_map(|w| w.models())
-            .filter(|c| allowed.contains(&c.id))
+            // 👇 修改这里的过滤逻辑
+            .filter(|c| allow_all || allowed.contains(&c.id))
             .collect();
+
         if cards.is_empty() {
             (
                 StatusCode::NOT_FOUND,
@@ -515,12 +521,20 @@ impl RouterTrait for RouterManager {
                     .into_response();
             };
 
-            let allowed: HashSet<String> = remote_auth
-                .allowed_models(token)
-                .await
-                .into_iter()
-                .collect();
-            if allowed.is_empty() {
+            // 1. 获取认证响应（如果接口请求失败，这里得到 None）
+            let auth_resp = remote_auth.allowed_models(token).await;
+
+            // 2. 如果接口报错或未返回任何有效数据，直接阻断（对应你原先 is_empty 的逻辑）
+            let Some(auth_data) = auth_resp else {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "Token is not authorized for any models",
+                )
+                    .into_response();
+            };
+
+            // 3. 如果既没有开启 allow_all，且 models 列表也为空，说明确实没有任何权限
+            if !auth_data.allow_all && auth_data.models.is_empty() {
                 return (
                     StatusCode::FORBIDDEN,
                     "Token is not authorized for any models",
@@ -528,19 +542,26 @@ impl RouterTrait for RouterManager {
                     .into_response();
             }
 
-            // Try BYOK upstreams first, then fall back to filtered registry.
+            // 将 models 转换为 HashSet 方便后续 O(1) 复杂度查找
+            let allowed_set: HashSet<String> = auth_data.models.into_iter().collect();
+
+            // 4. 处理 upstream_cards 的过滤逻辑
             let upstream_cards: Vec<_> = self
                 .fetch_upstream_models(token)
                 .await
                 .into_iter()
-                .filter(|c| allowed.contains(&c.id))
+                .filter(|c| {
+                    // 如果 allow_all 为 true，直接放行；否则检查是否在 allowed_set 中
+                    auth_data.allow_all || allowed_set.contains(&c.id)
+                })
                 .collect();
+
             if !upstream_cards.is_empty() {
                 let resp = ListModelsResponse::from_model_cards(upstream_cards);
                 return (StatusCode::OK, Json(resp)).into_response();
             }
 
-            return self.registry_models_response_filtered(&allowed);
+            return self.registry_models_response_filtered(&allowed_set, auth_data.allow_all)
         }
 
         // If the caller sent a provider token, try to discover models from

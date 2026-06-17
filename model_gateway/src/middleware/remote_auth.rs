@@ -58,7 +58,7 @@ impl RemoteAuthClient {
     /// 2. `x-api-key: <token>` (Anthropic-style)
     pub fn extract_token(
         &self,
-        headers: &axum::http::HeaderMap,
+        headers: &http::HeaderMap,
     ) -> Option<String> {
         // 1. Authorization: Bearer <token>
         if let Some(token) = headers
@@ -172,7 +172,7 @@ impl RemoteAuthClient {
     /// Returns an empty `Vec` on any error (auth service unreachable, non-2xx,
     /// or malformed JSON) — the caller should treat this as "no models
     /// available" for the given token.
-    pub async fn allowed_models(&self, token: &str) -> Vec<String> {
+    pub async fn allowed_models(&self, token: &str) -> Option<AllowedModelsResponse> {
         let url = format!("{}/allowed-models", self.config.url);
         let timeout = Duration::from_secs(self.config.timeout_secs);
 
@@ -194,7 +194,7 @@ impl RemoteAuthClient {
                             count = body.models.len(),
                             "RemoteAuth: received allowed models"
                         );
-                        body.models
+                        Some(body)
                     }
                     Err(e) => {
                         warn!(
@@ -202,7 +202,7 @@ impl RemoteAuthClient {
                             url = %url,
                             "RemoteAuth: failed to parse allowed-models response"
                         );
-                        Vec::new()
+                        None
                     }
                 }
             }
@@ -212,7 +212,7 @@ impl RemoteAuthClient {
                     url = %url,
                     "RemoteAuth: non-success status from allowed-models"
                 );
-                Vec::new()
+                None
             }
             Err(e) => {
                 warn!(
@@ -220,7 +220,7 @@ impl RemoteAuthClient {
                     url = %url,
                     "RemoteAuth: auth service unreachable for model listing"
                 );
-                Vec::new()
+                None
             }
         }
     }
@@ -229,8 +229,9 @@ impl RemoteAuthClient {
 // ── internal types ──────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-struct AllowedModelsResponse {
-    models: Vec<String>,
+pub struct AllowedModelsResponse {
+    pub allow_all: bool,
+    pub models: Vec<String>,
 }
 
 // ── convenience helpers ─────────────────────────────────────────────────
