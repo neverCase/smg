@@ -122,7 +122,12 @@ impl HarmonyStreamingProcessor {
                     let _ = tx.send(Ok(SseEncoder::done()));
                 });
             }
-            context::ExecutionResult::Dual { prefill, decode } => {
+            context::ExecutionResult::Dual {
+                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
+                prefill,
+                decode,
+                ..
+            } => {
                 tokio::spawn(async move {
                     let result =
                         Self::process_dual_stream(prefill, *decode, dispatch, chat_request, &tx)
@@ -519,7 +524,12 @@ impl HarmonyStreamingProcessor {
                 debug!("Processing Responses API single stream mode");
                 Self::process_decode_stream(stream, emitter, tx, session, format_registry, 0).await
             }
-            context::ExecutionResult::Dual { prefill, decode } => {
+            context::ExecutionResult::Dual {
+                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
+                prefill,
+                decode,
+                ..
+            } => {
                 debug!("Processing Responses API dual stream mode");
                 Self::process_responses_dual_stream(
                     prefill,
