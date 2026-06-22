@@ -7,7 +7,7 @@ global:
   image:
     registry: hub.local
     repository: x-hive-pro/smg
-    tag: "latest"  # defaults to Chart.appVersion
+    tag: "develop"  # defaults to Chart.appVersion
     pullPolicy: Always
   imagePullSecrets: []
 

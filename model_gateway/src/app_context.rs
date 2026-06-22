@@ -17,6 +17,7 @@ use tracing::debug;
 use crate::{
     config::RouterConfig,
     middleware::{create_remote_auth_client, RemoteAuthClient, TokenBucket},
+    observability::audit_sink::{AuditConfig, AuditSink},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     routers::{
@@ -77,6 +78,11 @@ pub struct AppContext {
     /// handler verifies the caller's token + model_id against the remote
     /// service, and `/v1/models` returns only the allowed subset.
     pub remote_auth_client: Option<Arc<RemoteAuthClient>>,
+    /// Async audit sink used by request handlers to forward per-request
+    /// payloads (request body / response body / timing / model / user) to
+    /// an external Python sidecar. `None` when `SMG_AUDIT_ENDPOINT` is not
+    /// configured — handlers MUST treat absence as "feature disabled".
+    pub audit_sink: Option<Arc<AuditSink>>,
     /// Bind address for WebRTC UDP sockets (`None` = `0.0.0.0`, auto-detect).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
     /// STUN server for ICE candidate gathering. Defaults to `stun.l.google.com:19302`; `"none"` to disable.
@@ -388,6 +394,7 @@ impl AppContextBuilder {
             kv_event_monitor: self.kv_event_monitor,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             remote_auth_client: self.remote_auth_client,
+            audit_sink: AuditConfig::from_env().map(|cfg| Arc::new(AuditSink::spawn(cfg))),
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server,
         })

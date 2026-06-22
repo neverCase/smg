@@ -211,13 +211,40 @@ async fn v1_chat_completions(
     if let Err(resp) = check_remote_auth(&state, &headers, &body.model).await {
         return resp;
     }
-    cancel
+
+    // Audit (phase 1: chat-completions only). The sink internally applies
+    // - hard path allow-list (only `/v1/chat/completions` for now),
+    // - probabilistic sampling per `SMG_AUDIT_SAMPLE_RATE`,
+    // - non-blocking `try_send` with queue-full drop semantics.
+    // When disabled (`SMG_AUDIT_ENDPOINT` unset) the closure is never entered.
+    let pending = state.context.audit_sink.as_ref().and_then(|sink| {
+        let raw_request = serde_json::to_vec(&body)
+            .map(bytes::Bytes::from)
+            .unwrap_or_default();
+        sink.prepare_chat("/v1/chat/completions", &headers, &body, raw_request)
+    });
+
+    let response = cancel
         .guard(
             state
                 .router
                 .route_chat(Some(&headers), &tenant_meta, &body, &body.model),
         )
-        .await
+        .await;
+
+    // Wrap the response body so we can record TTFT on the first chunk and
+    // accumulate `raw_response` for the audit log. Stream semantics are
+    // preserved — chunks are forwarded as they arrive.
+    if let Some(pending) = pending {
+        use crate::observability::audit_sink::AuditedBodyStream;
+        let (parts, body) = response.into_parts();
+        let status = parts.status.as_u16();
+        let data_stream = body.into_data_stream();
+        let wrapped = AuditedBodyStream::new(data_stream, pending, status);
+        Response::from_parts(parts, axum::body::Body::from_stream(wrapped))
+    } else {
+        response
+    }
 }
 
 async fn v1_completions(
