@@ -36,6 +36,7 @@ use crate::{
         common::{
             header_utils,
             retry::{is_retryable_status, RetryExecutor},
+            sse::SseEncoder,
         },
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
@@ -351,7 +352,10 @@ impl PDRouter {
                             context.batch_size,
                         ) {
                             Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
+                            Err(e) => {
+                                Metrics::record_pd_bootstrap_failure();
+                                return Self::handle_serialization_error(e);
+                            }
                         };
 
                         let mut prefill_json_request = json_request.clone();
@@ -647,22 +651,38 @@ impl PDRouter {
         // hits a transport error, the other is cancelled immediately — otherwise
         // the surviving request hangs waiting for a PD bootstrap that will never
         // come (see #831).
-        let pd_result = tokio::try_join!(prefill_request.send(), decode_request.send());
+        // Each leg captures its own head-arrival elapsed when its `send()`
+        // resolves, so the two are independent even though `try_join!` returns
+        // only once both heads arrive: decode TTFT isn't conflated with the
+        // prefill-head wait, and prefill duration isn't conflated with a slower
+        // decode head. Recorded on the success path only.
+        let runtime = prefill.metadata().spec.runtime_type.as_str();
+        let dispatch_start = Instant::now();
+        let prefill_fut = async {
+            let resp = prefill_request.send().await?;
+            Ok::<_, reqwest::Error>((dispatch_start.elapsed(), resp))
+        };
+        let decode_fut = async {
+            let resp = decode_request.send().await?;
+            Ok::<_, reqwest::Error>((dispatch_start.elapsed(), resp))
+        };
+        let pd_result = tokio::try_join!(prefill_fut, decode_fut);
 
         events::RequestReceivedEvent {}.emit();
 
-        let (prefill_response, decode_response) = match pd_result {
-            Ok((prefill_resp, decode_resp)) => (prefill_resp, decode_resp),
-            Err(e) => {
-                error!("PD request transport error, both sides aborted: {e}");
-                // Don't record_outcome here — the caller (execute_dual_dispatch)
-                // records outcomes from the response status after we return.
-                return error::bad_gateway(
-                    "PD disaggregation request failed",
-                    format!("Transport error: {e}"),
-                );
-            }
-        };
+        let ((prefill_head_elapsed, prefill_response), (decode_head_elapsed, decode_response)) =
+            match pd_result {
+                Ok(pair) => pair,
+                Err(e) => {
+                    error!("PD request transport error, both sides aborted: {e}");
+                    // Don't record_outcome here — the caller (execute_dual_dispatch)
+                    // records outcomes from the response status after we return.
+                    return error::bad_gateway(
+                        "PD disaggregation request failed",
+                        format!("Transport error: {e}"),
+                    );
+                }
+            };
 
         // Process decode response
         let status = StatusCode::from_u16(decode_response.status().as_u16())
@@ -681,7 +701,19 @@ impl PDRouter {
                 .await;
         }
 
+        // Honest PD TTFT: dispatch to the decode response head — the first
+        // user-visible decode output, since the gateway forwards the decode body
+        // unbuffered. Complements the decode-only `smg_router_ttft_seconds`,
+        // which PD never narrows to a single leg.
+        Metrics::record_pd_ttft(
+            metrics_labels::BACKEND_PD,
+            context.model_id,
+            runtime,
+            decode_head_elapsed,
+        );
+
         // Process prefill response
+        let prefill_drain_start = Instant::now();
         let prefill_body = match self
             .process_prefill_response(prefill_response, prefill.url(), context.return_logprob)
             .await
@@ -689,6 +721,15 @@ impl PDRouter {
             Ok((_, body)) => body,
             Err(error_response) => return error_response,
         };
+
+        // Prefill RPC duration: prefill-head elapsed + body drain, independent
+        // of decode so a slower decode head never inflates it.
+        Metrics::record_pd_prefill_duration(
+            metrics_labels::BACKEND_PD,
+            context.model_id,
+            runtime,
+            prefill_head_elapsed + prefill_drain_start.elapsed(),
+        );
 
         if context.is_stream {
             // Streaming response
@@ -910,14 +951,20 @@ impl PDRouter {
         )]
         tokio::spawn(async move {
             futures_util::pin_mut!(stream);
+            // Reusable SSE encoder for the logprob-merge re-encode path.
+            let mut encoder = SseEncoder::new();
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
                         let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
 
                         let result = if return_logprob && prefill_logprobs.is_some() {
-                            Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
-                                .unwrap_or(chunk)
+                            Self::merge_streaming_logprobs(
+                                prefill_logprobs.as_ref(),
+                                &chunk,
+                                &mut encoder,
+                            )
+                            .unwrap_or(chunk)
                         } else {
                             chunk
                         };
@@ -1136,8 +1183,9 @@ impl PDRouter {
     // Simple helper to merge logprobs in streaming responses
     // Optimized to reduce allocations in the merge path
     fn merge_streaming_logprobs(
-        prefill_logprobs: Option<Value>,
+        prefill_logprobs: Option<&Value>,
         decode_chunk: &[u8],
+        encoder: &mut SseEncoder,
     ) -> Result<bytes::Bytes, ()> {
         // Skip non-data chunks
         let chunk_str = std::str::from_utf8(decode_chunk).map_err(|_| ())?;
@@ -1150,7 +1198,7 @@ impl PDRouter {
         let mut decode_json: Value = serde_json::from_str(json_str).map_err(|_| ())?;
 
         // Merge prefill logprobs if available
-        if let Some(ref p_logprobs) = prefill_logprobs {
+        if let Some(p_logprobs) = prefill_logprobs {
             if let Some(meta) = decode_json.get_mut("meta_info") {
                 if let Some(d_logprobs) = meta.get_mut("input_token_logprobs") {
                     if let Some(p_arr) = p_logprobs.as_array() {
@@ -1168,12 +1216,8 @@ impl PDRouter {
             }
         }
 
-        // Re-serialize
-        let merged_str = format!(
-            "data: {}\n\n",
-            serde_json::to_string(&decode_json).unwrap_or_default()
-        );
-        Ok(bytes::Bytes::from(merged_str))
+        // Re-serialize via the shared encoder (reuses its buffer across chunks).
+        encoder.encode_data(&decode_json).map_err(|_| ())
     }
 }
 
