@@ -618,8 +618,7 @@ fn now_ms() -> u64 {
 /// Returns a pseudo-random `f32` in `[0, 1)`. Uses [`rand::random`] (already
 /// in workspace dependencies).
 fn rand_unit() -> f32 {
-    use rand::Rng;
-    rand::thread_rng().gen::<f32>()
+    rand::random::<f32>()
 }
 
 #[cfg(test)]

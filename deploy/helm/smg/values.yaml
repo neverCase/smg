@@ -113,7 +113,7 @@ router:
   metrics:
     port: 29000
     serviceMonitor:
-      enabled: false
+      enabled: true
       interval: 30s
       labels: {}
 

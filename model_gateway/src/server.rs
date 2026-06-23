@@ -16,6 +16,7 @@ use axum::{
 use llm_tokenizer::TokenizerRegistry;
 use openai_protocol::{
     chat::ChatCompletionRequest,
+    common::StreamOptions,
     classify::ClassifyRequest,
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
@@ -203,10 +204,10 @@ async fn generate(
 
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    ValidatedJson(mut body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     if let Err(resp) = check_remote_auth(&state, &headers, &body.model).await {
         return resp;
@@ -223,6 +224,30 @@ async fn v1_chat_completions(
             .unwrap_or_default();
         sink.prepare_chat("/v1/chat/completions", &headers, &body, raw_request)
     });
+
+    if body.stream {
+        // 只有当明确为 Some(true) 时才匹配成功
+        if matches!(body.stream_options.as_ref().and_then(|o| o.include_usage), Some(true)) {
+            // skip
+        } else {
+            // 3. 补全参数：因为 body 已经是 mut，这里可以顺利进行可变借用
+            let options = body.stream_options.get_or_insert_with(StreamOptions::default);
+            options.include_usage = Some(true);
+
+            // 4. 将修改后的 body 重新序列化为字节流
+            let new_body = serde_json::to_vec(&body).unwrap();
+            let new_size = new_body.len();
+
+            // 5. 更新 Header 中的 Content-Length
+            headers.insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from_str(&new_size.to_string()).unwrap(),
+            );
+            // 💡 提示：在 Axum 路由函数中，接下来你向下游发起请求（如用 reqwest 转发）时，
+            // 应该直接传入这个修改后的 `new_body`（或重新组装请求），不需要再找 `self` 了。
+        }
+    }
+
 
     let response = cancel
         .guard(
