@@ -192,6 +192,7 @@ pub struct PodInfo {
     pub status: String,
     pub is_ready: bool,
     pub pod_type: Option<PodType>,
+    pub tcp_port: Option<u16>,
     pub bootstrap_port: Option<u16>,
     pub is_router: bool,
     pub mesh_port: Option<u16>,
@@ -288,6 +289,12 @@ impl PodInfo {
             None
         };
 
+        let tcp_port = pod.spec.as_ref()
+            .and_then(|spec| spec.containers.first())
+            .and_then(|container| container.ports.as_ref())
+            .and_then(|ports| ports.iter().find(|p| p.protocol.as_deref() == Some("TCP")))
+            .map(|p| p.container_port as u16); // 转换
+
         let bootstrap_port = if matches!(pod_type, Some(PodType::Prefill)) {
             if let Some(config) = config {
                 pod.metadata
@@ -337,6 +344,7 @@ impl PodInfo {
             status: pod_status,
             is_ready,
             pod_type,
+            tcp_port,
             bootstrap_port,
             is_router,
             mesh_port,
@@ -350,7 +358,11 @@ impl PodInfo {
 
     pub fn worker_url(&self, port: u16) -> String {
         // Bare host:port lets DetectConnectionModeStep dual-probe HTTP and gRPC.
-        format!("{}:{}", self.ip, port)
+        if self.tcp_port.is_some() {
+            format!("{}:{}", self.ip, self.tcp_port.unwrap())
+        } else {
+            format!("{}:{}", self.ip, port)
+        }
     }
 }
 
@@ -1545,6 +1557,7 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            tcp_port: None,
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
@@ -1559,6 +1572,7 @@ mod tests {
             status: "Running".into(),
             is_ready: false,
             pod_type: None,
+            tcp_port: None,
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
@@ -1573,6 +1587,7 @@ mod tests {
             status: "Pending".into(),
             is_ready: true,
             pod_type: None,
+            tcp_port: None,
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
@@ -1592,6 +1607,7 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
+            tcp_port: None,
             bootstrap_port: Some(8081),
             is_router: false,
             mesh_port: None,
@@ -1605,6 +1621,7 @@ mod tests {
             status: "Pending".into(),
             is_ready: false,
             pod_type: Some(PodType::Decode),
+            tcp_port: None,
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
@@ -1618,6 +1635,7 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
+            tcp_port: None,
             bootstrap_port: Some(8081),
             is_router: false,
             mesh_port: None,
@@ -1641,6 +1659,7 @@ mod tests {
             status: "Pending".into(),
             is_ready: false,
             pod_type: None,
+            tcp_port: None,
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
@@ -1671,6 +1690,7 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
+            tcp_port: None,
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
@@ -1700,6 +1720,7 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
+            tcp_port: None,
             bootstrap_port: Some(8081),
             is_router: false,
             mesh_port: None,
@@ -1735,6 +1756,7 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Decode),
+            tcp_port: None,
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
@@ -1770,6 +1792,7 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
+            tcp_port: None,
             bootstrap_port: Some(8081),
             is_router: false,
             mesh_port: None,
@@ -1807,6 +1830,7 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Decode),
+            tcp_port: None,
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
@@ -1839,6 +1863,7 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Regular),
+            tcp_port: None,
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
@@ -1875,6 +1900,7 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
+            tcp_port: None,
             bootstrap_port: Some(8081),
             is_router: false,
             mesh_port: None,
@@ -1910,6 +1936,7 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Decode),
+            tcp_port: None,
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
@@ -2123,6 +2150,7 @@ mod tests {
             status: status.into(),
             is_ready,
             pod_type: Some(PodType::Regular),
+            tcp_port: None,
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
@@ -2409,6 +2437,7 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Prefill),
+            tcp_port: Some(9000),
             bootstrap_port: Some(8081),
             is_router: false,
             mesh_port: None,
@@ -2421,6 +2450,7 @@ mod tests {
             status: "Pending".into(),
             is_ready: false,
             pod_type: Some(PodType::Decode),
+            tcp_port: None,
             bootstrap_port: None,
             is_router: true,
             mesh_port: Some(9090),
@@ -2455,6 +2485,7 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Regular),
+            tcp_port: None,
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
@@ -2470,6 +2501,7 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: Some(PodType::Regular),
+            tcp_port: None,
             bootstrap_port: None,
             is_router: false,
             mesh_port: None,
