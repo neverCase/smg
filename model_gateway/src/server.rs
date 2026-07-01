@@ -310,12 +310,13 @@ async fn rerank(
         .await
 }
 
+#[axum::debug_handler]  // 👈 添加这一行
 async fn v1_rerank(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<V1RerankReqInput>,
+    ValidatedJson(body): ValidatedJson<V1RerankReqInput>,
 ) -> Response {
     let rerank_body: RerankRequest = body.into();
     if let Err(resp) = check_remote_auth(&state, &headers, &rerank_body.model).await {

@@ -1558,27 +1558,26 @@ async fn rerank_handler(
         .and_then(|d| d.as_array())
         .unwrap_or(&empty_vec);
 
-    // Create mock rerank results with scores based on document index
+    // Create mock rerank results with scores based on document index (Jina v1 format)
     let mut mock_results = Vec::new();
     for (i, doc) in documents.iter().enumerate() {
-        let score = 0.95 - (i as f32 * 0.1); // Decreasing scores
+        let relevance_score = 0.95 - (i as f32 * 0.1); // Decreasing scores
         let result = serde_json::json!({
-            "score": score,
-            "document": doc.as_str().unwrap_or(""),
             "index": i,
-            "meta_info": {
-                "confidence": if score > 0.9 { "high" } else { "medium" }
+            "relevance_score": relevance_score,
+            "document": {
+                "text": doc.as_str().unwrap_or("")
             }
         });
         mock_results.push(result);
     }
 
-    // Sort by score (highest first) to simulate proper ranking
+    // Sort by relevance_score (highest first) to simulate proper ranking
     mock_results.sort_by(|a, b| {
-        b["score"]
+        b["relevance_score"]
             .as_f64()
             .unwrap()
-            .partial_cmp(&a["score"].as_f64().unwrap())
+            .partial_cmp(&a["relevance_score"].as_f64().unwrap())
             .unwrap()
     });
 

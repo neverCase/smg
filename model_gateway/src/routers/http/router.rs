@@ -976,9 +976,25 @@ impl Router {
     ) -> anyhow::Result<Response> {
         let (_, response_body) = response.into_parts();
         let body_bytes = to_bytes(response_body, usize::MAX).await?;
-        let rerank_results = serde_json::from_slice::<Vec<RerankResult>>(&body_bytes)?;
+
+        // Try parsing as a full standard response (Jina v1 / vLLM format) first,
+        // then fall back to legacy raw array of results.
         let mut rerank_response =
-            RerankResponse::new(rerank_results, req.model.clone(), req.rid.clone());
+            if let Ok(mut full_resp) = serde_json::from_slice::<RerankResponse>(&body_bytes) {
+                // Backend returned a complete response object; override model if needed
+                if full_resp.model.is_empty() {
+                    full_resp.model = req.model.clone();
+                }
+                if full_resp.id.is_none() {
+                    full_resp.id = req.rid.clone();
+                }
+                full_resp
+            } else {
+                // Legacy format: backend returns a raw array of results
+                let rerank_results = serde_json::from_slice::<Vec<RerankResult>>(&body_bytes)?;
+                RerankResponse::new(rerank_results, req.model.clone(), req.rid.clone())
+            };
+
         // Sorting is handled by Python worker (serving_rerank.py)
         if let Some(top_k) = req.top_k {
             rerank_response.apply_top_k(top_k);

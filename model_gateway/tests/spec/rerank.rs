@@ -1,10 +1,8 @@
-use std::collections::HashMap;
-
 use openai_protocol::{
-    common::{GenerationRequest, StringOrArray, UsageInfo},
-    rerank::{RerankRequest, RerankResponse, RerankResult, V1RerankReqInput},
+    common::{GenerationRequest, StringOrArray},
+    rerank::{RerankDocument, RerankRequest, RerankResponse, RerankResult, RerankUsageInfo, V1RerankReqInput},
 };
-use serde_json::{from_str, to_string, Number, Value};
+use serde_json::{from_str, to_string};
 use validator::Validate;
 
 #[test]
@@ -184,16 +182,14 @@ fn test_rerank_request_effective_top_k_none() {
 fn test_rerank_response_creation() {
     let results = vec![
         RerankResult {
-            score: 0.8,
-            document: Some("doc1".to_string()),
+            relevance_score: 0.8,
+            document: Some(RerankDocument { text: "doc1".to_string() }),
             index: 0,
-            meta_info: None,
         },
         RerankResult {
-            score: 0.6,
-            document: Some("doc2".to_string()),
+            relevance_score: 0.6,
+            document: Some(RerankDocument { text: "doc2".to_string() }),
             index: 1,
-            meta_info: None,
         },
     ];
 
@@ -209,17 +205,14 @@ fn test_rerank_response_creation() {
         response.id,
         Some(StringOrArray::String("req-123".to_string()))
     );
-    assert_eq!(response.object, "rerank");
-    assert!(response.created > 0);
 }
 
 #[test]
 fn test_rerank_response_serialization() {
     let results = vec![RerankResult {
-        score: 0.8,
-        document: Some("doc1".to_string()),
+        relevance_score: 0.8,
+        document: Some(RerankDocument { text: "doc1".to_string() }),
         index: 0,
-        meta_info: None,
     }];
 
     let response = RerankResponse::new(
@@ -234,29 +227,25 @@ fn test_rerank_response_serialization() {
     assert_eq!(deserialized.results.len(), response.results.len());
     assert_eq!(deserialized.model, response.model);
     assert_eq!(deserialized.id, response.id);
-    assert_eq!(deserialized.object, response.object);
 }
 
 #[test]
 fn test_rerank_response_apply_top_k() {
     let results = vec![
         RerankResult {
-            score: 0.8,
-            document: Some("doc1".to_string()),
+            relevance_score: 0.8,
+            document: Some(RerankDocument { text: "doc1".to_string() }),
             index: 0,
-            meta_info: None,
         },
         RerankResult {
-            score: 0.6,
-            document: Some("doc2".to_string()),
+            relevance_score: 0.6,
+            document: Some(RerankDocument { text: "doc2".to_string() }),
             index: 1,
-            meta_info: None,
         },
         RerankResult {
-            score: 0.4,
-            document: Some("doc3".to_string()),
+            relevance_score: 0.4,
+            document: Some(RerankDocument { text: "doc3".to_string() }),
             index: 2,
-            meta_info: None,
         },
     ];
 
@@ -269,17 +258,16 @@ fn test_rerank_response_apply_top_k() {
     response.apply_top_k(2);
 
     assert_eq!(response.results.len(), 2);
-    assert_eq!(response.results[0].score, 0.8);
-    assert_eq!(response.results[1].score, 0.6);
+    assert_eq!(response.results[0].relevance_score, 0.8);
+    assert_eq!(response.results[1].relevance_score, 0.6);
 }
 
 #[test]
 fn test_rerank_response_apply_top_k_larger_than_results() {
     let results = vec![RerankResult {
-        score: 0.8,
-        document: Some("doc1".to_string()),
+        relevance_score: 0.8,
+        document: Some(RerankDocument { text: "doc1".to_string() }),
         index: 0,
-        meta_info: None,
     }];
 
     let mut response = RerankResponse::new(
@@ -296,10 +284,9 @@ fn test_rerank_response_apply_top_k_larger_than_results() {
 #[test]
 fn test_rerank_response_drop_documents() {
     let results = vec![RerankResult {
-        score: 0.8,
-        document: Some("doc1".to_string()),
+        relevance_score: 0.8,
+        document: Some(RerankDocument { text: "doc1".to_string() }),
         index: 0,
-        meta_info: None,
     }];
     let mut response = RerankResponse::new(
         results,
@@ -315,43 +302,33 @@ fn test_rerank_response_drop_documents() {
 #[test]
 fn test_rerank_result_serialization() {
     let result = RerankResult {
-        score: 0.85,
-        document: Some("test document".to_string()),
+        relevance_score: 0.85,
+        document: Some(RerankDocument { text: "test document".to_string() }),
         index: 42,
-        meta_info: Some(HashMap::from([
-            ("confidence".to_string(), Value::String("high".to_string())),
-            (
-                "processing_time".to_string(),
-                Value::Number(Number::from(150)),
-            ),
-        ])),
     };
 
     let serialized = to_string(&result).unwrap();
     let deserialized: RerankResult = from_str(&serialized).unwrap();
 
-    assert_eq!(deserialized.score, result.score);
+    assert_eq!(deserialized.relevance_score, result.relevance_score);
     assert_eq!(deserialized.document, result.document);
     assert_eq!(deserialized.index, result.index);
-    assert_eq!(deserialized.meta_info, result.meta_info);
 }
 
 #[test]
 fn test_rerank_result_serialization_without_document() {
     let result = RerankResult {
-        score: 0.85,
+        relevance_score: 0.85,
         document: None,
         index: 42,
-        meta_info: None,
     };
 
     let serialized = to_string(&result).unwrap();
     let deserialized: RerankResult = from_str(&serialized).unwrap();
 
-    assert_eq!(deserialized.score, result.score);
+    assert_eq!(deserialized.relevance_score, result.relevance_score);
     assert_eq!(deserialized.document, result.document);
     assert_eq!(deserialized.index, result.index);
-    assert_eq!(deserialized.meta_info, result.meta_info);
 }
 
 #[test]
@@ -475,10 +452,9 @@ fn test_rerank_request_rid_array() {
 #[test]
 fn test_rerank_response_with_usage_info() {
     let results = vec![RerankResult {
-        score: 0.8,
-        document: Some("doc1".to_string()),
+        relevance_score: 0.8,
+        document: Some(RerankDocument { text: "doc1".to_string() }),
         index: 0,
-        meta_info: None,
     }];
 
     let mut response = RerankResponse::new(
@@ -487,12 +463,10 @@ fn test_rerank_response_with_usage_info() {
         Some(StringOrArray::String("req-123".to_string())),
     );
 
-    response.usage = Some(UsageInfo {
-        prompt_tokens: 100,
-        completion_tokens: 50,
+    response.usage = Some(RerankUsageInfo {
         total_tokens: 150,
-        reasoning_tokens: None,
-        prompt_tokens_details: None,
+        prompt_tokens: Some(100),
+        completion_tokens: Some(50),
     });
 
     let serialized = to_string(&response).unwrap();
@@ -500,9 +474,9 @@ fn test_rerank_response_with_usage_info() {
 
     assert!(deserialized.usage.is_some());
     let usage = deserialized.usage.unwrap();
-    assert_eq!(usage.prompt_tokens, 100);
-    assert_eq!(usage.completion_tokens, 50);
     assert_eq!(usage.total_tokens, 150);
+    assert_eq!(usage.prompt_tokens, Some(100));
+    assert_eq!(usage.completion_tokens, Some(50));
 }
 
 #[test]
@@ -529,28 +503,24 @@ fn test_full_rerank_workflow() {
     // Simulate reranking results (in real scenario, this would come from the model)
     let results = vec![
         RerankResult {
-            score: 0.95,
-            document: Some("Introduction to machine learning algorithms".to_string()),
+            relevance_score: 0.95,
+            document: Some(RerankDocument { text: "Introduction to machine learning algorithms".to_string() }),
             index: 0,
-            meta_info: None,
         },
         RerankResult {
-            score: 0.87,
-            document: Some("Deep learning for computer vision".to_string()),
+            relevance_score: 0.87,
+            document: Some(RerankDocument { text: "Deep learning for computer vision".to_string() }),
             index: 1,
-            meta_info: None,
         },
         RerankResult {
-            score: 0.72,
-            document: Some("Natural language processing basics".to_string()),
+            relevance_score: 0.72,
+            document: Some(RerankDocument { text: "Natural language processing basics".to_string() }),
             index: 2,
-            meta_info: None,
         },
         RerankResult {
-            score: 0.45,
-            document: Some("Statistics and probability theory".to_string()),
+            relevance_score: 0.45,
+            document: Some(RerankDocument { text: "Statistics and probability theory".to_string() }),
             index: 3,
-            meta_info: None,
         },
     ];
 
@@ -561,9 +531,9 @@ fn test_full_rerank_workflow() {
     response.apply_top_k(request.effective_top_k());
 
     assert_eq!(response.results.len(), 2);
-    assert_eq!(response.results[0].score, 0.95);
+    assert_eq!(response.results[0].relevance_score, 0.95);
     assert_eq!(response.results[0].index, 0);
-    assert_eq!(response.results[1].score, 0.87);
+    assert_eq!(response.results[1].relevance_score, 0.87);
     assert_eq!(response.results[1].index, 1);
     assert_eq!(response.model, "rerank-model");
 

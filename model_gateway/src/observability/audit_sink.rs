@@ -268,7 +268,7 @@ impl AuditSink {
     pub fn prepare_chat(
         &self,
         path: &str,
-        headers: &axum::http::HeaderMap,
+        headers: &http::HeaderMap,
         body: &ChatCompletionRequest,
         raw_request: Bytes,
     ) -> Option<PendingAudit> {

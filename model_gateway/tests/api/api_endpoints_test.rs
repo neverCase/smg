@@ -1773,7 +1773,7 @@ mod rerank_tests {
         let results = body_json["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
 
-        assert!(results[0]["score"].as_f64().unwrap() >= results[1]["score"].as_f64().unwrap());
+        assert!(results[0]["relevance_score"].as_f64().unwrap() >= results[1]["relevance_score"].as_f64().unwrap());
 
         ctx.shutdown().await;
     }
