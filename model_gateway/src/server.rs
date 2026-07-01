@@ -170,6 +170,22 @@ async fn check_remote_auth(
             .into_response());
     };
 
+    let exists = state.router_manager
+        .as_ref().unwrap().
+        get_models_all().iter().
+        any(|card| card.id == model_id);
+    if !exists {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+            "error": {
+                "message": format!("Model '{}' not found.", model_id),
+                "type": "not_found",
+            }
+        })),
+        ).into_response());
+    }
+
     if let Err((status, msg)) = client.verify(&token, model_id).await {
         return Err((
             status,

@@ -365,6 +365,19 @@ impl RouterManager {
         }
     }
 
+    // Return all health model cards
+    pub fn get_models_all(
+        &self,
+    ) -> Vec<ModelCard> {
+        self
+            .worker_registry
+            .get_all()
+            .iter()
+            .filter(|w| !matches!(w.metadata().spec.runtime_type, RuntimeType::External))
+            .flat_map(|w| w.models())
+            .collect()
+    }
+
     /// Fan out to all healthy external upstreams concurrently with the caller's
     /// bearer token and return the first successful model inventory. Returns an
     /// empty vec on total failure.
