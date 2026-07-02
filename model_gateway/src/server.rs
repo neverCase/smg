@@ -411,13 +411,29 @@ async fn v1_embeddings(
     if let Err(resp) = check_remote_auth(&state, &headers, &body.model).await {
         return resp;
     }
-    cancel
+    let pending = state.context.audit_sink.as_ref().and_then(|sink| {
+        let raw_request = serde_json::to_vec(&body)
+            .map(bytes::Bytes::from)
+            .unwrap_or_default();
+        sink.prepare_embeddings("/v1/embeddings", &headers, &body, raw_request)
+    });
+    let response = cancel
         .guard(
             state
                 .router
                 .route_embeddings(Some(&headers), &tenant_meta, &body, &body.model),
         )
-        .await
+        .await;
+    if let Some(pending) = pending {
+        use crate::observability::audit_sink::AuditedBodyStream;
+        let (parts, body) = response.into_parts();
+        let status = parts.status.as_u16();
+        let data_stream = body.into_data_stream();
+        let wrapped = AuditedBodyStream::new(data_stream, pending, status);
+        Response::from_parts(parts, axum::body::Body::from_stream(wrapped))
+    } else {
+        response
+    }
 }
 
 async fn v1_messages(

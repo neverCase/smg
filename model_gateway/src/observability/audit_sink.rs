@@ -37,6 +37,7 @@ use futures_util::Stream;
 use metrics::counter;
 use openai_protocol::chat::ChatCompletionRequest;
 use openai_protocol::rerank::RerankRequest;
+use openai_protocol::embedding::EmbeddingRequest;
 use reqwest::Client;
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -179,7 +180,7 @@ fn serialize_bytes_as_str<S: serde::Serializer>(
 /// HTTP paths eligible for auditing. Phase 1: only chat-completions.
 #[inline]
 fn is_audited_path(path: &str) -> bool {
-    matches!(path, "/v1/chat/completions" | "/v1/rerank")
+    matches!(path, "/v1/chat/completions" | "/v1/rerank" | "/v1/embeddings")
 }
 
 /// Lock-free atomic counters exposed for tests and ops dashboards.
@@ -303,7 +304,7 @@ impl AuditSink {
         })
     }
 
-    /// Extract user/api-key/model metadata from a ChatCompletionRequest plus
+    /// Extract user/api-key/model metadata from a RerankRequest plus
     /// the incoming headers. Returns `None` when sampling / path policy says
     /// "skip".
     pub fn prepare_rerank(
@@ -311,6 +312,46 @@ impl AuditSink {
         path: &str,
         headers: &http::HeaderMap,
         body: &RerankRequest,
+        raw_request: Bytes,
+    ) -> Option<PendingAudit> {
+        if !self.should_audit(path) {
+            return None;
+        }
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let api_key = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim_start_matches("Bearer ").to_string())
+            .unwrap_or_default();
+        let user_id = body.user.clone().unwrap_or_default();
+        Some(PendingAudit {
+            sink: self.clone(),
+            request_id,
+            api_key,
+            user_id,
+            model: body.model.clone(),
+            endpoint: path.to_string(),
+            is_streaming: false,
+            raw_request,
+            start_ms: now_ms(),
+            raw_response: BytesMut::new(),
+            ttft_ms: None,
+            status_code: 0,
+        })
+    }
+
+    /// Extract user/api-key/model metadata from a EmbeddingRequest plus
+    /// the incoming headers. Returns `None` when sampling / path policy says
+    /// "skip".
+    pub fn prepare_embeddings(
+        &self,
+        path: &str,
+        headers: &http::HeaderMap,
+        body: &EmbeddingRequest,
         raw_request: Bytes,
     ) -> Option<PendingAudit> {
         if !self.should_audit(path) {
