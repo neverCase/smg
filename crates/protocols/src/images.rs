@@ -286,3 +286,53 @@ pub struct ImageFile {
     /// Original content-type of the image part (e.g. `image/png`), if the client supplied one.
     pub content_type: Option<String>,
 }
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ImageVariationRequest {
+    // image: file
+    // The image to use as the basis for the variation(s).
+    // Must be a valid PNG file, less than 4MB, and square.
+
+    // model: string or "gpt-image-1.5" or
+    // "gpt-image-1" or "gpt-image-1-mini" or "chatgpt-image-latest"
+    // The model to use for image editing.
+    pub model: String,
+
+    // n: optional number
+    // The number of edited images to generate.
+    // minimum 1, maximum 10
+    pub n: Option<u8>,
+
+    // response_format: optional "url" or "b64_json"
+    // The format in which the generated images are returned. Must be one of url or b64_json.
+    // URLs are only valid for 60 minutes after the image has been generated.
+    pub response_format: Option<String>,
+
+    // size: optional "auto" or "1024x1024" or "1536x1024" or "1024x1536"
+    // Requested output image size.
+    pub size: Option<String>,
+
+    // stream: optional boolean
+    // Stream partial image results as events.
+    pub stream: Option<bool>,
+
+    // user: optional string
+    // A unique identifier representing your end-user, which can help OpenAI monitor and detect abuse.
+    pub user: Option<String>,
+}
+
+impl GenerationRequest for ImageVariationRequest {
+    fn is_stream(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        // todo cache
+        "".to_string()
+    }
+}

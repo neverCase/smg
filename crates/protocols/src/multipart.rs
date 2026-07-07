@@ -15,7 +15,7 @@ use axum::{
 #[cfg(feature = "axum")]
 use crate::{
     transcription::{AudioFile, TranscriptionRequest},
-    images::{ImageFile, ImageEditRequest, Mask},
+    images::{ImageFile, ImageEditRequest, Mask, ImageVariationRequest},
 };
 
 /// Extractor for `/v1/audio/transcriptions` requests.
@@ -34,6 +34,12 @@ pub struct AudioTranscriptionMultipart {
 pub struct ImageEditMultipart {
     pub request: ImageEditRequest,
     pub images: Vec<ImageFile>,
+}
+
+#[cfg(feature = "axum")]
+pub struct ImageVariationMultipart {
+    pub request: ImageVariationRequest,
+    pub image: ImageFile,
 }
 
 #[cfg(feature = "axum")]
@@ -348,6 +354,118 @@ impl<S: Send + Sync> FromRequest<S> for ImageEditMultipart {
         }
 
         Ok(ImageEditMultipart { request, images })
+    }
+}
+
+#[cfg(feature = "axum")]
+impl<S: Send + Sync> FromRequest<S> for ImageVariationMultipart {
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let mut multipart = Multipart::from_request(req, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+
+        let mut images = Vec::new();
+        let mut request = ImageVariationRequest::default();
+
+        loop {
+            let field = match multipart.next_field().await {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(bad_request(format!("Failed to read multipart field: {e}")));
+                }
+            };
+
+            let name = field.name().unwrap_or("").to_string();
+            match name.as_str() {
+                "image" => {
+                    let file_name = field.file_name().map(str::to_string);
+                    let content_type = field.content_type().map(str::to_string);
+                    let bytes = field.bytes().await.map_err(|e| {
+                        bad_request(format!("Failed to read image file bytes: {e}"))
+                    })?;
+
+                    if bytes.is_empty() {
+                        return Err(bad_request("Uploaded 'image' part is empty".to_string()));
+                    }
+
+                    images.push(ImageFile {
+                        bytes,
+                        file_name: file_name.unwrap_or_else(|| "image".to_string()),
+                        content_type,
+                    });
+                },
+                "model" => {
+                    request.model = field.text().await.map_err(|e| bad_text_field("model", e))?;
+                }
+                "n" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("n", e))?;
+                    if !v.is_empty() {
+                        let n = v.trim().parse::<u8>().map_err(|_| {
+                            bad_request(format!("Invalid 'n' value: '{v}' (must be 1-10)"))
+                        })?;
+                        if !(1..=10).contains(&n) {
+                            return Err(bad_request(format!(
+                                "Invalid 'n' value: {n} (must be between 1 and 10)"
+                            )));
+                        }
+                        request.n = Some(n);
+                    }
+                }
+                "response_format" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("response_format", e))?;
+                    if !v.is_empty() {
+                        request.response_format = Some(v);
+                    }
+                }
+                "size" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("size", e))?;
+                    if !v.is_empty() {
+                        request.size = Some(v);
+                    }
+                }
+                "stream" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("stream", e))?;
+                    if !v.is_empty() {
+                        request.stream = match v.as_str() {
+                            "true" | "True" | "TRUE" | "1" => Some(true),
+                            "false" | "False" | "FALSE" | "0" => Some(false),
+                            other => {
+                                return Err(bad_request(format!(
+                                    "Invalid 'stream' value: '{other}' (expected true/false/1/0)"
+                                )));
+                            }
+                        };
+                    }
+                }
+                "user" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("user", e))?;
+                    if !v.is_empty() {
+                        request.user = Some(v);
+                    }
+                }
+                _ => {
+                    // Unknown field; drain to free resources but otherwise ignore.
+                    let _ = field.bytes().await;
+                }
+            }
+        }
+
+        // ============ 校验 ============
+        if request.model.trim().is_empty() {
+            return Err(bad_request("Missing required 'model' field".to_string()));
+        }
+        request.model = request.model.trim().to_string();
+
+
+        if images.is_empty() {
+            return Err(bad_request("Missing required 'image' part(s)".to_string()));
+        }
+        let image = images.into_iter().next().unwrap();
+        
+        Ok(ImageVariationMultipart { request, image })
     }
 }
 

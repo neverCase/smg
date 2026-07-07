@@ -46,6 +46,7 @@ pub mod tokenize;
 pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience
 pub use http::{pd_router, pd_types, router};
+use openai_protocol::images::ImageVariationRequest;
 
 /// Core trait for all router implementations
 ///
@@ -203,6 +204,27 @@ pub trait RouterTrait: Send + Sync + Debug {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Image edits not implemented",
+        )
+            .into_response()
+    }
+
+    /// Route audio transcription requests (OpenAI-compatible /v1/audio/transcriptions).
+    ///
+    /// Unlike the JSON-bodied endpoints, `/v1/audio/transcriptions` uses
+    /// multipart/form-data: the server handler parses the form, packs text
+    /// fields into `body` and the audio part into `audio`, and routers forward
+    /// both to a worker capable of audio transcription.
+    async fn route_image_variations(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _body: &ImageVariationRequest,
+        _image: ImageFile,
+        _model_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Image variations not implemented",
         )
             .into_response()
     }
