@@ -105,6 +105,7 @@ async fn detect_via_models_endpoint(
     match first_model.owned_by.as_deref() {
         Some("sglang") => Ok("sglang".to_string()),
         Some("vllm") => Ok("vllm".to_string()),
+        Some("diffusers") => Ok("vllm".to_string()),
         other => Err(format!("Unrecognized owned_by value: {other:?}")),
     }
 }

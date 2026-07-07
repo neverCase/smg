@@ -33,6 +33,7 @@ use openai_protocol::{
     rerank::RerankRequest,
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
+    images::ImageGenerationRequest,
     UNKNOWN_MODEL_ID,
 };
 use serde_json::Value;
@@ -800,6 +801,28 @@ impl RouterTrait for RouterManager {
         if let Some(router) = router {
             router
                 .route_classify(headers, tenant_meta, body, model_id)
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_image_generations(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        body: &ImageGenerationRequest,
+        model_id: &str,
+    ) -> Response {
+        let router = self.select_router_for_request(Some(model_id));
+
+        if let Some(router) = router {
+            router
+                .route_image_generations(headers, tenant_meta, body, model_id)
                 .await
         } else {
             (

@@ -24,6 +24,7 @@ use openai_protocol::{
     rerank::RerankRequest,
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
+    images::ImageGenerationRequest,
 };
 
 use crate::middleware::TenantRequestMeta;
@@ -172,6 +173,17 @@ pub trait RouterTrait: Send + Sync + Debug {
         _model_id: &str,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Classify not implemented").into_response()
+    }
+
+    /// Route images generations requests (OpenAI-compatible /v1/images/generations).
+    async fn route_image_generations(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _body: &ImageGenerationRequest,
+        _model_id: &str,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Image Generations not implemented").into_response()
     }
 
     /// Route audio transcription requests (OpenAI-compatible /v1/audio/transcriptions).

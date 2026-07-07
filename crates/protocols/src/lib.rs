@@ -33,3 +33,4 @@ pub mod tokenize;
 pub mod transcription;
 pub mod validated;
 pub mod worker;
+pub mod images;

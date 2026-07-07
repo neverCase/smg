@@ -23,6 +23,7 @@ use openai_protocol::{
     rerank::{RerankRequest, RerankResponse, RerankResult},
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
+    images::ImageGenerationRequest,
 };
 use reqwest::{
     multipart::{Form, Part},
@@ -1243,6 +1244,17 @@ impl RouterTrait for Router {
         model_id: &str,
     ) -> Response {
         self.route_typed_request(headers, body, "/v1/classify", model_id)
+            .await
+    }
+
+    async fn route_image_generations(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: &ImageGenerationRequest,
+        model_id: &str,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/images/generations", model_id)
             .await
     }
 

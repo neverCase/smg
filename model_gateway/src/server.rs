@@ -36,6 +36,7 @@ use openai_protocol::{
     worker::{
         ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerSpec, WorkerUpdateRequest,
     },
+    images::ImageGenerationRequest,
 };
 use rustls::crypto::ring;
 use serde::Deserialize;
@@ -468,6 +469,26 @@ async fn v1_classify(
                 .router
                 .route_classify(Some(&headers), &tenant_meta, &body, &body.model),
         )
+        .await
+}
+
+async fn v1_image_generations(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
+    Json(body): Json<ImageGenerationRequest>,
+) -> Response {
+    if let Err(resp) = check_remote_auth(&state, &headers, &body.model).await {
+        return resp;
+    }
+    cancel
+        .guard(state.router.route_image_generations(
+            Some(&headers),
+            &tenant_meta,
+            &body,
+            &body.model,
+        ))
         .await
 }
 
@@ -1039,12 +1060,30 @@ pub fn build_app(
         app_state.clone(),
     )
     .route_layer(axum::middleware::from_fn_with_state(
+        tenant_resolution_state.clone(),
+        middleware::route_request_meta_middleware,
+    ))
+    .route_layer(axum::middleware::from_fn_with_state(
+        auth_config.clone(),
+        middleware::auth_middleware,
+    ));
+
+    let images_routes = with_admission_layer(
+        Router::new().route("/v1/images/generations", post(v1_image_generations)),
+        &admission_mode,
+        app_state.clone(),
+    )
+    .route_layer(axum::middleware::from_fn_with_state(
         tenant_resolution_state,
         middleware::route_request_meta_middleware,
     ))
     .route_layer(axum::middleware::from_fn_with_state(
         auth_config.clone(),
         middleware::auth_middleware,
+    ))
+    .route_layer(axum::middleware::from_fn_with_state(
+        app_state.clone(),
+        middleware::wasm_middleware,
     ));
 
     let public_routes = Router::new()
@@ -1120,6 +1159,7 @@ pub fn build_app(
         .merge(protected_routes)
         .merge(realtime_routes)
         .merge(multipart_upload_routes)
+        .merge(images_routes)
         .merge(public_routes)
         .merge(admin_routes)
         .merge(worker_routes)
