@@ -13,7 +13,10 @@ use axum::{
 };
 
 #[cfg(feature = "axum")]
-use crate::transcription::{AudioFile, TranscriptionRequest};
+use crate::{
+    transcription::{AudioFile, TranscriptionRequest},
+    images::{ImageFile, ImageEditRequest, Mask},
+};
 
 /// Extractor for `/v1/audio/transcriptions` requests.
 ///
@@ -25,6 +28,12 @@ use crate::transcription::{AudioFile, TranscriptionRequest};
 pub struct AudioTranscriptionMultipart {
     pub request: TranscriptionRequest,
     pub audio: AudioFile,
+}
+
+#[cfg(feature = "axum")]
+pub struct ImageEditMultipart {
+    pub request: ImageEditRequest,
+    pub images: Vec<ImageFile>,
 }
 
 #[cfg(feature = "axum")]
@@ -152,6 +161,197 @@ impl<S: Send + Sync> FromRequest<S> for AudioTranscriptionMultipart {
 }
 
 #[cfg(feature = "axum")]
+impl<S: Send + Sync> FromRequest<S> for ImageEditMultipart {
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let mut multipart = Multipart::from_request(req, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+
+        let mut images = Vec::new();
+        let mut request = ImageEditRequest::default();
+
+        loop {
+            let field = match multipart.next_field().await {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(bad_request(format!("Failed to read multipart field: {e}")));
+                }
+            };
+
+            let name = field.name().unwrap_or("").to_string();
+            match name.as_str() {
+                // 支持 "image" 和 "image[]" 两种字段名
+                "image" | "image[]" => {
+                    let file_name = field.file_name().map(str::to_string);
+                    let content_type = field.content_type().map(str::to_string);
+                    let bytes = field.bytes().await.map_err(|e| {
+                        bad_request(format!("Failed to read image file bytes: {e}"))
+                    })?;
+
+                    if bytes.is_empty() {
+                        return Err(bad_request("Uploaded 'image' part is empty".to_string()));
+                    }
+
+                    images.push(ImageFile {
+                        bytes,
+                        file_name: file_name.unwrap_or_else(|| "image".to_string()),
+                        content_type,
+                    });
+                },
+                "prompt" => {
+                    request.prompt = field.text().await.map_err(|e| bad_text_field("prompt", e))?;
+                }
+                "model" => {
+                    request.model = field.text().await.map_err(|e| bad_text_field("model", e))?;
+                }
+                "background" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("background", e))?;
+                    if !v.is_empty() {
+                        request.background = Some(v);
+                    }
+                }
+                "input_fidelity" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("input_fidelity", e))?;
+                    if !v.is_empty() {
+                        request.input_fidelity = Some(v);
+                    }
+                }
+                "moderation" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("moderation", e))?;
+                    if !v.is_empty() {
+                        request.moderation = Some(v);
+                    }
+                }
+                "n" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("n", e))?;
+                    if !v.is_empty() {
+                        let n = v.trim().parse::<u8>().map_err(|_| {
+                            bad_request(format!("Invalid 'n' value: '{v}' (must be 1-10)"))
+                        })?;
+                        if !(1..=10).contains(&n) {
+                            return Err(bad_request(format!(
+                                "Invalid 'n' value: {n} (must be between 1 and 10)"
+                            )));
+                        }
+                        request.n = Some(n);
+                    }
+                }
+                "output_compression" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("output_compression", e))?;
+                    if !v.is_empty() {
+                        let c = v.trim().parse::<u8>().map_err(|_| {
+                            bad_request(format!("Invalid 'output_compression' value: '{v}' (must be 0-100)"))
+                        })?;
+                        if c > 100 {
+                            return Err(bad_request(format!(
+                                "Invalid 'output_compression' value: {c} (must be between 0 and 100)"
+                            )));
+                        }
+                        request.output_compression = Some(c);
+                    }
+                }
+                "output_format" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("output_format", e))?;
+                    if !v.is_empty() {
+                        request.output_format = Some(v);
+                    }
+                }
+                "partial_images" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("partial_images", e))?;
+                    if !v.is_empty() {
+                        let p = v.trim().parse::<u8>().map_err(|_| {
+                            bad_request(format!("Invalid 'partial_images' value: '{v}' (must be 0-3)"))
+                        })?;
+                        if p > 3 {
+                            return Err(bad_request(format!(
+                                "Invalid 'partial_images' value: {p} (must be between 0 and 3)"
+                            )));
+                        }
+                        request.partial_images = Some(p);
+                    }
+                }
+                "quality" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("quality", e))?;
+                    if !v.is_empty() {
+                        request.quality = Some(v);
+                    }
+                }
+                "size" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("size", e))?;
+                    if !v.is_empty() {
+                        request.size = Some(v);
+                    }
+                }
+                "stream" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("stream", e))?;
+                    if !v.is_empty() {
+                        request.stream = match v.as_str() {
+                            "true" | "True" | "TRUE" | "1" => Some(true),
+                            "false" | "False" | "FALSE" | "0" => Some(false),
+                            other => {
+                                return Err(bad_request(format!(
+                                    "Invalid 'stream' value: '{other}' (expected true/false/1/0)"
+                                )));
+                            }
+                        };
+                    }
+                }
+                "user" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("user", e))?;
+                    if !v.is_empty() {
+                        request.user = Some(v);
+                    }
+                }
+                // mask 特殊处理（需要解析 JSON）
+                "mask" => {
+                    let text = field.text().await.map_err(|e| bad_text_field("mask", e))?;
+                    if !text.is_empty() {
+                        match serde_json::from_str::<Mask>(&text) {
+                            Ok(mask) => request.mask = Some(mask),
+                            Err(e) => {
+                                return Err(bad_request(format!(
+                                    "Invalid 'mask' JSON: {e}. Expected {{\"file_id\": \"...\"}} or {{\"image_url\": \"...\"}}"
+                                )));
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // Unknown field; drain to free resources but otherwise ignore.
+                    let _ = field.bytes().await;
+                }
+            }
+        }
+
+        // ============ 校验 ============
+        if request.model.trim().is_empty() {
+            return Err(bad_request("Missing required 'model' field".to_string()));
+        }
+        request.model = request.model.trim().to_string();
+
+        if request.prompt.trim().is_empty() {
+            return Err(bad_request("Missing required 'prompt' field".to_string()));
+        }
+        request.prompt = request.prompt.trim().to_string();
+
+        if images.is_empty() {
+            return Err(bad_request("Missing required 'image' part(s)".to_string()));
+        }
+        if images.len() > 16 {
+            return Err(bad_request(format!(
+                "Too many images: {} (maximum 16)",
+                images.len()
+            )));
+        }
+
+        Ok(ImageEditMultipart { request, images })
+    }
+}
+
+#[cfg(feature = "axum")]
 fn bad_request(message: String) -> Response {
     (StatusCode::BAD_REQUEST, message).into_response()
 }
@@ -160,3 +360,4 @@ fn bad_request(message: String) -> Response {
 fn bad_text_field(field: &str, e: MultipartError) -> Response {
     bad_request(format!("Failed to read '{field}' field: {e}"))
 }
+

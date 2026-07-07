@@ -3,7 +3,7 @@ use super::common::{GenerationRequest};
 
 
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ImageGenerationRequest {
     /// Input can be a string, array of strings, tokens, or batch inputs
     pub prompt: String,
@@ -105,7 +105,7 @@ impl GenerationRequest for ImageGenerationRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        // todo
+        // todo cache
         self.prompt.clone()
     }
 }
@@ -172,4 +172,117 @@ struct ImageGenerationResponse {
     /// optional { input_tokens, input_tokens_details, output_tokens, 2 more }
     // For gpt-image-1 only, the token usage information for the image generation.
     pub usage: Option<Usage>,
+}
+
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub enum Mask {
+    FileId { file_id: String },
+    ImageUrl { image_url: String },
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ImageEditRequest {
+    // images: array of { file_id, image_url }
+    // Input image references to edit. For GPT image models, you can provide up to 16 images.
+
+    // prompt: string
+    // A text description of the desired image edit.
+    // minLength1
+    // maxLength32000
+    pub prompt: String,
+
+    // background: optional "transparent" or "opaque" or "auto"
+    // Background behavior for generated image output.
+    pub background: Option<String>,
+
+    // input_fidelity: optional "high" or "low"
+    // Controls fidelity to the original input image(s).
+    pub input_fidelity: Option<String>,
+
+    // mask: optional { file_id, image_url }
+    // Reference an input image by either URL or uploaded file ID.
+    // Provide exactly one of image_url or file_id.
+    pub mask: Option<Mask>,
+
+    // model: string or "gpt-image-1.5" or
+    // "gpt-image-1" or "gpt-image-1-mini" or "chatgpt-image-latest"
+    // The model to use for image editing.
+    pub model: String,
+
+    // moderation: optional "low" or "auto"
+    // Moderation level for GPT image models.
+    pub moderation: Option<String>,
+
+    // n: optional number
+    // The number of edited images to generate.
+    // minimum 1, maximum 10
+    pub n: Option<u8>,
+
+    // output_compression: optional number
+    // Compression level for jpeg or webp output.
+    // minimum 0, maximum 100
+    pub output_compression: Option<u8>,
+
+    // output_format: optional "png" or "jpeg" or "webp"
+    // Output image format. Supported for GPT image models.
+    pub output_format: Option<String>,
+
+    // partial_images: optional number
+    // The number of partial images to generate.
+    // This parameter is used for streaming responses that return partial images.
+    // Value must be between 0 and 3.
+    // When set to 0, the response will be a single image sent in one streaming event.
+    // Note that the final image may be sent before the full number of partial images are generated
+    // if the full image is generated more quickly.
+    // maximum3
+    // minimum0
+    pub partial_images: Option<u8>,
+
+    // quality: optional "low" or "medium" or "high" or "auto"
+    // Output quality for GPT image models.
+    pub quality: Option<String>,
+
+    // size: optional "auto" or "1024x1024" or "1536x1024" or "1024x1536"
+    // Requested output image size.
+    pub size: Option<String>,
+
+    // stream: optional boolean
+    // Stream partial image results as events.
+    pub stream: Option<bool>,
+
+    // user: optional string
+    // A unique identifier representing your end-user, which can help OpenAI monitor and detect abuse.
+    pub user: Option<String>,
+}
+
+impl GenerationRequest for ImageEditRequest {
+    fn is_stream(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        // todo cache
+        self.prompt.clone()
+    }
+}
+
+/// Binary image payload for `/v1/images/edits`.
+///
+/// The transcription endpoint uses multipart/form-data, so the file bytes
+/// travel alongside the JSON-like `TranscriptionRequest` rather than inside it.
+#[derive(Debug, Clone)]
+pub struct ImageFile {
+    /// Raw image bytes ("png" or "jpeg" or "webp").
+    pub bytes: bytes::Bytes,
+    /// Original filename from the multipart part. Forwarded verbatim to the worker.
+    pub file_name: String,
+    /// Original content-type of the image part (e.g. `image/png`), if the client supplied one.
+    pub content_type: Option<String>,
 }

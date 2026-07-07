@@ -23,7 +23,7 @@ use openai_protocol::{
     generate::GenerateRequest,
     interactions::InteractionsRequest,
     messages::CreateMessageRequest,
-    multipart::AudioTranscriptionMultipart,
+    multipart::{AudioTranscriptionMultipart, ImageEditMultipart},
     parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
@@ -488,6 +488,27 @@ async fn v1_image_generations(
             &tenant_meta,
             &body,
             &body.model,
+        ))
+        .await
+}
+
+async fn v1_image_edits(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
+    ImageEditMultipart { request, images }: ImageEditMultipart,
+) -> Response {
+    if let Err(resp) = check_remote_auth(&state, &headers, &request.model).await {
+        return resp;
+    }
+    cancel
+        .guard(state.router.route_image_edits(
+            Some(&headers),
+            &tenant_meta,
+            &request,
+            images,
+            &request.model,
         ))
         .await
 }
@@ -1055,7 +1076,9 @@ pub fn build_app(
     // routinely exceed that, so WASM middleware would reject them with 400
     // before reaching the handler.
     let multipart_upload_routes = with_admission_layer(
-        Router::new().route("/v1/audio/transcriptions", post(v1_audio_transcriptions)),
+        Router::new()
+            .route("/v1/audio/transcriptions", post(v1_audio_transcriptions))
+            .route("/v1/images/edits", post(v1_image_edits)),
         &admission_mode,
         app_state.clone(),
     )
