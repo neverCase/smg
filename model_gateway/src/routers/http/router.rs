@@ -23,7 +23,7 @@ use openai_protocol::{
     rerank::{RerankRequest, RerankResponse, RerankResult},
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
-    images::{ImageGenerationRequest, ImageEditRequest, ImageFile},
+    images::{ImageGenerationRequest, ImageEditRequest, ImageFile, ImageVariationRequest},
 };
 use reqwest::{
     multipart::{Form, Part},
@@ -2044,8 +2044,6 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
 }
 
 use async_trait::async_trait;
-use openai_protocol::images::ImageVariationRequest;
-
 #[async_trait]
 impl RouterTrait for Router {
     fn as_any(&self) -> &dyn std::any::Any {
