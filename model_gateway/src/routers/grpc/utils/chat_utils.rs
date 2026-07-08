@@ -382,7 +382,10 @@ pub fn process_chat_messages(
         let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
         let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
 
-        // Add reasoning_effort if present (like Python does)
+        // Add reasoning_effort if present (like Python does): some templates read
+        // it as a *level*. The thinking on/off projection is applied separately
+        // via `ChatTemplateParams.thinking` below, so the tokenizer sets the
+        // model's own toggle key.
         if let Some(reasoning_effort) = &request.reasoning_effort {
             combined_template_kwargs.insert(
                 "reasoning_effort".to_string(),
@@ -407,6 +410,12 @@ pub fn process_chat_messages(
             add_generation_prompt: true,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
+            // Project OpenAI `reasoning_effort` (none/minimal) onto the model's
+            // thinking toggle; the tokenizer applies it under the correct key.
+            // An explicit chat_template_kwargs toggle still wins (in apply).
+            thinking: openai_protocol::chat::thinking_from_reasoning_effort(
+                request.reasoning_effort.as_deref(),
+            ),
             ..Default::default()
         };
 

@@ -7,7 +7,7 @@
 use std::{
     collections::HashMap,
     fs::{read_dir, remove_file, OpenOptions},
-    io::{BufWriter, Write},
+    io::Write,
     path::{Path, PathBuf},
     process,
     sync::{
@@ -18,6 +18,9 @@ use std::{
 };
 
 use futures_util::StreamExt;
+use memmap2::MmapOptions;
+#[cfg(target_os = "linux")]
+use rustix::fs::FallocateFlags;
 use smg_grpc_client::{
     mlx_engine::AbortOnDropStream as MlxStream,
     mlx_proto::{self as mlx},
@@ -32,6 +35,17 @@ use smg_grpc_client::{
     vllm_engine::AbortOnDropStream as VllmStream,
     vllm_proto::{self as vllm, generate_complete::MatchedStop as VllmMatchedStop},
 };
+
+/// Backend-neutral encode->prefill bootstrap info for one multimodal item.
+///
+/// Backend wrappers translate this into their own proto shape when supported.
+#[derive(Clone, Debug)]
+pub(crate) struct EncodeItemBootstrapInfo {
+    pub item_index: u32,
+    pub bootstrap_host: String,
+    pub bootstrap_port: i32,
+    pub bootstrap_room: i64,
+}
 
 // =====================
 // Multimodal Data
@@ -257,7 +271,8 @@ impl TrtllmMultimodalData {
 }
 
 impl TokenSpeedMultimodalData {
-    /// Convert to TokenSpeed proto MultimodalInputs.
+    /// Convert to TokenSpeed proto MultimodalInputs. The EPD prefill leg drops
+    /// each item's encoder_input afterward via `clear_mm_pixel_values`.
     pub fn into_proto(self) -> tokenspeed::MultimodalInputs {
         let shm_enabled = self.shm_enabled;
         let items = self
@@ -283,6 +298,8 @@ impl TokenSpeedMultimodalItem {
             .map(|(k, v)| (k, tensor_bytes_to_tokenspeed(v, shm_enabled)))
             .collect::<HashMap<_, _>>();
 
+        let encoder_input = Some(tokenspeed_tensor_to_proto(self.encoder_input, shm_enabled));
+
         tokenspeed::MultimodalItem {
             modality: match self.modality {
                 TokenSpeedModality::Image => tokenspeed::Modality::Image as i32,
@@ -290,7 +307,7 @@ impl TokenSpeedMultimodalItem {
                 TokenSpeedModality::Video => tokenspeed::Modality::Video as i32,
             },
             content_hash: self.content_hash,
-            encoder_input: Some(tokenspeed_tensor_to_proto(self.encoder_input, shm_enabled)),
+            encoder_input,
             model_specific_tensors,
             placeholders,
             placeholder_token_id: self.placeholder_token_id,
@@ -416,7 +433,10 @@ pub fn tokenspeed_mm_shm_min_bytes() -> usize {
 static TOKENSPEED_SHM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn write_tokenspeed_shm(data: &[u8]) -> std::io::Result<tokenspeed::ShmHandle> {
-    write_tokenspeed_shm_with(data.len(), |file| file.write_all(data))
+    write_tokenspeed_shm_with(data.len(), |output| {
+        output.copy_from_slice(data);
+        Ok(())
+    })
 }
 
 /// Whether SMG can actually create+write files under `/dev/shm`. Probed once;
@@ -500,38 +520,38 @@ fn sweep_orphan_tokenspeed_shm_once() {
 // ShmTensorHandle offset support + a per-segment refcount so the segment is
 // unlinked exactly once after all its tensors are consumed. Cleanliness / fewer
 // files, not a measured speed win (tmpfs makes per-file syscalls negligible).
+#[expect(
+    unsafe_code,
+    reason = "mapping a new, exclusively owned, fixed-length SHM file"
+)]
 pub fn write_tokenspeed_shm_with(
     nbytes: usize,
-    write_fn: impl FnOnce(&mut BufWriter<std::fs::File>) -> std::io::Result<()>,
+    write_fn: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
 ) -> std::io::Result<tokenspeed::ShmHandle> {
     sweep_orphan_tokenspeed_shm_once();
     let name = next_tokenspeed_shm_name();
     let path = tokenspeed_shm_path(&name);
     // create_new (no clobber) + owner-only mode in world-writable /dev/shm.
     let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
+    opts.read(true).write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
     let file = opts.open(&path)?;
-    let mut writer = BufWriter::new(file);
-    if let Err(error) = write_fn(&mut writer) {
-        drop(writer);
-        let _ = remove_file(&path);
-        return Err(error);
-    }
-    if let Err(error) = writer.flush().and_then(|()| {
-        if writer.get_ref().metadata()?.len() != nbytes as u64 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "TokenSpeed SHM writer produced an unexpected byte length",
-            ));
-        }
-        Ok(())
-    }) {
-        drop(writer);
+    let result = if nbytes == 0 {
+        write_fn(&mut [])
+    } else {
+        reserve_tokenspeed_shm_file(&file, nbytes).and_then(|()| {
+            // SAFETY: this process exclusively owns the newly created file,
+            // reserves its full length before mapping, and does not expose or
+            // truncate it until the callback and mapping have both dropped.
+            let mut mapping = unsafe { MmapOptions::new().len(nbytes).map_mut(&file)? };
+            write_fn(&mut mapping)
+        })
+    };
+    if let Err(error) = result {
         let _ = remove_file(&path);
         return Err(error);
     }
@@ -542,6 +562,24 @@ pub fn write_tokenspeed_shm_with(
         nbytes: nbytes as u64,
         owner_id: format!("smg:{}", process::id()),
     })
+}
+
+#[cfg(target_os = "linux")]
+fn reserve_tokenspeed_shm_file(file: &std::fs::File, nbytes: usize) -> std::io::Result<()> {
+    match rustix::fs::fallocate(file, FallocateFlags::empty(), 0, nbytes as u64) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error == rustix::io::Errno::OPNOTSUPP || error == rustix::io::Errno::NOSYS =>
+        {
+            file.set_len(nbytes as u64)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reserve_tokenspeed_shm_file(file: &std::fs::File, nbytes: usize) -> std::io::Result<()> {
+    file.set_len(nbytes as u64)
 }
 
 pub fn collect_tokenspeed_multimodal_inputs_shm_handles(
@@ -970,17 +1008,21 @@ impl ProtoGenerateRequest {
         self.clone()
     }
 
-    /// Strip multimodal inputs from the request.
+    /// Drop raw multimodal encoder tensors while keeping item metadata.
     ///
-    /// Used for the decode worker in PD disaggregation — the decode worker only
-    /// needs the KV cache from prefill, not the image pixel data. This avoids
-    /// transmitting ~40MB of pixel tensors to a worker that ignores them.
-    pub fn clear_mm_inputs(&mut self) {
+    /// Used by the EPD prefill leg: image embeddings arrive from encode workers,
+    /// but prefill still needs placeholders/model-specific metadata to slot them.
+    pub fn clear_mm_pixel_values(&mut self) {
         match self {
             Self::Sglang(req) => req.mm_inputs = None,
             Self::Vllm(req) => req.mm_inputs = None,
-            Self::TokenSpeed(req) => req.mm_inputs = None,
-            // TRT-LLM and MLX protos have no mm_inputs field
+            Self::TokenSpeed(req) => {
+                if let Some(mm) = req.mm_inputs.as_mut() {
+                    for item in &mut mm.items {
+                        item.encoder_input = None;
+                    }
+                }
+            }
             Self::Trtllm(_) | Self::Mlx(_) => {}
         }
     }
@@ -1041,6 +1083,64 @@ impl ProtoGenerateRequest {
             Self::Vllm(req) => req.kv_transfer_params_json = Some(json),
             Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
                 tracing::warn!("set_kv_transfer_params_json called on non-vLLM request, ignoring");
+            }
+        }
+    }
+
+    /// Set encode->prefill bootstrap info for backends that receive image embeddings
+    /// out-of-band from encode workers.
+    pub(crate) fn set_encode_bootstrap_info(&mut self, items: Vec<EncodeItemBootstrapInfo>) {
+        match self {
+            Self::TokenSpeed(req) => {
+                let items = items
+                    .into_iter()
+                    .map(|item| tokenspeed::EncodeItemBootstrapInfo {
+                        item_index: item.item_index,
+                        bootstrap_host: item.bootstrap_host,
+                        bootstrap_port: item.bootstrap_port,
+                        bootstrap_room: item.bootstrap_room,
+                    })
+                    .collect();
+                req.encode_bootstrap_info = Some(tokenspeed::EncodeBootstrapInfo { items });
+            }
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => {
+                tracing::warn!(
+                    "set_encode_bootstrap_info called on a backend without encode bootstrap info, ignoring"
+                );
+            }
+        }
+    }
+
+    /// Clear prefill-only encode bootstrap info from the decode-side request.
+    pub(crate) fn clear_encode_bootstrap_info(&mut self) {
+        match self {
+            Self::TokenSpeed(req) => req.encode_bootstrap_info = None,
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => {}
+        }
+    }
+
+    /// Set the PD prefill->decode KV rendezvous params (TokenSpeed only).
+    ///
+    /// The gateway sends identical params to both the prefill and decode worker:
+    /// the prefill hosts the Mooncake bootstrap server at (`bootstrap_host`,
+    /// `bootstrap_port`) and the decode worker discovers it there, keyed by
+    /// `bootstrap_room`.
+    pub fn set_kv_bootstrap_info(
+        &mut self,
+        bootstrap_host: String,
+        bootstrap_port: i32,
+        bootstrap_room: i64,
+    ) {
+        match self {
+            Self::TokenSpeed(req) => {
+                req.kv_bootstrap_info = Some(tokenspeed::KvBootstrapInfo {
+                    bootstrap_host,
+                    bootstrap_port,
+                    bootstrap_room,
+                });
+            }
+            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => {
+                tracing::warn!("set_kv_bootstrap_info called on non-TokenSpeed request, ignoring");
             }
         }
     }
@@ -1875,6 +1975,22 @@ mod tests {
             }
             _ => panic!("expected shm TensorData payload"),
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn tokenspeed_shm_writer_exposes_complete_mapped_payload() {
+        let expected = [0x12, 0x34, 0x56, 0x78];
+        let handle = write_tokenspeed_shm_with(expected.len(), |output| {
+            output.copy_from_slice(&expected);
+            Ok(())
+        })
+        .unwrap();
+        let payload = std::fs::read(tokenspeed_shm_path(&handle.name));
+        cleanup_tokenspeed_shm_handles(std::slice::from_ref(&handle));
+
+        assert_eq!(payload.unwrap(), expected);
+        assert!(!tokenspeed_shm_path(&handle.name).exists());
     }
 
     fn inline_tensor_data(tensor: &tokenspeed::TensorData) -> &[u8] {

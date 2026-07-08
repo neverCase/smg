@@ -11,7 +11,6 @@
 
 use std::{
     collections::HashMap,
-    io::Write,
     mem::size_of,
     path::Path,
     sync::{Arc, OnceLock},
@@ -27,12 +26,13 @@ use llm_multimodal::{
     PromptReplacement, TrackedMedia, TrackerOutput, VideoClip, VisionProcessorRegistry,
 };
 use llm_tokenizer::TokenizerTrait;
-use ndarray::{ArrayD, Axis, Slice};
+use ndarray::{ArrayD, ArrayViewD, Axis, Slice};
 use openai_protocol::{
     chat::{ChatMessage, MessageContent},
     common::ContentPart,
     messages::{ImageSource, InputContent, InputContentBlock, InputMessage, Role},
 };
+use rayon::prelude::*;
 use tracing::{debug, info, warn};
 
 use crate::routers::grpc::{
@@ -673,13 +673,13 @@ async fn process_multimodal_parts(
             .unwrap_or_else(|| model_config.preprocessor_config.clone()),
         _ => model_config.preprocessor_config.clone(),
     };
+    let preprocess_started = Instant::now();
+
     let registry = components.vision_processor_registry.clone();
     let model_id_owned = model_id.to_string();
     let model_type_owned = model_type.map(String::from);
     let images_for_preprocess = images.clone(); // cheap Arc refcount bumps
     let videos_for_preprocess = videos.clone(); // cheap Arc refcount bumps
-
-    let preprocess_started = Instant::now();
     let preprocessed: PreprocessedEncoderInputs = tokio::task::spawn_blocking(move || {
         let processor = registry
             .find(&model_id_owned, model_type_owned.as_deref())
@@ -945,14 +945,33 @@ fn expand_tokens(
 /// Assemble backend-specific multimodal data from the intermediate.
 ///
 /// Called in request_building after worker selection, when the backend is known.
+pub(crate) async fn assemble_multimodal_data(
+    intermediate: MultimodalIntermediate,
+    client: &GrpcClient,
+    workers: Option<&WorkerSelection>,
+) -> Result<MultimodalData> {
+    assemble_multimodal_data_impl(intermediate, client, workers, false).await
+}
+
+/// Assemble multimodal data for a prefill request whose item embeddings will
+/// arrive out-of-band from encode workers.
+pub(crate) async fn assemble_multimodal_data_after_encode(
+    intermediate: MultimodalIntermediate,
+    client: &GrpcClient,
+    workers: Option<&WorkerSelection>,
+) -> Result<MultimodalData> {
+    assemble_multimodal_data_impl(intermediate, client, workers, true).await
+}
+
 #[expect(
     clippy::unreachable,
     reason = "MLX multimodal rejected by caller before reaching here"
 )]
-pub(crate) fn assemble_multimodal_data(
+async fn assemble_multimodal_data_impl(
     intermediate: MultimodalIntermediate,
     client: &GrpcClient,
     workers: Option<&WorkerSelection>,
+    omit_prefill_pixels: bool,
 ) -> Result<MultimodalData> {
     match intermediate {
         MultimodalIntermediate::Precomputed(precomputed) => match client {
@@ -968,14 +987,50 @@ pub(crate) fn assemble_multimodal_data(
                 ensure_image_only(&precomputed, "TRT-LLM")?;
                 Ok(MultimodalData::Trtllm(assemble_trtllm(precomputed)))
             }
-            GrpcClient::TokenSpeed(_) => Ok(MultimodalData::TokenSpeed(assemble_tokenspeed(
-                precomputed,
-                workers,
-            )?)),
+            GrpcClient::TokenSpeed(_) => {
+                let options =
+                    tokenspeed_assembly_options(precomputed.modality, workers, omit_prefill_pixels);
+                let pending = tokio::task::spawn_blocking(move || {
+                    assemble_tokenspeed_with_options(&precomputed, options)
+                        .map(PendingTokenSpeedAssembly::new)
+                })
+                .await
+                .context("TokenSpeed multimodal assembly task failed")??;
+                Ok(MultimodalData::TokenSpeed(pending.into_inner()?))
+            }
             GrpcClient::Mlx(_) => unreachable!(
                 "caller rejects multimodal for MLX in build_chat_request/build_messages_request"
             ),
         },
+    }
+}
+
+/// Owns SHM-backed assembly output until the awaiting task accepts it.
+///
+/// Dropping a `spawn_blocking` join handle does not cancel its task. If the
+/// request future is cancelled, Tokio drops the completed task output instead;
+/// this guard unlinks any SHM files before that output is discarded.
+struct PendingTokenSpeedAssembly {
+    data: Option<TokenSpeedMultimodalData>,
+}
+
+impl PendingTokenSpeedAssembly {
+    fn new(data: TokenSpeedMultimodalData) -> Self {
+        Self { data: Some(data) }
+    }
+
+    fn into_inner(mut self) -> Result<TokenSpeedMultimodalData> {
+        self.data
+            .take()
+            .context("pending TokenSpeed assembly is missing data")
+    }
+}
+
+impl Drop for PendingTokenSpeedAssembly {
+    fn drop(&mut self) {
+        if let Some(data) = &self.data {
+            cleanup_tokenspeed_items_encoder_shm(&data.items, None);
+        }
     }
 }
 
@@ -1056,18 +1111,45 @@ fn assemble_trtllm(intermediate: PrecomputedMultimodalIntermediate) -> TrtllmMul
     TrtllmMultimodalData { image_data }
 }
 
-fn assemble_tokenspeed(
-    intermediate: PrecomputedMultimodalIntermediate,
+pub(crate) fn assemble_tokenspeed(
+    intermediate: &PrecomputedMultimodalIntermediate,
     workers: Option<&WorkerSelection>,
+    skip_pixel_values: bool,
+) -> Result<TokenSpeedMultimodalData> {
+    let options = tokenspeed_assembly_options(intermediate.modality, workers, skip_pixel_values);
+    assemble_tokenspeed_with_options(intermediate, options)
+}
+
+struct TokenSpeedAssemblyOptions {
+    shm_enabled: bool,
+    encoder_input_dtype: String,
+    skip_pixel_values: bool,
+}
+
+fn tokenspeed_assembly_options(
+    modality: Modality,
+    workers: Option<&WorkerSelection>,
+    skip_pixel_values: bool,
+) -> TokenSpeedAssemblyOptions {
+    TokenSpeedAssemblyOptions {
+        shm_enabled: resolve_tokenspeed_shm_enabled(workers, skip_pixel_values),
+        encoder_input_dtype: tokenspeed_encoder_input_dtype(modality, workers),
+        skip_pixel_values,
+    }
+}
+
+fn assemble_tokenspeed_with_options(
+    intermediate: &PrecomputedMultimodalIntermediate,
+    options: TokenSpeedAssemblyOptions,
 ) -> Result<TokenSpeedMultimodalData> {
     let log_timing = log_mm_timing_enabled();
     let total_started = Instant::now();
-    // Resolve the multimodal tensor transport once per request: `shm` always on,
-    // `auto` only when the worker is verified to share /dev/shm (matching
-    // namespace token), otherwise inline. See `worker_shares_dev_shm`.
-    let shm_enabled = resolve_tokenspeed_shm_enabled(workers);
+    let TokenSpeedAssemblyOptions {
+        shm_enabled,
+        encoder_input_dtype,
+        skip_pixel_values,
+    } = options;
     // Use patch-only offsets when available and non-empty; fall back to full structural ranges.
-    let encoder_input_dtype = tokenspeed_encoder_input_dtype(intermediate.modality, workers);
     let patch_offsets = intermediate
         .patch_offsets
         .clone()
@@ -1081,7 +1163,7 @@ fn assemble_tokenspeed(
         Modality::ImageEmbeds => TokenSpeedModality::Image,
     };
 
-    let item_count = precomputed_multimodal_item_count(&intermediate)?;
+    let item_count = precomputed_multimodal_item_count(intermediate)?;
     // Build items imperatively so that if any step fails partway we can unlink
     // the /dev/shm segments already created for prior items' encoder inputs
     // (and this item's, once created). `?`/`collect` would drop those
@@ -1089,23 +1171,30 @@ fn assemble_tokenspeed(
     // cleanup, leaking files until the next sweep.
     let mut items: Vec<TokenSpeedMultimodalItem> = Vec::with_capacity(item_count);
     for item_index in 0..item_count {
-        let item_encoder_input = match encoder_input_for_item(
-            &intermediate.preprocessed,
-            &intermediate.field_layouts,
-            item_index,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                cleanup_tokenspeed_items_encoder_shm(&items, None);
-                return Err(error);
-            }
-        };
         let encoder_input_started = Instant::now();
-        let encoder_input = serialize_array_as_tokenspeed_tensor(
-            &item_encoder_input,
-            &encoder_input_dtype,
-            shm_enabled,
-        );
+        // EPD prefill: the embedding arrives over Mooncake and this item's
+        // encoder_input is stripped downstream (clear_mm_pixel_values), so skip
+        // the per-item slice + serialize entirely when skip_pixel_values is set.
+        let encoder_input = if skip_pixel_values {
+            TokenSpeedTensor::inline(Vec::new(), Vec::new(), encoder_input_dtype.clone())
+        } else {
+            let item_encoder_input = match encoder_input_for_item(
+                &intermediate.preprocessed,
+                &intermediate.field_layouts,
+                item_index,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    cleanup_tokenspeed_items_encoder_shm(&items, None);
+                    return Err(error);
+                }
+            };
+            serialize_array_as_tokenspeed_tensor(
+                &item_encoder_input,
+                &encoder_input_dtype,
+                shm_enabled,
+            )
+        };
         let encoder_input_serialize_ms = encoder_input_started.elapsed().as_secs_f64() * 1000.0;
         let model_specific_started = Instant::now();
         let model_specific_tensors = match serialize_model_specific_for_item(
@@ -1124,7 +1213,7 @@ fn assemble_tokenspeed(
         let model_specific_serialize_ms = model_specific_started.elapsed().as_secs_f64() * 1000.0;
         let mm_placeholders =
             placeholders_for_item(item_index, &intermediate.placeholders, &patch_offsets);
-        let content_hash = content_hash_for_item(intermediate.modality, &intermediate, item_index);
+        let content_hash = content_hash_for_item(intermediate.modality, intermediate, item_index);
 
         if log_timing {
             info!(
@@ -1197,11 +1286,20 @@ fn precomputed_multimodal_item_count(
     Ok(item_count)
 }
 
-fn encoder_input_for_item(
-    preprocessed: &PreprocessedEncoderInputs,
+pub(crate) fn precomputed_encode_routing_hashes(
+    intermediate: &PrecomputedMultimodalIntermediate,
+) -> Result<Vec<Vec<u8>>> {
+    let item_count = precomputed_multimodal_item_count(intermediate)?;
+    Ok((0..item_count)
+        .map(|item_index| content_hash_for_item(intermediate.modality, intermediate, item_index))
+        .collect())
+}
+
+fn encoder_input_for_item<'a>(
+    preprocessed: &'a PreprocessedEncoderInputs,
     field_layouts: &HashMap<String, FieldLayout>,
     item_index: usize,
-) -> Result<ArrayD<f32>> {
+) -> Result<ArrayViewD<'a, f32>> {
     // The field layout key remains "pixel_values" because it mirrors the
     // HuggingFace/vLLM vision kwargs contract. Internally this tensor is the
     // modality encoder input we pass to TokenSpeed.
@@ -1289,7 +1387,7 @@ fn content_hash_for_item(
     }
 }
 
-fn slice_array_axis0(array: &ArrayD<f32>, start: usize, len: usize) -> Result<ArrayD<f32>> {
+fn slice_array_axis0(array: &ArrayD<f32>, start: usize, len: usize) -> Result<ArrayViewD<'_, f32>> {
     let end = start
         .checked_add(len)
         .ok_or_else(|| anyhow::anyhow!("array slice range overflow"))?;
@@ -1298,9 +1396,7 @@ fn slice_array_axis0(array: &ArrayD<f32>, start: usize, len: usize) -> Result<Ar
         end <= rows,
         "array first-dimension slice {start}..{end} exceeds {rows}"
     );
-    Ok(array
-        .slice_axis(Axis(0), Slice::from(start..end))
-        .to_owned())
+    Ok(array.slice_axis(Axis(0), Slice::from(start..end)))
 }
 
 fn tensor_sizes_from_model_specific(
@@ -1340,10 +1436,10 @@ fn hash_hex_strings<'a>(hashes: impl Iterator<Item = &'a str>) -> Vec<u8> {
 
 /// Serialize the primary encoder input ndarray to raw little-endian f32 bytes + shape.
 fn serialize_encoder_input(preprocessed: &PreprocessedEncoderInputs) -> (Vec<u8>, Vec<u32>) {
-    serialize_array(&preprocessed.encoder_input)
+    serialize_array(&preprocessed.encoder_input.view())
 }
 
-fn serialize_array(encoder_input: &ArrayD<f32>) -> (Vec<u8>, Vec<u32>) {
+fn serialize_array(encoder_input: &ArrayViewD<'_, f32>) -> (Vec<u8>, Vec<u32>) {
     let encoder_bytes: Vec<u8> = if let Some(encoder_slice) = encoder_input
         // Fast path only for C-contiguous arrays, whose memory order equals
         // logical (row-major) order. A non-C-contiguous array (e.g. a
@@ -1374,7 +1470,7 @@ fn serialize_array(encoder_input: &ArrayD<f32>) -> (Vec<u8>, Vec<u32>) {
 
 /// Serialize encoder input to the requested wire dtype.
 fn serialize_array_as_tokenspeed_tensor(
-    encoder_input: &ArrayD<f32>,
+    encoder_input: &ArrayViewD<'_, f32>,
     dtype: &str,
     shm_enabled: bool,
 ) -> TokenSpeedTensor {
@@ -1400,8 +1496,8 @@ fn serialize_array_as_tokenspeed_tensor(
 
     if shm_enabled && nbytes >= tokenspeed_mm_shm_min_bytes() {
         let started = Instant::now();
-        match write_tokenspeed_shm_with(nbytes, |file| {
-            write_array_as_dtype(file, encoder_input, &dtype)
+        match write_tokenspeed_shm_with(nbytes, |output| {
+            fill_array_as_dtype(output, encoder_input, &dtype)
         }) {
             Ok(handle) => {
                 if log_mm_timing_enabled() {
@@ -1430,15 +1526,36 @@ fn serialize_array_as_tokenspeed_tensor(
     TokenSpeedTensor::inline(data, shape, dtype)
 }
 
-fn write_array_as_dtype(
-    writer: &mut impl Write,
-    encoder_input: &ArrayD<f32>,
+fn fill_array_as_dtype(
+    output: &mut [u8],
+    encoder_input: &ArrayViewD<'_, f32>,
     dtype: &str,
 ) -> std::io::Result<()> {
+    let element_size = if dtype == "bfloat16" || dtype == "float16" {
+        size_of::<u16>()
+    } else {
+        size_of::<f32>()
+    };
+    if output.len() != encoder_input.len() * element_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "encoder input output buffer has an unexpected byte length",
+        ));
+    }
+
     match dtype {
-        "float32" => write_array_as_f32(writer, encoder_input),
-        "bfloat16" => write_array_as_u16(writer, encoder_input, f32_to_bf16_bits),
-        "float16" => write_array_as_u16(writer, encoder_input, f32_to_f16_bits),
+        "float32" => {
+            fill_array_as_f32_bytes(output, encoder_input);
+            Ok(())
+        }
+        "bfloat16" => {
+            fill_array_as_u16_bytes(output, encoder_input, f32_to_bf16_bits);
+            Ok(())
+        }
+        "float16" => {
+            fill_array_as_u16_bytes(output, encoder_input, f32_to_f16_bits);
+            Ok(())
+        }
         other => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("unsupported TokenSpeed encoder input dtype: {other}"),
@@ -1446,7 +1563,7 @@ fn write_array_as_dtype(
     }
 }
 
-fn write_array_as_f32(writer: &mut impl Write, encoder_input: &ArrayD<f32>) -> std::io::Result<()> {
+fn fill_array_as_f32_bytes(output: &mut [u8], encoder_input: &ArrayViewD<'_, f32>) {
     if let Some(encoder_slice) = encoder_input
         // Fast path only for C-contiguous arrays, whose memory order equals
         // logical (row-major) order. A non-C-contiguous array (e.g. a
@@ -1455,97 +1572,42 @@ fn write_array_as_f32(writer: &mut impl Write, encoder_input: &ArrayD<f32>) -> s
         // because it would serialize such arrays in the wrong dimension order.
         .as_slice()
     {
-        return write_f32_slice(writer, encoder_slice);
-    }
-
-    for value in encoder_input {
-        writer.write_all(&value.to_le_bytes())?;
-    }
-    Ok(())
-}
-
-fn write_f32_slice(writer: &mut impl Write, values: &[f32]) -> std::io::Result<()> {
-    #[cfg(target_endian = "little")]
-    {
-        writer.write_all(bytemuck::cast_slice(values))
-    }
-    #[cfg(not(target_endian = "little"))]
-    {
-        for value in values {
-            writer.write_all(&value.to_le_bytes())?;
-        }
-        Ok(())
-    }
-}
-
-fn write_array_as_u16<F>(
-    writer: &mut impl Write,
-    encoder_input: &ArrayD<f32>,
-    convert: F,
-) -> std::io::Result<()>
-where
-    F: Fn(f32) -> u16 + Copy,
-{
-    // Convert in bounded chunks so peak memory stays at ~CHUNK_VALUES u16s
-    // regardless of tensor size, on both the contiguous and strided paths.
-    const CHUNK_VALUES: usize = 256 * 1024;
-
-    if let Some(encoder_slice) = encoder_input
-        // Fast path only for C-contiguous arrays, whose memory order equals
-        // logical (row-major) order. A non-C-contiguous array (e.g. a
-        // Fortran-contiguous view) falls through to logical `.iter()` below;
-        // `as_slice_memory_order()` is deliberately NOT used as a fallback
-        // because it would serialize such arrays in the wrong dimension order.
-        .as_slice()
-    {
-        let mut converted: Vec<u16> = Vec::with_capacity(CHUNK_VALUES.min(encoder_slice.len()));
-        for chunk in encoder_slice.chunks(CHUNK_VALUES) {
-            converted.clear();
-            converted.extend(chunk.iter().map(|&value| convert(value)));
-            #[cfg(target_endian = "little")]
-            {
-                writer.write_all(bytemuck::cast_slice(converted.as_slice()))?;
-            }
-            #[cfg(not(target_endian = "little"))]
-            {
-                for value in &converted {
-                    writer.write_all(&value.to_le_bytes())?;
-                }
-            }
-        }
-        return Ok(());
-    }
-
-    let mut converted = Vec::with_capacity(CHUNK_VALUES);
-    let mut flush = |converted: &mut Vec<u16>| -> std::io::Result<()> {
-        if converted.is_empty() {
-            return Ok(());
-        }
         #[cfg(target_endian = "little")]
-        {
-            writer.write_all(bytemuck::cast_slice(converted.as_slice()))?;
-        }
+        output.copy_from_slice(bytemuck::cast_slice(encoder_slice));
         #[cfg(not(target_endian = "little"))]
-        {
-            for value in converted.iter() {
-                writer.write_all(&value.to_le_bytes())?;
-            }
-        }
-        converted.clear();
-        Ok(())
-    };
-
-    for &value in encoder_input {
-        converted.push(convert(value));
-        if converted.len() == CHUNK_VALUES {
-            flush(&mut converted)?;
-        }
+        fill_f32_values_as_bytes(output, encoder_slice.iter().copied());
+        return;
     }
-    flush(&mut converted)
+
+    fill_f32_values_as_bytes(output, encoder_input.iter().copied());
+}
+
+fn fill_f32_values_as_bytes(output: &mut [u8], values: impl IntoIterator<Item = f32>) {
+    for (output, value) in output.chunks_exact_mut(size_of::<f32>()).zip(values) {
+        output.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn fill_array_as_u16_bytes<F>(output: &mut [u8], encoder_input: &ArrayViewD<'_, f32>, convert: F)
+where
+    F: Fn(f32) -> u16 + Copy + Send + Sync,
+{
+    if let Some(encoder_slice) = encoder_input
+        // Fast path only for C-contiguous arrays, whose memory order equals
+        // logical (row-major) order. A non-C-contiguous array (e.g. a
+        // Fortran-contiguous view) falls through to logical `.iter()` below;
+        // `as_slice_memory_order()` is deliberately NOT used as a fallback
+        // because it would serialize such arrays in the wrong dimension order.
+        .as_slice()
+    {
+        fill_f32_slice_as_u16_bytes(output, encoder_slice, convert);
+    } else {
+        fill_f32_values_as_u16_bytes(output, encoder_input.iter().copied(), convert);
+    }
 }
 
 fn serialize_array_as_dtype(
-    encoder_input: &ArrayD<f32>,
+    encoder_input: &ArrayViewD<'_, f32>,
     dtype: &str,
 ) -> (Vec<u8>, Vec<u32>, String) {
     match canonical_float_dtype(dtype).as_deref() {
@@ -1574,37 +1636,55 @@ fn serialize_array_as_dtype(
     }
 }
 
-fn serialize_array_as_u16_bytes<F>(encoder_input: &ArrayD<f32>, convert: F) -> Vec<u8>
+fn serialize_array_as_u16_bytes<F>(encoder_input: &ArrayViewD<'_, f32>, convert: F) -> Vec<u8>
 where
-    F: Fn(f32) -> u16 + Copy,
+    F: Fn(f32) -> u16 + Copy + Send + Sync,
 {
     let element_count = encoder_input.len();
-    let mut converted = Vec::with_capacity(element_count);
+    let mut bytes = vec![0u8; element_count * size_of::<u16>()];
+    fill_array_as_u16_bytes(&mut bytes, encoder_input, convert);
+    bytes
+}
 
-    if let Some(encoder_slice) = encoder_input
-        // Fast path only for C-contiguous arrays, whose memory order equals
-        // logical (row-major) order. A non-C-contiguous array (e.g. a
-        // Fortran-contiguous view) falls through to logical `.iter()` below;
-        // `as_slice_memory_order()` is deliberately NOT used as a fallback
-        // because it would serialize such arrays in the wrong dimension order.
-        .as_slice()
-    {
-        converted.extend(encoder_slice.iter().map(|&value| convert(value)));
+fn fill_f32_slice_as_u16_bytes<F>(bytes: &mut [u8], values: &[f32], convert: F)
+where
+    F: Fn(f32) -> u16 + Copy + Send + Sync,
+{
+    debug_assert_eq!(bytes.len(), values.len() * size_of::<u16>());
+    const MIN_OUTPUT_BYTES: usize = 1 << 19;
+    const MIN_VALUES_PER_TASK: usize = 32;
+    const MAX_TASKS: usize = 8;
+    let available = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    let tasks = if bytes.len() < MIN_OUTPUT_BYTES {
+        1
     } else {
-        converted.extend(encoder_input.iter().map(|&value| convert(value)));
+        (values.len() / MIN_VALUES_PER_TASK)
+            .min(available)
+            .clamp(1, MAX_TASKS)
+    };
+    if tasks == 1 {
+        fill_f32_values_as_u16_bytes(bytes, values.iter().copied(), convert);
+        return;
     }
 
-    #[cfg(target_endian = "little")]
-    {
-        bytemuck::cast_slice(&converted).to_vec()
-    }
-    #[cfg(not(target_endian = "little"))]
-    {
-        let mut bytes = Vec::with_capacity(element_count * std::mem::size_of::<u16>());
-        for value in converted {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        bytes
+    let chunk_values = values.len().div_ceil(tasks);
+    bytes
+        .par_chunks_mut(chunk_values * size_of::<u16>())
+        .zip(values.par_chunks(chunk_values))
+        .for_each(|(output, values)| {
+            fill_f32_values_as_u16_bytes(output, values.iter().copied(), convert);
+        });
+}
+
+fn fill_f32_values_as_u16_bytes<I, F>(bytes: &mut [u8], values: I, convert: F)
+where
+    I: IntoIterator<Item = f32>,
+    F: Fn(f32) -> u16 + Copy,
+{
+    for (output, value) in bytes.chunks_exact_mut(size_of::<u16>()).zip(values) {
+        output.copy_from_slice(&convert(value).to_le_bytes());
     }
 }
 
@@ -1615,7 +1695,11 @@ fn tokenspeed_encoder_input_dtype(modality: Modality, workers: Option<&WorkerSel
     if let Some(dtype) = tokenspeed_encoder_input_dtype_from_worker(workers) {
         return dtype;
     }
-    "float32".to_string()
+    // Default to bf16 on the wire: the engine casts encoder_input to the model
+    // dtype (bf16) at the ViT regardless, so this is numerically identical to f32
+    // while halving the gateway->encode payload (the EPD throughput limiter).
+    // Override per-modality via SMG_TOKENSPEED_*_ENCODER_INPUT_DTYPE.
+    "bfloat16".to_string()
 }
 
 fn tokenspeed_encoder_input_dtype_from_env(modality: Modality) -> Option<String> {
@@ -1647,7 +1731,7 @@ fn cached_env_dtype(cell: &'static OnceLock<Option<String>>, name: &str) -> Opti
 fn tokenspeed_encoder_input_dtype_from_worker(workers: Option<&WorkerSelection>) -> Option<String> {
     let worker = match workers? {
         WorkerSelection::Single { worker } => worker,
-        WorkerSelection::Dual { prefill, .. } => prefill,
+        WorkerSelection::Disaggregated { prefill, .. } => prefill,
     };
     worker
         .metadata()
@@ -1659,16 +1743,20 @@ fn tokenspeed_encoder_input_dtype_from_worker(workers: Option<&WorkerSelection>)
 }
 
 /// Resolve whether large multimodal tensors should use the SHM transport for
-/// this request. `shm` = always (legacy explicit opt-in); `auto` = only when the
-/// worker is known to share SMG's `/dev/shm`; anything else (including unset or
-/// `inline`) keeps the inline gRPC path.
-fn resolve_tokenspeed_shm_enabled(workers: Option<&WorkerSelection>) -> bool {
+/// this request. `shm` and `auto` require the receiving worker leg to share
+/// SMG's `/dev/shm`; anything else (including unset or `inline`) keeps the
+/// inline gRPC path.
+fn resolve_tokenspeed_shm_enabled(
+    workers: Option<&WorkerSelection>,
+    skip_pixel_values: bool,
+) -> bool {
     let mode = tokenspeed_mm_tensor_transport_mode();
     log_tokenspeed_transport_config_once(&mode);
     match mode.as_str() {
         // SHM only ever happens when SMG can actually write /dev/shm.
-        "shm" => tokenspeed_shm_dev_writable(),
-        "auto" => worker_shares_dev_shm(workers) && tokenspeed_shm_dev_writable(),
+        "shm" | "auto" => {
+            worker_shares_dev_shm(workers, skip_pixel_values) && tokenspeed_shm_dev_writable()
+        }
         "" | "inline" => false,
         other => {
             log_unknown_tokenspeed_transport_once(other);
@@ -1700,7 +1788,7 @@ fn log_unknown_tokenspeed_transport_once(value: &str) {
 }
 
 /// Whether the worker is *verified* to share SMG's `/dev/shm`, making the SHM
-/// transport safe under `auto`.
+/// transport safe for this payload.
 ///
 /// Rather than inferring locality from the worker URL (TCP loopback proves only
 /// network locality, not a shared `/dev/shm`), the worker advertises its
@@ -1713,15 +1801,37 @@ fn log_unknown_tokenspeed_transport_once(value: &str) {
 /// underlying superblock is the same). We compare the worker's token to ours:
 /// equal ⇒ shared. A missing/empty token or any mismatch is treated as
 /// non-sharing, so `auto` safely falls back to inline.
-fn worker_shares_dev_shm(workers: Option<&WorkerSelection>) -> bool {
+fn worker_shares_dev_shm(workers: Option<&WorkerSelection>, skip_pixel_values: bool) -> bool {
     let Some(local) = local_shm_namespace_id() else {
         return false;
     };
-    let worker = match workers {
-        Some(WorkerSelection::Single { worker }) => worker,
-        Some(WorkerSelection::Dual { prefill, .. }) => prefill,
-        None => return false,
-    };
+    match workers {
+        Some(WorkerSelection::Single { worker }) => worker_matches_shm_namespace(worker, local),
+        Some(WorkerSelection::Disaggregated {
+            encode_assignments,
+            prefill,
+            decode,
+            ..
+        }) => {
+            if !skip_pixel_values {
+                if let Some(encode_assignments) = encode_assignments {
+                    // EPD: encoder_input (pixels) ships gateway -> encode worker, so SHM
+                    // is safe only if every encode worker assigned in this request shares
+                    // the gateway's /dev/shm. A mixed local/remote fan-out must fall back
+                    // to inline/RDMA rather than giving a remote worker an unreadable SHM handle.
+                    return encode_assignments
+                        .iter()
+                        .all(|assignment| worker_matches_shm_namespace(&assignment.worker, local));
+                }
+            }
+            worker_matches_shm_namespace(prefill, local)
+                && worker_matches_shm_namespace(decode, local)
+        }
+        None => false,
+    }
+}
+
+fn worker_matches_shm_namespace(worker: &Arc<dyn crate::worker::Worker>, local: &str) -> bool {
     worker
         .metadata()
         .spec
@@ -1763,7 +1873,7 @@ fn canonical_float_dtype(dtype: &str) -> Option<String> {
     }
 }
 
-fn array_shape(encoder_input: &ArrayD<f32>) -> Vec<u32> {
+fn array_shape(encoder_input: &ArrayViewD<'_, f32>) -> Vec<u32> {
     encoder_input.shape().iter().map(|&d| d as u32).collect()
 }
 
@@ -1874,11 +1984,56 @@ fn model_specific_to_tensor_bytes(value: &ModelSpecificValue) -> Option<TensorBy
 mod tests {
     use std::{fs, mem::size_of};
 
-    use ndarray::IxDyn;
+    use ndarray::{IxDyn, ShapeBuilder};
     use openai_protocol::common::{ImageUrl, VideoUrl};
     use tempfile::TempDir;
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn pending_tokenspeed_shm_assembly() -> (PendingTokenSpeedAssembly, std::path::PathBuf) {
+        let handle = write_tokenspeed_shm_with(4, |output| {
+            output.copy_from_slice(&[1, 2, 3, 4]);
+            Ok(())
+        })
+        .unwrap();
+        let path = Path::new("/dev/shm").join(&handle.name);
+        let data = TokenSpeedMultimodalData {
+            items: vec![TokenSpeedMultimodalItem {
+                modality: TokenSpeedModality::Image,
+                encoder_input: TokenSpeedTensor::shm(handle, vec![2], "bfloat16".to_string()),
+                model_specific_tensors: HashMap::new(),
+                placeholder_token_id: None,
+                mm_placeholders: vec![],
+                content_hash: vec![],
+            }],
+            shm_enabled: true,
+        };
+        (PendingTokenSpeedAssembly::new(data), path)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pending_tokenspeed_assembly_cleans_shm_when_dropped() {
+        let (pending, path) = pending_tokenspeed_shm_assembly();
+        assert!(path.exists());
+
+        drop(pending);
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pending_tokenspeed_assembly_transfers_shm_ownership() {
+        let (pending, path) = pending_tokenspeed_shm_assembly();
+        let data = pending.into_inner().unwrap();
+        assert!(path.exists());
+
+        cleanup_tokenspeed_items_encoder_shm(&data.items, None);
+
+        assert!(!path.exists());
+    }
 
     #[test]
     #[cfg(target_os = "linux")]
@@ -2178,13 +2333,14 @@ mod tests {
             keep_on_cpu_keys: vec![],
         };
 
-        let assembled = assemble_tokenspeed(intermediate, None).unwrap();
+        let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
         assert_eq!(assembled.items.len(), 2);
 
         let first = &assembled.items[0];
         assert_eq!(first.modality, TokenSpeedModality::Image);
         assert_eq!(first.encoder_input.shape, vec![2, 2]);
-        assert_eq!(first.encoder_input.nbytes(), 4 * size_of::<f32>());
+        // bf16 is the default TokenSpeed encoder_input wire dtype (2 bytes/elem).
+        assert_eq!(first.encoder_input.nbytes(), 4 * size_of::<u16>());
         assert_eq!(first.mm_placeholders, vec![(10, 2)]);
         assert_eq!(
             first.content_hash,
@@ -2284,13 +2440,14 @@ mod tests {
             keep_on_cpu_keys: vec![],
         };
 
-        let assembled = assemble_tokenspeed(intermediate, None).unwrap();
+        let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
         assert_eq!(assembled.items.len(), 2);
 
         let first = &assembled.items[0];
         assert_eq!(first.modality, TokenSpeedModality::Video);
         assert_eq!(first.encoder_input.shape, vec![2, 2]);
-        assert_eq!(first.encoder_input.nbytes(), 4 * size_of::<f32>());
+        // bf16 is the default TokenSpeed encoder_input wire dtype (2 bytes/elem).
+        assert_eq!(first.encoder_input.nbytes(), 4 * size_of::<u16>());
         assert_eq!(first.mm_placeholders, vec![(30, 2)]);
         assert_eq!(
             first.content_hash,
@@ -2439,5 +2596,59 @@ mod tests {
             .await
             .expect("preloaded entry must be returned without touching source");
         assert!(Arc::ptr_eq(&got, &cfg));
+    }
+
+    #[test]
+    fn parallel_u16_serialization_matches_scalar_conversion() {
+        let values: Vec<f32> = (0..300_000)
+            .map(|index| (index as f32 - 150_000.0) / 257.0)
+            .collect();
+        let array = ArrayD::from_shape_vec(IxDyn(&[values.len()]), values.clone()).unwrap();
+
+        for (dtype, convert) in [
+            ("bfloat16", f32_to_bf16_bits as fn(f32) -> u16),
+            ("float16", f32_to_f16_bits as fn(f32) -> u16),
+        ] {
+            let actual = serialize_array_as_u16_bytes(&array.view(), convert);
+            let expected: Vec<u8> = values
+                .iter()
+                .flat_map(|&value| convert(value).to_le_bytes())
+                .collect();
+            assert_eq!(actual, expected);
+
+            let mut direct = vec![0; expected.len()];
+            fill_array_as_dtype(&mut direct, &array.view(), dtype).unwrap();
+            assert_eq!(direct, expected);
+        }
+    }
+
+    #[test]
+    fn encoder_input_slice_is_borrowed_and_serializes_in_logical_order() {
+        let array =
+            ArrayD::from_shape_vec(IxDyn(&[3, 2]), vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+
+        let item = slice_array_axis0(&array, 1, 1).unwrap();
+
+        assert_eq!(item.as_ptr(), array.as_ptr().wrapping_add(2));
+        assert_eq!(item.shape(), &[1, 2]);
+        let expected = [3.0_f32, 4.0]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        assert_eq!(serialize_array(&item), (expected, vec![1, 2]));
+
+        let fortran_array =
+            ArrayD::from_shape_vec(IxDyn(&[3, 2]).f(), vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0])
+                .unwrap();
+        let fortran_item = slice_array_axis0(&fortran_array, 1, 1).unwrap();
+        let expected: Vec<u8> = [2.0_f32, 5.0]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        assert!(fortran_item.as_slice().is_none());
+        let mut direct = vec![0; expected.len()];
+        fill_array_as_dtype(&mut direct, &fortran_item, "float32").unwrap();
+        assert_eq!(direct, expected);
+        assert_eq!(serialize_array(&fortran_item), (expected, vec![1, 2]));
     }
 }

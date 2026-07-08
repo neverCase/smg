@@ -83,6 +83,9 @@ bincode = "1.3"
 clap = { version = "4", features = ["derive", "env"] }
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 ndarray = "0.17"
+memmap2 = "0.9"
+rayon = "1.12"
+rustix = { version = "1", features = ["fs"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.7", features = ["trace", "compression-gzip", "cors", "timeout", "limit", "request-id", "util"] }
 serde_json = { version = "1.0", default-features = false, features = ["std", "preserve_order"] }
@@ -140,7 +143,7 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 http-body-util = "0.1"
 portpicker = "0.1"
 lazy_static = "1.5"
-wasm-encoder = "0.252"
+wasm-encoder = "0.253"
 npyz = { version = "0.9", features = ["npz"] }
 opentelemetry-proto = { version = "0.32", features = ["gen-tonic"] }
 serial_test = "3.5"

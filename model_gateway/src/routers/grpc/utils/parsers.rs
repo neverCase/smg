@@ -4,6 +4,7 @@ use llm_tokenizer::{
     chat_template::{ThinkingKeyName, ThinkingToggle},
     traits::Tokenizer,
 };
+use openai_protocol::chat::thinking_from_reasoning_effort;
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ReasoningParser};
 use serde_json::Value;
 use tool_parser::{
@@ -32,7 +33,7 @@ pub fn should_mark_reasoning_started(
 /// Only checks the key that the template actually uses (e.g. `enable_thinking`
 /// for Qwen3, `thinking` for Kimi-K2.5). This prevents mismatches where the
 /// user passes the wrong key name and the template ignores it.
-pub fn extract_thinking_from_kwargs(
+pub(crate) fn extract_thinking_from_kwargs(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     tokenizer: &dyn Tokenizer,
 ) -> Option<bool> {
@@ -43,6 +44,28 @@ pub fn extract_thinking_from_kwargs(
         None => None,
     }
     .and_then(|v| v.as_bool())
+}
+
+/// Precedence for the effective thinking preference: an explicit template
+/// toggle (already extracted from kwargs) always wins; otherwise fall back to
+/// the protocol-level OpenAI `reasoning_effort` mapping
+/// ([`thinking_from_reasoning_effort`]).
+fn resolve_thinking_pref(explicit: Option<bool>, reasoning_effort: Option<&str>) -> Option<bool> {
+    explicit.or_else(|| thinking_from_reasoning_effort(reasoning_effort))
+}
+
+/// Resolve the user's effective thinking preference, honoring an explicit
+/// template thinking kwarg first (it always wins), then falling back to the
+/// OpenAI `reasoning_effort` mapping.
+pub fn resolve_user_thinking(
+    kwargs: Option<&std::collections::HashMap<String, Value>>,
+    reasoning_effort: Option<&str>,
+    tokenizer: &dyn Tokenizer,
+) -> Option<bool> {
+    resolve_thinking_pref(
+        extract_thinking_from_kwargs(kwargs, tokenizer),
+        reasoning_effort,
+    )
 }
 
 /// Check if a reasoning parser is available for the given model
@@ -155,6 +178,21 @@ pub(crate) fn create_tool_parser(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_thinking_pref_explicit_kwarg_wins() {
+        // An explicit template toggle always wins over the reasoning_effort mapping.
+        assert_eq!(resolve_thinking_pref(Some(true), Some("none")), Some(true));
+        assert_eq!(
+            resolve_thinking_pref(Some(false), Some("high")),
+            Some(false)
+        );
+        // No explicit toggle -> fall back to the reasoning_effort mapping.
+        assert_eq!(resolve_thinking_pref(None, Some("none")), Some(false));
+        assert_eq!(resolve_thinking_pref(None, Some("minimal")), Some(false));
+        assert_eq!(resolve_thinking_pref(None, Some("high")), None);
+        assert_eq!(resolve_thinking_pref(None, None), None);
+    }
 
     #[test]
     fn create_reasoning_parser_returns_independent_instances() {
