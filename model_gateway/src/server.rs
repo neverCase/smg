@@ -541,6 +541,9 @@ async fn v1_audio_transcriptions(
     cancel: middleware::scheduler::PreemptionGuard,
     AudioTranscriptionMultipart { request, audio }: AudioTranscriptionMultipart,
 ) -> Response {
+    if let Err(resp) = check_remote_auth(&state, &headers, &request.model).await {
+        return resp;
+    }
     cancel
         .guard(state.router.route_audio_transcriptions(
             Some(&headers),
