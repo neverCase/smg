@@ -9,7 +9,8 @@ use std::{sync::Arc, time::Instant};
 use anyhow::Result;
 use llm_multimodal::{
     AsyncMultiModalTracker, ImageFrame, Modality, ModelMetadata, PlaceholderRange,
-    PreprocessedEncoderInputs, PromptReplacement, TrackedMedia, TrackerOutput, VideoClip,
+    PreProcessorConfig, PreprocessedEncoderInputs, PromptReplacement, TrackedMedia, TrackerOutput,
+    VideoClip, VisionProcessorRegistry,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::{chat::ChatMessage, messages::InputMessage};
@@ -18,8 +19,9 @@ use tracing::{debug, info, warn};
 use super::{
     config::MultimodalComponents,
     detect::{extract_content_parts, extract_content_parts_messages},
-    log_mm_timing_enabled, MultimodalIntermediate, MultimodalOutput,
-    PrecomputedMultimodalIntermediate,
+    log_mm_timing_enabled,
+    pixel_cache::{config_fingerprint, CachedPreprocessedItem, PixelCache, PixelCacheKey},
+    MultimodalIntermediate, MultimodalOutput, PrecomputedMultimodalIntermediate,
 };
 
 /// Resolve the placeholder token string for a multimodal model.
@@ -233,77 +235,93 @@ async fn process_multimodal_parts(
     };
     let preprocess_started = Instant::now();
 
-    let registry = components.vision_processor_registry.clone();
-    let model_id_owned = model_id.to_string();
-    let model_type_owned = model_type.map(String::from);
-    let images_for_preprocess = images.clone(); // cheap Arc refcount bumps
-    let videos_for_preprocess = videos.clone(); // cheap Arc refcount bumps
-    let preprocessed: PreprocessedEncoderInputs = tokio::task::spawn_blocking(move || {
-        let processor = registry
-            .find(&model_id_owned, model_type_owned.as_deref())
-            .ok_or_else(|| {
-                anyhow::anyhow!("No vision processor found for model: {model_id_owned}")
-            })?;
+    let preprocessed: PreprocessedEncoderInputs = if let (Some(cache), Modality::Image, 1) =
+        (components.pixel_cache.clone(), modality, images.len())
+    {
+        preprocess_image_cached(
+            cache,
+            &images[0],
+            components.vision_processor_registry.clone(),
+            model_id.to_string(),
+            model_type.map(String::from),
+            pp_config,
+            config_fingerprint(tokenizer_id, &model_config.config),
+        )
+        .await?
+    } else {
+        let registry = components.vision_processor_registry.clone();
+        let model_id_owned = model_id.to_string();
+        let model_type_owned = model_type.map(String::from);
+        let images_for_preprocess = images.clone(); // cheap Arc refcount bumps
+        let videos_for_preprocess = videos.clone(); // cheap Arc refcount bumps
+        let preprocessed: PreprocessedEncoderInputs = tokio::task::spawn_blocking(move || {
+            let processor = registry
+                .find(&model_id_owned, model_type_owned.as_deref())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("No vision processor found for model: {model_id_owned}")
+                })?;
 
-        match modality {
-            Modality::Image => {
-                // Extract DynamicImages inside the blocking closure so the expensive
-                // clone happens off the tokio async runtime.
-                let raw_images: Vec<image::DynamicImage> = images_for_preprocess
-                    .iter()
-                    .map(|f| f.image.clone())
-                    .collect();
-                processor
-                    .preprocess(&raw_images, &pp_config)
-                    .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
-            }
-            Modality::Video => {
-                let video = videos_for_preprocess
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("No video available for preprocessing"))?;
-
-                if !video.frames().is_empty() {
-                    return processor
-                        .preprocess_video(video.frames(), &pp_config)
-                        .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"));
+            match modality {
+                Modality::Image => {
+                    // Extract DynamicImages inside the blocking closure so the expensive
+                    // clone happens off the tokio async runtime.
+                    let raw_images: Vec<image::DynamicImage> = images_for_preprocess
+                        .iter()
+                        .map(|f| f.image.clone())
+                        .collect();
+                    processor
+                        .preprocess(&raw_images, &pp_config)
+                        .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
                 }
+                Modality::Video => {
+                    let video = videos_for_preprocess
+                        .first()
+                        .ok_or_else(|| anyhow::anyhow!("No video available for preprocessing"))?;
 
-                if let Some(rgb_video) = video.rgb_video() {
-                    match rgb_video.frame_refs() {
-                        Ok(frame_refs) => {
-                            match processor.preprocess_video_rgb(&frame_refs, &pp_config) {
-                                Ok(preprocessed) => return Ok(preprocessed),
-                                Err(error) => {
-                                    warn!(
-                                        error = %error,
-                                        "RGB video preprocessing fast path failed; falling back to materialized frames"
-                                    );
+                    if !video.frames().is_empty() {
+                        return processor
+                            .preprocess_video(video.frames(), &pp_config)
+                            .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"));
+                    }
+
+                    if let Some(rgb_video) = video.rgb_video() {
+                        match rgb_video.frame_refs() {
+                            Ok(frame_refs) => {
+                                match processor.preprocess_video_rgb(&frame_refs, &pp_config) {
+                                    Ok(preprocessed) => return Ok(preprocessed),
+                                    Err(error) => {
+                                        warn!(
+                                            error = %error,
+                                            "RGB video preprocessing fast path failed; falling back to materialized frames"
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        Err(error) => {
-                            warn!(
-                                error = %error,
-                                "RGB video frame refs are invalid; falling back to materialized frames"
-                            );
+                            Err(error) => {
+                                warn!(
+                                    error = %error,
+                                    "RGB video frame refs are invalid; falling back to materialized frames"
+                                );
+                            }
                         }
                     }
-                }
 
-                let frames = video
-                    .materialized_frames()
-                    .map_err(|e| anyhow::anyhow!("Video frame materialization failed: {e}"))?;
-                processor
-                    .preprocess_video(&frames, &pp_config)
-                    .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"))
+                    let frames = video
+                        .materialized_frames()
+                        .map_err(|e| anyhow::anyhow!("Video frame materialization failed: {e}"))?;
+                    processor
+                        .preprocess_video(&frames, &pp_config)
+                        .map_err(|e| anyhow::anyhow!("Video preprocessing failed: {e}"))
+                }
+                _ => Err(anyhow::anyhow!(
+                    "Unsupported modality for preprocessing: {modality}"
+                )),
             }
-            _ => Err(anyhow::anyhow!(
-                "Unsupported modality for preprocessing: {modality}"
-            )),
-        }
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("Preprocessing task panicked: {e}"))??;
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Preprocessing task panicked: {e}"))??;
+        preprocessed
+    };
     let preprocess_elapsed_ms = preprocess_started.elapsed().as_secs_f64() * 1000.0;
 
     debug!(
@@ -405,6 +423,61 @@ async fn process_multimodal_parts(
     })
 }
 
+/// Pixel-cache image preprocessing for single-image requests.
+async fn preprocess_image_cached(
+    cache: Arc<PixelCache>,
+    image: &Arc<ImageFrame>,
+    registry: Arc<VisionProcessorRegistry>,
+    model_id: String,
+    model_type: Option<String>,
+    pp_config: PreProcessorConfig,
+    fingerprint: u64,
+) -> Result<PreprocessedEncoderInputs> {
+    let key = PixelCacheKey {
+        image_hash: image.hash.clone(),
+        config_fingerprint: fingerprint,
+    };
+    if let Some(cached) = cache.get(&key) {
+        return Ok(cached.preprocessed.clone());
+    }
+
+    let preprocessed = preprocess_image_batch(
+        registry,
+        model_id,
+        model_type,
+        pp_config,
+        std::slice::from_ref(image),
+    )
+    .await?;
+    cache.insert(
+        key,
+        Arc::new(CachedPreprocessedItem {
+            preprocessed: preprocessed.clone(),
+        }),
+    );
+    Ok(preprocessed)
+}
+
+async fn preprocess_image_batch(
+    registry: Arc<VisionProcessorRegistry>,
+    model_id: String,
+    model_type: Option<String>,
+    pp_config: PreProcessorConfig,
+    images: &[Arc<ImageFrame>],
+) -> Result<PreprocessedEncoderInputs> {
+    let raw_images: Vec<image::DynamicImage> = images.iter().map(|f| f.image.clone()).collect();
+    tokio::task::spawn_blocking(move || {
+        let processor = registry
+            .find(&model_id, model_type.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("No vision processor found for model: {model_id}"))?;
+        processor
+            .preprocess(&raw_images, &pp_config)
+            .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Preprocessing task panicked: {e}"))?
+}
+
 /// Output of token expansion, containing both full structural and patch-only ranges.
 struct ExpandedTokens {
     /// The expanded token ID sequence.
@@ -472,9 +545,15 @@ fn expand_tokens(
 
             // PromptReplacement uses TokenId = i32, convert to u32
             expanded.extend(repl.tokens.iter().map(|&t| t as u32));
+            // Fold any template-emitted structural prefix (already in `expanded`,
+            // e.g. Qwen's leading <|vision_start|>) into the reported range so a
+            // backend that scans the range for structural markers — vLLM's video
+            // mrope walks each frame from <|vision_start|> — starts on the marker.
+            // `offset` (used by the sglang patch_offsets pass above) is untouched.
+            let prefix = repl.structural_prefix.min(offset);
             placeholders.push(PlaceholderRange {
-                offset,
-                length: repl.tokens.len(),
+                offset: offset - prefix,
+                length: repl.tokens.len() + prefix,
             });
             replacement_idx += 1;
         } else {
@@ -520,6 +599,7 @@ mod tests {
             modality: Modality::Image,
             placeholder_token: "<image>".to_string(),
             tokens: vec![50, 50, 50, 50], // Expand to 4 tokens
+            structural_prefix: 0,
         }];
 
         let result = expand_tokens(&token_ids, Some(100), None, &replacements);
@@ -529,6 +609,30 @@ mod tests {
         assert_eq!(result.placeholders[0].offset, 2);
         assert_eq!(result.placeholders[0].length, 4);
         assert!(result.patch_offsets.is_none());
+    }
+
+    #[test]
+    fn test_expand_tokens_structural_prefix_folds_leading_marker() {
+        // Qwen video: the chat template emits <VS><video_pad><VE> (777, 100, 778).
+        // The replacement declares structural_prefix=1, so the reported range must
+        // start on the leading <VS> (offset 2, not 3) and grow by one, letting a
+        // backend that scans the range for <VS> (vLLM's per-frame video mrope) find
+        // it. The token stream is unchanged — the marker is not re-emitted.
+        let token_ids = vec![1, 2, 777, 100, 778, 3]; // 100 is the placeholder
+        let replacements = vec![PromptReplacement {
+            modality: Modality::Video,
+            placeholder_token: "<|video_pad|>".to_string(),
+            tokens: vec![50, 50, 50], // expands to 3 video tokens
+            structural_prefix: 1,
+        }];
+
+        let result = expand_tokens(&token_ids, Some(100), None, &replacements);
+
+        assert_eq!(result.token_ids, vec![1, 2, 777, 50, 50, 50, 778, 3]);
+        assert_eq!(result.placeholders.len(), 1);
+        // Range starts on <VS> (index 2) and covers it + the 3 video tokens.
+        assert_eq!(result.placeholders[0].offset, 2);
+        assert_eq!(result.placeholders[0].length, 4);
     }
 
     #[test]
@@ -549,11 +653,13 @@ mod tests {
                 modality: Modality::Image,
                 placeholder_token: "<image>".to_string(),
                 tokens: vec![50, 50], // 2 tokens for first image
+                structural_prefix: 0,
             },
             PromptReplacement {
                 modality: Modality::Image,
                 placeholder_token: "<image>".to_string(),
                 tokens: vec![60, 60, 60], // 3 tokens for second image
+                structural_prefix: 0,
             },
         ];
 
@@ -576,6 +682,7 @@ mod tests {
             modality: Modality::Image,
             placeholder_token: "<image>".to_string(),
             tokens: vec![88, 92, 92, 92, 93, 92, 92, 92, 89], // start + patches + sep + patches + end
+            structural_prefix: 0,
         }];
 
         let result = expand_tokens(&token_ids, Some(100), Some(92), &replacements);
@@ -601,6 +708,7 @@ mod tests {
             modality: Modality::Image,
             placeholder_token: "<image>".to_string(),
             tokens: vec![50, 50],
+            structural_prefix: 0,
         }];
 
         let result = expand_tokens(&token_ids, Some(100), None, &replacements);

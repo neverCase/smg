@@ -41,6 +41,7 @@ from tokenspeed.runtime.pd.kv_events import KVEventBatch
 from smg_grpc_servicer.kv_events import endpoint_for_rank, stream_kv_events
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
+from smg_grpc_servicer.tokenspeed.rdma_pixel import RdmaPixelPuller
 
 if TYPE_CHECKING:
     # Type-only — keeps these out of the cold-path graph when the servicer is
@@ -131,6 +132,13 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # Resolved ZMQ KV-events endpoint, or None when the worker was not
         # launched with --kv-events-config (SubscribeKvEvents → UNIMPLEMENTED).
         self._kv_events_config = resolve_kv_events_config(server_args)
+        self._rdma_pixel_puller = RdmaPixelPuller(
+            agent_name=(
+                f"smg-scheduler-{getattr(server_args, 'host', 'unknown')}-"
+                f"{getattr(server_args, 'port', 'unknown')}"
+            ),
+            log_prefix="TokenSpeed RDMA",
+        )
 
         # Drive AsyncLLM's output-dispatch loop. This is idempotent — the
         # first caller creates the handle loop; subsequent callers (including
@@ -424,8 +432,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             self.server_args, "tokenizer_path", ""
         )
         supports_vision = bool(getattr(model_config, "is_multimodal", False))
-        image_modality = getattr(tokenspeed_scheduler_pb2, "IMAGE", 1)
-        video_modality = getattr(tokenspeed_scheduler_pb2, "VIDEO", 3)
+        image_modality = common_pb2.IMAGE
+        video_modality = common_pb2.VIDEO
         supported_modalities = []
         if supports_vision:
             supported_modalities.append(image_modality)
@@ -1027,7 +1035,15 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             if item_proto.HasField("encoder_input"):
                 feature_started = time.perf_counter() if LOG_MM_TIMING else None
                 encoder_input = item_proto.encoder_input
-                feature = self._feature_from_proto(encoder_input, cast_to=model_dtype)
+                if encoder_input.WhichOneof("payload") == "remote":
+                    feature, _ = self._rdma_pixel_puller.feature_from_remote(
+                        encoder_input,
+                        explicit_room=None,
+                        cast_to=model_dtype,
+                        publish_shm=False,
+                    )
+                else:
+                    feature = self._feature_from_proto(encoder_input, cast_to=model_dtype)
                 feature_elapsed_ms = (
                     (time.perf_counter() - feature_started) * 1000
                     if feature_started is not None
@@ -1131,11 +1147,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
     @staticmethod
     def _modality_from_proto(modality: int) -> Modality:
-        if modality == getattr(tokenspeed_scheduler_pb2, "IMAGE", 1):
+        if modality == common_pb2.IMAGE:
             return Modality.IMAGE
-        if modality == getattr(tokenspeed_scheduler_pb2, "VIDEO", 3):
+        if modality == common_pb2.VIDEO:
             return Modality.VIDEO
-        if modality == getattr(tokenspeed_scheduler_pb2, "AUDIO", 2):
+        if modality == common_pb2.AUDIO:
             raise ValueError("TokenSpeed audio multimodal inputs are not supported yet")
         raise ValueError(f"Unsupported multimodal item modality: {modality}")
 
