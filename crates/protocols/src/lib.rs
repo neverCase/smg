@@ -34,3 +34,4 @@ pub mod transcription;
 pub mod validated;
 pub mod worker;
 pub mod images;
+pub mod speech;

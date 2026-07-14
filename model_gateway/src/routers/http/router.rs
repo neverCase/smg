@@ -24,6 +24,7 @@ use openai_protocol::{
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
     images::{ImageGenerationRequest, ImageEditRequest, ImageFile, ImageVariationRequest},
+    speech::SpeechRequest,
 };
 use reqwest::{
     multipart::{Form, Part},
@@ -650,6 +651,373 @@ impl Router {
         events::RequestSentEvent { url: worker.url() }.emit();
 
         let form = match build_transcription_form(body, audio) {
+            Ok(f) => f,
+            Err(e) => {
+                let resp = error::bad_request("multipart_build_failed", e);
+                record_pre_send_error(&resp);
+                return resp;
+            }
+        };
+
+        let endpoint_url = worker.endpoint_url(route);
+        let mut request_builder = self.client.post(&endpoint_url).multipart(form);
+
+        if let Some(key) = worker.api_key().cloned() {
+            let mut auth_header = String::with_capacity(7 + key.len());
+            auth_header.push_str("Bearer ");
+            auth_header.push_str(&key);
+            request_builder = request_builder.header("Authorization", auth_header);
+        }
+
+        if let Some(headers) = headers {
+            for (name, value) in headers {
+                // Skip Content-Type and Content-Length — reqwest sets the
+                // correct multipart boundary itself.
+                let name_str = name.as_str();
+                if name_str.eq_ignore_ascii_case("content-type")
+                    || name_str.eq_ignore_ascii_case("content-length")
+                {
+                    continue;
+                }
+                if header_utils::should_forward_request_header(name_str) {
+                    request_builder = request_builder.header(name, value);
+                }
+            }
+        }
+
+        let res = match request_builder.send().await {
+            Ok(res) => res,
+            Err(e) => {
+                error!(
+                    "Failed to send multipart transcription request worker_url={} route={} error={}",
+                    worker.url(),
+                    route,
+                    e
+                );
+                let err_resp = convert_reqwest_error(e);
+                let err_status = err_resp.status();
+                // Feed the synthetic status into the worker circuit breaker
+                // and worker-error metric; transport failures (timeouts,
+                // connect errors) must be visible to health tracking so the
+                // same bad worker isn't picked repeatedly.
+                worker.record_outcome(err_status.as_u16());
+                if err_status.is_server_error() {
+                    Metrics::record_worker_error(
+                        metrics_labels::WORKER_REGULAR,
+                        metrics_labels::CONNECTION_HTTP,
+                        error_type_from_status(err_status),
+                    );
+                }
+                Metrics::record_router_upstream_response(
+                    metrics_labels::ROUTER_HTTP,
+                    err_status.as_u16(),
+                    extract_error_code_from_response(&err_resp),
+                );
+                // Mirror route_typed_request: a send failure must still bump
+                // the terminal router_error counter, not just upstream_response.
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_HTTP,
+                    metrics_labels::BACKEND_REGULAR,
+                    metrics_labels::CONNECTION_HTTP,
+                    model_id,
+                    endpoint,
+                    error_type_from_status(err_status),
+                );
+                return err_resp;
+            }
+        };
+
+        let status = StatusCode::from_u16(res.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+        Metrics::record_router_upstream_response(metrics_labels::ROUTER_HTTP, status.as_u16(), "");
+
+        events::RequestReceivedEvent {}.emit();
+
+        let response = if is_stream {
+            // Preserve the upstream content-type verbatim. A `stream=true`
+            // hint from the client doesn't guarantee the worker actually
+            // streams — whisper backends may ignore it and return a normal
+            // JSON body (success or 4xx error). Don't relabel non-SSE
+            // responses as SSE; leave that judgment to whatever the worker
+            // set.
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let stream = res.bytes_stream();
+            // Bounded channel applies backpressure: if the downstream client
+            // is slow, the upstream relay awaits on `send` rather than piling
+            // chunks in memory.
+            const STREAM_RELAY_BUFFER: usize = 32;
+            let (tx, rx) = mpsc::channel::<Result<bytes::Bytes, String>>(STREAM_RELAY_BUFFER);
+            // Attribute worker-level and router-level outcomes to the actual
+            // stream completion from inside the relay task: a mid-stream error
+            // after a 2xx header, or a non-streaming 5xx header returned under
+            // `stream=true`, must be visible to circuit-breaker + worker-error
+            // + router-error metrics. Recording only at header time would mis-
+            // classify those.
+            let worker_for_stream = worker.clone();
+            let stream_header_status = status;
+            let stream_model_id = model_id.to_string();
+            let stream_endpoint = endpoint;
+            let stream_start = start;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
+            )]
+            tokio::spawn(async move {
+                let mut stream = stream;
+                let mut stream_failed = false;
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            if tx.send(Ok(bytes)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            stream_failed = true;
+                            let _ = tx.send(Err(format!("Stream error: {e}"))).await;
+                            break;
+                        }
+                    }
+                }
+                // Effective status = BAD_GATEWAY if the relay failed, else the
+                // worker's header status. Covers both "5xx header returned
+                // while stream=true" and "200 header then mid-stream break".
+                let effective_status = if stream_failed {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    stream_header_status
+                };
+                worker_for_stream.record_outcome(effective_status.as_u16());
+                if effective_status.is_server_error() {
+                    Metrics::record_worker_error(
+                        metrics_labels::WORKER_REGULAR,
+                        metrics_labels::CONNECTION_HTTP,
+                        error_type_from_status(effective_status),
+                    );
+                }
+                if effective_status.is_success() {
+                    Metrics::record_router_duration(
+                        metrics_labels::ROUTER_HTTP,
+                        metrics_labels::BACKEND_REGULAR,
+                        metrics_labels::CONNECTION_HTTP,
+                        &stream_model_id,
+                        stream_endpoint,
+                        stream_start.elapsed(),
+                    );
+                } else {
+                    Metrics::record_router_error(
+                        metrics_labels::ROUTER_HTTP,
+                        metrics_labels::BACKEND_REGULAR,
+                        metrics_labels::CONNECTION_HTTP,
+                        &stream_model_id,
+                        stream_endpoint,
+                        error_type_from_status(effective_status),
+                    );
+                }
+            });
+            let stream = ReceiverStream::new(rx);
+            let body = Body::from_stream(stream);
+            let mut response = Response::new(body);
+            *response.status_mut() = status;
+            *response.headers_mut() = response_headers;
+            if let Some(guard) = load_guard {
+                response = AttachedBody::wrap_response(response, guard);
+            }
+            response
+        } else {
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            match res.bytes().await {
+                Ok(body) => {
+                    let mut response = Response::new(Body::from(body));
+                    *response.status_mut() = status;
+                    *response.headers_mut() = response_headers;
+                    response
+                }
+                Err(e) => error::internal_error(
+                    "read_response_body_failed",
+                    format!("Failed to read response body: {e}"),
+                ),
+            }
+        };
+
+        // Non-streaming: classify metrics off the final response the client
+        // will actually see. A body-read failure can rewrite a 2xx upstream
+        // into a local 5xx, and we want the circuit breaker + metrics to see
+        // that. Streaming outcomes are owned by the relay task above.
+        if !is_stream {
+            let final_status = response.status();
+            worker.record_outcome(final_status.as_u16());
+            if final_status.is_server_error() {
+                Metrics::record_worker_error(
+                    metrics_labels::WORKER_REGULAR,
+                    metrics_labels::CONNECTION_HTTP,
+                    error_type_from_status(final_status),
+                );
+            }
+            if final_status.is_success() {
+                Metrics::record_router_duration(
+                    metrics_labels::ROUTER_HTTP,
+                    metrics_labels::BACKEND_REGULAR,
+                    metrics_labels::CONNECTION_HTTP,
+                    model_id,
+                    endpoint,
+                    start.elapsed(),
+                );
+            } else {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_HTTP,
+                    metrics_labels::BACKEND_REGULAR,
+                    metrics_labels::CONNECTION_HTTP,
+                    model_id,
+                    endpoint,
+                    error_type_from_status(final_status),
+                );
+            }
+        }
+
+        response
+    }
+
+    /// Forward an audio transcription request to an audio-capable worker as
+    /// `multipart/form-data`. Separate from `route_typed_request` because the
+    /// endpoint is not JSON-bodied.
+    async fn route_multipart_speech(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &SpeechRequest,
+        prompt_speech: AudioFile,
+        route: &'static str,
+        model_id: &str,
+    ) -> Response {
+        let start = Instant::now();
+        let is_stream = body.is_stream();
+        let text = body.extract_text_for_routing();
+        let endpoint = route_to_endpoint(route);
+
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            model_id,
+            endpoint,
+            bool_to_static_str(is_stream),
+        );
+
+        // Finalize router metrics for an early error that never reached an
+        // upstream worker (model_not_found, dp_aware_not_supported, no
+        // available workers, build failure). Without this, pre-send failures
+        // silently disappear from router_upstream_responses / router_error.
+        let record_pre_send_error = |response: &Response| {
+            let rstatus = response.status();
+            Metrics::record_router_upstream_response(
+                metrics_labels::ROUTER_HTTP,
+                rstatus.as_u16(),
+                extract_error_code_from_response(response),
+            );
+            if !is_retryable_status(rstatus) {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_HTTP,
+                    metrics_labels::BACKEND_REGULAR,
+                    metrics_labels::CONNECTION_HTTP,
+                    model_id,
+                    endpoint,
+                    error_type_from_status(rstatus),
+                );
+            }
+        };
+
+        // Multipart transcription can't route through `worker.prepare_request`,
+        // which is the hook that injects `data_parallel_rank` for DP-aware
+        // workers. Pre-filter DP-aware workers out of the candidate pool so
+        // the policy can pick a non-DP worker when one exists; only fall back
+        // to model_not_found / 400 when every candidate is DP-aware.
+        let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
+            None
+        } else {
+            Some(model_id)
+        };
+        let all_workers = self.worker_registry.get_workers_filtered(
+            model_filter,
+            Some(WorkerType::Regular),
+            Some(ConnectionMode::Http),
+            None,
+            false,
+        );
+        if all_workers.is_empty() {
+            let resp = error::model_not_found(model_id);
+            record_pre_send_error(&resp);
+            return resp;
+        }
+        let non_dp_workers: Vec<Arc<dyn Worker>> = all_workers
+            .iter()
+            .filter(|w| !w.is_dp_aware())
+            .cloned()
+            .collect();
+        if non_dp_workers.is_empty() {
+            let resp = error::bad_request(
+                "dp_aware_not_supported",
+                "/v1/audio/speech does not yet support DP-aware workers",
+            );
+            record_pre_send_error(&resp);
+            return resp;
+        }
+        let available: Vec<Arc<dyn Worker>> = non_dp_workers
+            .iter()
+            .filter(|w| w.is_available())
+            .cloned()
+            .collect();
+        if available.is_empty() {
+            let resp = error::service_unavailable(
+                "no_available_workers",
+                "All workers are unavailable (circuit breaker open or unhealthy)",
+            );
+            record_pre_send_error(&resp);
+            return resp;
+        }
+
+        let policy = self.policy_registry.get_policy_or_default(model_id);
+        let hash_ring = self.worker_registry.get_hash_ring(model_id);
+        let idx = match self.policy_registry.select_worker(
+            &policy,
+            &available,
+            &SelectWorkerInfo {
+                request_text: Some(&text),
+                tokens: None,
+                headers,
+                hash_ring,
+                leg: crate::policies::WorkerLeg::Single,
+            },
+        ) {
+            Some(i) => i,
+            None => {
+                let resp = error::service_unavailable(
+                    "no_available_workers",
+                    "Policy returned no eligible worker",
+                );
+                record_pre_send_error(&resp);
+                return resp;
+            }
+        };
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            model_id,
+            policy.name(),
+        );
+        let worker = available[idx].clone();
+
+        let load_guard = ["cache_aware", "manual"]
+            .contains(&policy.name())
+            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+        let headers = Some(&headers_with_trace);
+
+        events::RequestSentEvent { url: worker.url() }.emit();
+
+        let form = match build_speech_form(body, prompt_speech) {
             Ok(f) => f,
             Err(e) => {
                 let resp = error::bad_request("multipart_build_failed", e);
@@ -1829,6 +2197,50 @@ fn build_transcription_form(body: &TranscriptionRequest, audio: AudioFile) -> Re
     Ok(form)
 }
 
+fn build_speech_form(body: &SpeechRequest, prompt_speech: AudioFile) -> Result<Form, String> {
+    let AudioFile {
+        bytes,
+        file_name,
+        content_type,
+    } = prompt_speech;
+
+    // Wrap the already-buffered Bytes in a reqwest Body (Arc refcount, no
+    // additional copy) instead of Part::bytes, which would force a Vec copy.
+    let file_len = bytes.len() as u64;
+    let mut file_part =
+        Part::stream_with_length(reqwest::Body::from(bytes), file_len).file_name(file_name);
+    if let Some(ct) = content_type.as_deref() {
+        file_part = file_part
+            .mime_str(ct)
+            .map_err(|e| format!("Invalid audio content-type '{ct}': {e}"))?;
+    }
+
+    let mut form = Form::new()
+        .part("prompt_speech", file_part)
+        .text("input", body.input.clone())
+        .text("model", body.model.clone());
+
+    if let Some(ref voice) = body.voice {
+        form = form.text("voice", voice.clone());
+    }
+    if let Some(ref instructions) = body.instructions {
+        form = form.text("instructions", instructions.clone());
+    }
+    if let Some(ref response_format) = body.response_format {
+        form = form.text("response_format", response_format.clone());
+    }
+    if let Some(speed) = body.speed {
+        form = form.text("speed", speed.to_string());
+    }
+    if let Some(ref stream_format) = body.stream_format {
+        form = form.text("stream_format", stream_format.clone());
+    }
+    if let Some(ref prompt_text) = body.prompt_text {
+        form = form.text("prompt_text", prompt_text.clone());
+    }
+    Ok(form)
+}
+
 fn build_image_edit_form(
     body: &ImageEditRequest,
     images: Vec<ImageFile>,
@@ -2209,6 +2621,24 @@ impl RouterTrait for Router {
             model_id,
         )
         .await
+    }
+
+    async fn route_audio_speech(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: &SpeechRequest,
+        prompt_speech: AudioFile,
+        model_id: &str,
+    ) -> Response {
+        self.route_multipart_speech(
+            headers,
+            body,
+            prompt_speech,
+            "/v1/audio/speech",
+            model_id,
+        )
+            .await
     }
 
     async fn route_rerank(

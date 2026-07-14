@@ -106,6 +106,7 @@ async fn detect_via_models_endpoint(
         Some("sglang" | "nvidia") => Ok("sglang".to_string()),
         Some("vllm") => Ok("vllm".to_string()),
         Some("diffusers") => Ok("vllm".to_string()),
+        Some("funaudiollm") => Ok("vllm".to_string()),
         other => Err(format!("Unrecognized owned_by value: {other:?}")),
     }
 }

@@ -16,6 +16,7 @@ use axum::{
 use crate::{
     transcription::{AudioFile, TranscriptionRequest},
     images::{ImageFile, ImageEditRequest, Mask, ImageVariationRequest},
+    speech::{SpeechRequest},
 };
 
 /// Extractor for `/v1/audio/transcriptions` requests.
@@ -40,6 +41,12 @@ pub struct ImageEditMultipart {
 pub struct ImageVariationMultipart {
     pub request: ImageVariationRequest,
     pub image: ImageFile,
+}
+
+#[cfg(feature = "axum")]
+pub struct AudioSpeechMultipart {
+    pub request: SpeechRequest,
+    pub prompt_speech: AudioFile,
 }
 
 #[cfg(feature = "axum")]
@@ -464,8 +471,132 @@ impl<S: Send + Sync> FromRequest<S> for ImageVariationMultipart {
             return Err(bad_request("Missing required 'image' part(s)".to_string()));
         }
         let image = images.into_iter().next().unwrap();
-        
+
         Ok(ImageVariationMultipart { request, image })
+    }
+}
+
+#[cfg(feature = "axum")]
+impl<S: Send + Sync> FromRequest<S> for AudioSpeechMultipart {
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let mut multipart = Multipart::from_request(req, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+
+        let mut audios = Vec::new();
+        let mut request = SpeechRequest::default();
+
+        loop {
+            let field = match multipart.next_field().await {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(bad_request(format!("Failed to read multipart field: {e}")));
+                }
+            };
+
+            let name = field.name().unwrap_or("").to_string();
+            match name.as_str() {
+                "prompt_speech" => {
+                    let file_name = field.file_name().map(str::to_string);
+                    let content_type = field.content_type().map(str::to_string);
+                    let bytes = field.bytes().await.map_err(|e| {
+                        bad_request(format!("Failed to read image file bytes: {e}"))
+                    })?;
+
+                    if bytes.is_empty() {
+                        return Err(bad_request("Uploaded 'image' part is empty".to_string()));
+                    }
+
+                    audios.push(AudioFile {
+                        bytes,
+                        file_name: file_name.unwrap_or_else(|| "image".to_string()),
+                        content_type,
+                    });
+                },
+                "input" => {
+                    request.input = field.text().await.map_err(|e| bad_text_field("input", e))?;
+                },
+                "model" => {
+                    request.model = field.text().await.map_err(|e| bad_text_field("model", e))?;
+                },
+                "voice" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("voice", e))?;
+                    if !v.is_empty() {
+                        request.voice = Some(v);
+                    }
+                },
+                "instructions" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("instructions", e))?;
+                    if !v.is_empty() {
+                        request.instructions = Some(v);
+                    }
+                },
+                "response_format" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("response_format", e))?;
+                    if !v.is_empty() {
+                        request.response_format = Some(v);
+                    }
+                },
+                "speed" => match field.text().await {
+                    Ok(t) => match t.trim().parse::<f64>() {
+                        Ok(v) if v.is_finite() && (0.0..=1.0).contains(&v) => {
+                            request.speed = Some(v);
+                        }
+                        Ok(v) => {
+                            return Err(bad_request(format!(
+                                "Invalid 'speed' value: {v} (must be a finite number in [0.25 to 4.0. 1.0])"
+                            )));
+                        }
+                        Err(e) => {
+                            return Err(bad_request(format!("Invalid 'speed' value: {e}")));
+                        }
+                    },
+                    Err(e) => return Err(bad_text_field("speed", e)),
+                },
+                "stream_format" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("stream_format", e))?;
+                    if !v.is_empty() {
+                        match v.as_str() {
+                            "sse" | "audio" => {
+                                request.stream_format = Some(v);
+                            }
+                            other => {
+                                return Err(bad_request(format!(
+                                    "Invalid 'stream_format' value: '{other}' (expected 'sse' or 'audio')"
+                                )));
+                            }
+                        }
+                    }
+                },
+                "prompt_text" => {
+                    let v = field.text().await.map_err(|e| bad_text_field("prompt_text", e))?;
+                    if !v.is_empty() {
+                        request.prompt_text = Some(v);
+                    }
+                }
+                _ => {
+                    // Unknown field; drain to free resources but otherwise ignore.
+                    let _ = field.bytes().await;
+                }
+            }
+        }
+
+        // ============ 校验 ============
+        if request.model.trim().is_empty() {
+            return Err(bad_request("Missing required 'model' field".to_string()));
+        }
+        request.model = request.model.trim().to_string();
+
+
+        if audios.is_empty() {
+            return Err(bad_request("Missing required 'prompt_speech' part(s)".to_string()));
+        }
+        let prompt_speech = audios.into_iter().next().unwrap();
+        
+        Ok(AudioSpeechMultipart { request, prompt_speech })
     }
 }
 

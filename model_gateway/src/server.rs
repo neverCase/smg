@@ -23,7 +23,7 @@ use openai_protocol::{
     generate::GenerateRequest,
     interactions::InteractionsRequest,
     messages::CreateMessageRequest,
-    multipart::{AudioTranscriptionMultipart, ImageEditMultipart, ImageVariationMultipart},
+    multipart::{AudioTranscriptionMultipart, ImageEditMultipart, ImageVariationMultipart, AudioSpeechMultipart},
     parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
@@ -550,6 +550,27 @@ async fn v1_audio_transcriptions(
             &tenant_meta,
             &request,
             audio,
+            &request.model,
+        ))
+        .await
+}
+
+async fn v1_audio_speech(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
+    AudioSpeechMultipart { request, prompt_speech }: AudioSpeechMultipart,
+) -> Response {
+    if let Err(resp) = check_remote_auth(&state, &headers, &request.model).await {
+        return resp;
+    }
+    cancel
+        .guard(state.router.route_audio_speech(
+            Some(&headers),
+            &tenant_meta,
+            &request,
+            prompt_speech,
             &request.model,
         ))
         .await
@@ -1102,6 +1123,7 @@ pub fn build_app(
     let multipart_upload_routes = with_admission_layer(
         Router::new()
             .route("/v1/audio/transcriptions", post(v1_audio_transcriptions))
+            .route("/v1/audio/speech", post(v1_audio_speech))
             .route("/v1/images/edits", post(v1_image_edits))
             .route("/v1/images/variations", post(v1_image_variations)),
         &admission_mode,

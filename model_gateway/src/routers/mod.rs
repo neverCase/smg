@@ -25,6 +25,7 @@ use openai_protocol::{
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
     images::{ImageGenerationRequest, ImageEditRequest, ImageFile},
+    speech::SpeechRequest,
 };
 
 use crate::middleware::TenantRequestMeta;
@@ -249,6 +250,28 @@ pub trait RouterTrait: Send + Sync + Debug {
         )
             .into_response()
     }
+
+    /// Route audio transcription requests (OpenAI-compatible /v1/audio/speech).
+    ///
+    /// Unlike the JSON-bodied endpoints, `/v1/audio/speech` uses
+    /// multipart/form-data: the server handler parses the form, packs text
+    /// fields into `body` and the audio part into `audio`, and routers forward
+    /// both to a worker capable of audio transcription.
+    async fn route_audio_speech(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _body: &SpeechRequest,
+        _prompt_speech: AudioFile,
+        _model_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Audio speech not implemented",
+        )
+            .into_response()
+    }
+
 
     /// Route rerank requests
     async fn route_rerank(
