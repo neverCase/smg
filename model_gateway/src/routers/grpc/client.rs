@@ -184,6 +184,19 @@ impl GrpcClient {
         matches!(self, Self::TokenSpeed(_))
     }
 
+    /// Runtime type backing this client. Lets shared logic (e.g. the multimodal
+    /// capability matrix) key on the backend without matching every variant.
+    pub fn runtime_type(&self) -> crate::worker::RuntimeType {
+        use crate::worker::RuntimeType;
+        match self {
+            Self::Sglang(_) => RuntimeType::Sglang,
+            Self::Vllm(_) => RuntimeType::Vllm,
+            Self::Trtllm(_) => RuntimeType::Trtllm,
+            Self::Mlx(_) => RuntimeType::Mlx,
+            Self::TokenSpeed(_) => RuntimeType::TokenSpeed,
+        }
+    }
+
     pub async fn connect(
         url: &str,
         runtime_type: &str,
@@ -534,9 +547,7 @@ impl GrpcClient {
             }
             Self::TokenSpeed(client) => {
                 let tokenspeed_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::TokenSpeed(data) => {
-                        data.try_export_encoder_inputs_nixl_remote().into_proto()
-                    }
+                    MultimodalData::TokenSpeed(data) => data.into_proto(true),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
                 finish_tokenspeed_request(tokenspeed_mm, |mm| {
@@ -628,9 +639,7 @@ impl GrpcClient {
             }
             Self::TokenSpeed(client) => {
                 let tokenspeed_mm = options.multimodal_inputs.map(|mm| match mm {
-                    MultimodalData::TokenSpeed(data) => {
-                        data.try_export_encoder_inputs_nixl_remote().into_proto()
-                    }
+                    MultimodalData::TokenSpeed(data) => data.into_proto(true),
                     _ => unreachable!("caller guarantees matching variant"),
                 });
                 finish_tokenspeed_request(tokenspeed_mm, |mm| {

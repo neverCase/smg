@@ -17,7 +17,7 @@ use crate::{
         error,
         grpc::{
             context::{EncodeWorkerAssignment, PreparationOutput, RequestContext, WorkerSelection},
-            multimodal::{self, MultimodalIntermediate},
+            multimodal,
         },
     },
     worker::{
@@ -170,12 +170,53 @@ impl PipelineStage for WorkerSelectionStage {
             }
         };
 
+        // Reject an unsupported (backend, modality) combination now that the
+        // runtime is known, before request building fetches/preprocesses media
+        // only to fail deep in assembly. The prefill leg builds the request in
+        // disaggregated mode, so its runtime is the one that must support the
+        // request's modalities.
+        if let Some(intermediate) = multimodal_intermediate(prep) {
+            if let Err(err) = multimodal::ensure_backend_supports_modalities(
+                selection_runtime(&workers),
+                intermediate,
+            ) {
+                return Err(error::bad_request(
+                    "multimodal_not_supported",
+                    format!("{err}"),
+                ));
+            }
+        }
+
         ctx.state.workers = Some(workers);
         Ok(None)
     }
 
     fn name(&self) -> &'static str {
         "WorkerSelection"
+    }
+}
+
+/// Runtime of the leg that builds the generate request: the sole worker in
+/// regular mode, the prefill worker in disaggregated (PD/EPD) mode.
+fn selection_runtime(workers: &WorkerSelection) -> RuntimeType {
+    match workers {
+        WorkerSelection::Single { worker } => worker.metadata().spec.runtime_type,
+        WorkerSelection::Disaggregated { runtime_type, .. } => *runtime_type,
+    }
+}
+
+/// Borrow the request's multimodal intermediate, if any.
+fn multimodal_intermediate(
+    prep: &PreparationOutput,
+) -> Option<&multimodal::MultimodalIntermediate> {
+    match prep {
+        PreparationOutput::Chat {
+            processed_messages, ..
+        }
+        | PreparationOutput::Messages {
+            processed_messages, ..
+        } => processed_messages.multimodal_intermediate.as_ref(),
+        _ => None,
     }
 }
 
@@ -442,9 +483,13 @@ impl WorkerSelectionStage {
             .iter()
             .map(|w| w.metadata().spec.runtime_type)
             .find(|runtime| {
-                all_decode
-                    .iter()
-                    .any(|w| w.metadata().spec.runtime_type == *runtime)
+                // The current EPD multimodal encoder adapter is TokenSpeed-
+                // specific. Do not select a shared SGLang/vLLM runtime only to
+                // reject it later during request building.
+                (!needs_encode || *runtime == RuntimeType::TokenSpeed)
+                    && all_decode
+                        .iter()
+                        .any(|w| w.metadata().spec.runtime_type == *runtime)
                     && (!needs_encode
                         || all_encode
                             .iter()
@@ -554,19 +599,10 @@ impl WorkerSelectionStage {
 }
 
 fn encode_item_hashes(prep: &PreparationOutput) -> anyhow::Result<Vec<Vec<u8>>> {
-    let intermediate = match prep {
-        PreparationOutput::Chat {
-            processed_messages, ..
-        }
-        | PreparationOutput::Messages {
-            processed_messages, ..
-        } => processed_messages.multimodal_intermediate.as_ref(),
-        _ => None,
-    };
-    let Some(MultimodalIntermediate::Precomputed(precomputed)) = intermediate else {
+    let Some(intermediate) = multimodal_intermediate(prep) else {
         return Ok(Vec::new());
     };
-    multimodal::precomputed_encode_routing_hashes(precomputed)
+    multimodal::encode_routing_hashes(intermediate)
 }
 
 fn assign_encode_workers(
