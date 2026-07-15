@@ -1,28 +1,111 @@
-//! Backend-specific EPD encode adapters.
+//! EPD encode stage: plan the encode-worker rendezvous and dispatch payloads.
 //!
-//! Request building owns encode rendezvous planning; request execution owns
-//! encode-worker dispatch. This module owns backend wire details: item assembly,
+//! Runs after client acquisition and before request building. Borrows the
+//! multimodal intermediate, mints one bootstrap room per encode item, and
+//! serializes the encode payload with pixels for the encode workers, landing the
+//! results in `ProcessingState::encode_outputs`:
+//!
+//! - request building injects the per-item bootstrap info into the prefill
+//!   request and drops the prefill pixels;
+//! - request execution dispatches the encode jobs alongside the prefill/decode
+//!   leg.
+//!
+//! Also owns the backend wire details for EPD encode: item assembly,
 //! transport-specific tensor payloads, and the encode-worker RPC.
 
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use axum::response::Response;
 use rand::RngExt;
 use smg_grpc_client::{
     common_proto,
     tokenspeed_encoder::{tokenspeed_encoder_proto as tokenspeed_encoder, TokenSpeedEncoderClient},
 };
+use tracing::error;
 use uuid::Uuid;
 
-use super::{
-    client::GrpcClient,
-    context::{ClientSelection, WorkerSelection},
-    multimodal::{assemble_tokenspeed_for_encode, mm_rdma_exporter, MultimodalIntermediate},
-    proto_wrapper::{
-        cleanup_mm_shm_handles, cleanup_tokenspeed_items_encoder_shm,
-        collect_tokenspeed_multimodal_inputs_shm_handles, stage_tokenspeed_tensor_rdma,
-        EncodeItemBootstrapInfo, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
+use super::PipelineStage;
+use crate::{
+    routers::{
+        error,
+        grpc::{
+            client::GrpcClient,
+            context::{ClientSelection, EncodeOutputs, RequestContext, WorkerSelection},
+            multimodal::{
+                assemble_tokenspeed_for_encode, mm_rdma_exporter, MultimodalIntermediate,
+            },
+            proto_wrapper::{
+                cleanup_mm_shm_handles, cleanup_tokenspeed_items_encoder_shm,
+                collect_tokenspeed_multimodal_inputs_shm_handles, stage_tokenspeed_tensor_rdma,
+                EncodeItemBootstrapInfo, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
+            },
+        },
     },
+    worker::DEFAULT_BOOTSTRAP_PORT,
 };
-use crate::worker::DEFAULT_BOOTSTRAP_PORT;
+
+/// No-op unless the request is multimodal and worker selection produced encode
+/// assignments; otherwise `encode_outputs` stays `None` and downstream stages
+/// take the plain prefill path.
+pub(crate) struct EncodeStage;
+
+impl EncodeStage {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl PipelineStage for EncodeStage {
+    async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
+        if ctx
+            .state
+            .workers
+            .as_ref()
+            .and_then(WorkerSelection::encode_assignments)
+            .is_none_or(|assignments| assignments.is_empty())
+        {
+            return Ok(None);
+        }
+
+        let Some(intermediate) = ctx.state.multimodal_intermediate.as_ref() else {
+            return Ok(None);
+        };
+
+        let plan = build_plan(
+            intermediate,
+            ctx.state.clients.as_ref(),
+            ctx.state.workers.as_ref(),
+        )
+        .map_err(|e| {
+            error!(function = "EncodeStage::execute", error = %e, "Failed to plan EPD encode");
+            error::bad_request("multimodal_not_supported", format!("{e}"))
+        })?;
+
+        // No items resolved to encode work: leave `encode_outputs` unset so
+        // request building takes the plain prefill path (with pixels) rather
+        // than the pixel-drop encode path.
+        if plan.is_empty() {
+            return Ok(None);
+        }
+
+        let (bootstrap_info, dispatch) = plan.into_parts();
+        ctx.state.encode_outputs = Some(EncodeOutputs {
+            bootstrap_info,
+            dispatch,
+        });
+        Ok(None)
+    }
+
+    fn name(&self) -> &'static str {
+        "Encode"
+    }
+
+    #[cfg(test)]
+    fn signature(&self) -> String {
+        "EncodeStage".to_string()
+    }
+}
 
 pub(crate) struct EncodePlan {
     bootstrap_info: Vec<EncodeItemBootstrapInfo>,
@@ -159,14 +242,6 @@ impl Drop for PreparedEncodeItem {
     }
 }
 
-pub(crate) fn build_plan_from_intermediate(
-    intermediate: &MultimodalIntermediate,
-    clients: Option<&ClientSelection>,
-    workers: Option<&WorkerSelection>,
-) -> Result<EncodePlan> {
-    build_plan(intermediate, clients, workers)
-}
-
 fn build_plan(
     intermediate: &MultimodalIntermediate,
     clients: Option<&ClientSelection>,
@@ -233,7 +308,7 @@ fn build_plan(
     })
 }
 
-pub(crate) fn prepare_items(
+fn prepare_items(
     intermediate: &MultimodalIntermediate,
     clients: Option<&ClientSelection>,
     workers: Option<&WorkerSelection>,
@@ -295,4 +370,138 @@ async fn send_tokenspeed_encode_rpc(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_plan_is_empty_and_yields_no_jobs() {
+        let plan = EncodePlan {
+            bootstrap_info: Vec::new(),
+            dispatch: EncodeDispatchPlan::new(Vec::new()),
+        };
+        assert!(plan.is_empty());
+        let (bootstrap_info, dispatch) = plan.into_parts();
+        assert!(bootstrap_info.is_empty());
+        assert_eq!(dispatch.len(), 0);
+        assert!(dispatch.into_jobs().is_empty());
+    }
+
+    /// Real `/dev/shm` segments back the encode jobs, so these run only on
+    /// Linux. They prove the encode jobs' SHM Drop guards move with the owning
+    /// state: dropping it before dispatch reclaims the segment, while a
+    /// dispatched item transfers ownership off the guard.
+    #[cfg(target_os = "linux")]
+    mod shm_lifecycle {
+        use std::collections::HashMap;
+
+        use smg_grpc_client::common_proto::ShmHandle;
+
+        use super::*;
+        use crate::routers::grpc::{
+            context::{EncodeOutputs, ProcessingState},
+            proto_wrapper::{
+                mm_shm_dev_writable, write_tokenspeed_shm_with, TokenSpeedModality,
+                TokenSpeedTensor,
+            },
+        };
+
+        fn shm_path(name: &str) -> std::path::PathBuf {
+            std::path::PathBuf::from("/dev/shm").join(name)
+        }
+
+        /// Build a `PreparedEncodeItem` whose encoder input is a freshly-created
+        /// `/dev/shm` segment, plus the path to that segment. The item's `Drop`
+        /// (cleanup_on_drop=true) is expected to unlink the segment.
+        fn tokenspeed_item_backed_by_shm() -> (PreparedEncodeItem, std::path::PathBuf) {
+            let payload = vec![7u8; 4096];
+            let handle: ShmHandle = write_tokenspeed_shm_with(payload.len(), |out| {
+                out.copy_from_slice(&payload);
+                Ok(())
+            })
+            .expect("write /dev/shm segment");
+            let path = shm_path(&handle.name);
+            assert!(path.exists(), "SHM segment must exist after creation");
+
+            let item = TokenSpeedMultimodalItem {
+                modality: TokenSpeedModality::Image,
+                encoder_input: TokenSpeedTensor::shm(handle, vec![1, 4096], "float32".to_string()),
+                model_specific_tensors: HashMap::new(),
+                placeholder_token_id: None,
+                mm_placeholders: Vec::new(),
+                content_hash: vec![1, 2, 3],
+            };
+            (
+                PreparedEncodeItem::tokenspeed(
+                    item, /*shm_enabled=*/ true, /*shm_min_bytes=*/ 0,
+                ),
+                path,
+            )
+        }
+
+        /// Dropping the owning `ProcessingState` (as a `RequestContext` drop
+        /// would, on early return / cancellation) before dispatch must reclaim
+        /// the encode jobs' `/dev/shm` segments via `PreparedEncodeItem`'s `Drop`.
+        #[test]
+        fn dropping_state_before_dispatch_reclaims_encode_shm() {
+            if !mm_shm_dev_writable() {
+                // Linux container without a usable /dev/shm; skip rather than fail.
+                return;
+            }
+
+            let (item, path) = tokenspeed_item_backed_by_shm();
+            let dispatch = EncodeDispatchPlan::new(vec![PreparedEncodeJob {
+                item,
+                endpoint: "http://encode-worker:9000".to_string(),
+                bootstrap_room: 42,
+            }]);
+            assert!(!dispatch.is_empty());
+
+            let state = ProcessingState {
+                encode_outputs: Some(EncodeOutputs {
+                    bootstrap_info: Vec::new(),
+                    dispatch,
+                }),
+                ..ProcessingState::default()
+            };
+
+            // Segment is still live while the state owns the plan.
+            assert!(
+                path.exists(),
+                "SHM segment must stay live until the owning state drops"
+            );
+
+            // Drop the state without ever dispatching (cancellation / early return).
+            drop(state);
+
+            assert!(
+                !path.exists(),
+                "dropping the owning state before dispatch must unlink the encode SHM segment"
+            );
+        }
+
+        /// dispatch() disarms the item's own Drop (cleanup_on_drop=false) and
+        /// hands cleanup to the send-path guard, which reclaims the segment after
+        /// the send attempt — so even a failed dispatch reclaims exactly once
+        /// (no leak, and the disarmed Drop cannot double-unlink).
+        #[tokio::test]
+        async fn dispatch_reclaims_shm_via_send_path_guard() {
+            if !mm_shm_dev_writable() {
+                return;
+            }
+
+            let (item, path) = tokenspeed_item_backed_by_shm();
+
+            // Bogus endpoint: the encode RPC fails, but the send-path guard still
+            // reclaims the segment when dispatch() returns.
+            let _ = item.dispatch("http://127.0.0.1:1".to_string(), 7).await;
+
+            assert!(
+                !path.exists(),
+                "dispatch must reclaim the encode SHM segment (no leak, no double-unlink)"
+            );
+        }
+    }
 }

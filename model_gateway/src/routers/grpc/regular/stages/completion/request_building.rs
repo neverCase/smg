@@ -104,12 +104,19 @@ impl PipelineStage for CompletionRequestBuildingStage {
             helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
         }
 
-        ctx.state.execution_plan =
-            Some(ExecutionPlan::generate(self.plan_kind, proto_request, None));
+        ctx.state.execution_plan = Some(ExecutionPlan::generate(self.plan_kind, proto_request));
         Ok(None)
     }
 
     fn name(&self) -> &'static str {
         "CompletionRequestBuilding"
+    }
+
+    #[cfg(test)]
+    fn signature(&self) -> String {
+        format!(
+            "CompletionRequestBuildingStage(inject_pd_metadata={}, {:?})",
+            self.inject_pd_metadata, self.plan_kind
+        )
     }
 }

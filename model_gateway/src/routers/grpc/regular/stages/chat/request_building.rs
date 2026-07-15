@@ -82,21 +82,13 @@ impl PipelineStage for ChatRequestBuildingStage {
         // Build chat request
         let request_id = format!("chatcmpl-{}", Uuid::now_v7());
 
-        // Assemble backend-specific multimodal data now that the backend is known.
-        // In EPD, request building also mints the encode->prefill rooms and
-        // carries the encode dispatch plan into the execution plan.
-        let mut encode_plan = None;
-        let multimodal_data = if let Some(intermediate) = processed_messages.multimodal_intermediate
-        {
-            let planned_encode =
-                helpers::plan_epd_encode(&intermediate, clients, ctx.state.workers.as_ref())
-                    .map_err(|e| {
-                        error!(function = "ChatRequestBuildingStage::execute", error = %e, "Failed to plan EPD encode");
-                        error::bad_request("multimodal_not_supported", format!("{e}"))
-                    })?;
-            let is_encode_routed = planned_encode.is_some();
-            encode_plan = planned_encode;
+        // `encode_outputs` set by EncodeStage selects the pixel-drop assembly path.
+        let is_encode_routed = ctx.state.encode_outputs.is_some();
 
+        // Assemble backend-specific multimodal data now that the backend is known;
+        // take the intermediate here for the prefill serialization. When
+        // encode-routed, drop the prefill pixels.
+        let multimodal_data = if let Some(intermediate) = ctx.state.multimodal_intermediate.take() {
             let assembled = if is_encode_routed {
                 assemble_multimodal_data_after_encode(
                     intermediate,
@@ -156,16 +148,12 @@ impl PipelineStage for ChatRequestBuildingStage {
             }
         }
 
-        // EPD: request building minted the per-item encode bootstrap info and
-        // planned the encode-worker dispatch. Inject the bootstrap info into the
-        // prefill request; the dispatch plan stays attached to ExecutionPlan.
-        let encode_dispatch = if let Some(plan) = encode_plan {
-            let (bootstrap_info, dispatch) = plan.into_parts();
-            proto_request.set_encode_bootstrap_info(bootstrap_info);
-            Some(dispatch)
-        } else {
-            None
-        };
+        // EPD: inject the per-item encode bootstrap info into the prefill
+        // request; the dispatch plan stays on `encode_outputs` for request
+        // execution to take.
+        if let Some(outputs) = ctx.state.encode_outputs.as_mut() {
+            proto_request.set_encode_bootstrap_info(std::mem::take(&mut outputs.bootstrap_info));
+        }
 
         // EPD: inject the prefill->decode KV rendezvous for backends that carry it
         // in the request. Runs before execute_parallel_pd clones the request, so
@@ -174,15 +162,19 @@ impl PipelineStage for ChatRequestBuildingStage {
             helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
         }
 
-        ctx.state.execution_plan = Some(ExecutionPlan::generate(
-            self.plan_kind,
-            proto_request,
-            encode_dispatch,
-        ));
+        ctx.state.execution_plan = Some(ExecutionPlan::generate(self.plan_kind, proto_request));
         Ok(None)
     }
 
     fn name(&self) -> &'static str {
         "ChatRequestBuilding"
+    }
+
+    #[cfg(test)]
+    fn signature(&self) -> String {
+        format!(
+            "ChatRequestBuildingStage(inject_pd_metadata={}, {:?})",
+            self.inject_pd_metadata, self.plan_kind
+        )
     }
 }
