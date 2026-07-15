@@ -23,10 +23,11 @@ use tracing::debug;
 
 use super::{
     client::GrpcClient,
-    epd_encode::EncodeDispatchPlan,
-    multimodal::MultimodalComponents,
+    common::stages::encode::EncodeDispatchPlan,
+    multimodal::{MultimodalComponents, MultimodalIntermediate},
     proto_wrapper::{
-        ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest, ProtoStream,
+        EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
+        ProtoRequest, ProtoStream,
     },
 };
 use crate::{
@@ -110,6 +111,16 @@ pub(crate) struct ProcessingState {
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
 
+    /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
+    /// can borrow it for the with-pixels encode serialization before request
+    /// building `take()`s it for the prefill serialization.
+    pub multimodal_intermediate: Option<MultimodalIntermediate>,
+
+    /// `Some` iff the request is multimodal EPD and worker selection produced
+    /// encode assignments. Request building injects the bootstrap info and drops
+    /// prefill pixels; request execution `take()`s the dispatch plan.
+    pub encode_outputs: Option<EncodeOutputs>,
+
     /// Resolved tokenizer (set once in preparation, reused in response processing)
     /// This avoids redundant registry lookups across pipeline stages.
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
@@ -133,14 +144,25 @@ pub(crate) struct ProcessingState {
     pub response: ResponseState,
 }
 
+/// Per-item bootstrap rendezvous info for prefill, plus the dispatch plan that
+/// fans out to encode workers.
+///
+/// Not `#[derive(Debug)]`: `EncodeDispatchPlan` transitively holds
+/// non-`Debug` raw proto payloads (`TokenSpeedMultimodalItem`).
+///
+/// Owns the encode jobs' SHM/RDMA Drop guards: dropping this before request
+/// execution dispatches (early return / cancellation) reclaims the staged
+/// `/dev/shm` segments via `PreparedEncodeItem`'s `Drop`.
+pub(crate) struct EncodeOutputs {
+    pub bootstrap_info: Vec<EncodeItemBootstrapInfo>,
+    pub dispatch: EncodeDispatchPlan,
+}
+
 /// Execution shape produced by request building and consumed by request execution.
 pub(crate) enum ExecutionPlan {
     Single(ProtoRequest),
     PrefillDecode(ProtoGenerateRequest),
-    EncodePrefillDecode {
-        request: ProtoGenerateRequest,
-        encode_dispatch: Option<EncodeDispatchPlan>,
-    },
+    EncodePrefillDecode { request: ProtoGenerateRequest },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,24 +173,11 @@ pub(crate) enum ExecutionPlanKind {
 }
 
 impl ExecutionPlan {
-    pub(crate) fn generate(
-        kind: ExecutionPlanKind,
-        request: ProtoGenerateRequest,
-        encode_dispatch: Option<EncodeDispatchPlan>,
-    ) -> Self {
+    pub(crate) fn generate(kind: ExecutionPlanKind, request: ProtoGenerateRequest) -> Self {
         match kind {
-            ExecutionPlanKind::Single => {
-                debug_assert!(encode_dispatch.is_none());
-                Self::Single(ProtoRequest::Generate(request))
-            }
-            ExecutionPlanKind::PrefillDecode => {
-                debug_assert!(encode_dispatch.is_none());
-                Self::PrefillDecode(request)
-            }
-            ExecutionPlanKind::EncodePrefillDecode => Self::EncodePrefillDecode {
-                request,
-                encode_dispatch,
-            },
+            ExecutionPlanKind::Single => Self::Single(ProtoRequest::Generate(request)),
+            ExecutionPlanKind::PrefillDecode => Self::PrefillDecode(request),
+            ExecutionPlanKind::EncodePrefillDecode => Self::EncodePrefillDecode { request },
         }
     }
 

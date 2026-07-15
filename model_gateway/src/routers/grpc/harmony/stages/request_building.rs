@@ -396,12 +396,19 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             }
         }
 
-        ctx.state.execution_plan =
-            Some(ExecutionPlan::generate(self.plan_kind, proto_request, None));
+        ctx.state.execution_plan = Some(ExecutionPlan::generate(self.plan_kind, proto_request));
         Ok(None)
     }
 
     fn name(&self) -> &'static str {
         "HarmonyRequestBuilding"
+    }
+
+    #[cfg(test)]
+    fn signature(&self) -> String {
+        format!(
+            "HarmonyRequestBuildingStage(inject_pd_metadata={}, {:?})",
+            self.inject_pd_metadata, self.plan_kind
+        )
     }
 }

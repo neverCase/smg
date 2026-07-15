@@ -8,10 +8,9 @@ use crate::routers::error;
 pub mod client; // Used by core/
 pub(crate) mod common;
 pub(crate) mod context;
-pub(crate) mod epd_encode;
 pub(crate) mod harmony;
+pub(crate) mod mode;
 pub(crate) mod multimodal;
-pub(crate) mod pd_router; // Used by routers/factory
 pub(crate) mod pipeline;
 pub(crate) mod proto_wrapper;
 pub(crate) mod regular;
@@ -45,14 +44,12 @@ fn validate_text_only_output(request: &ChatCompletionRequest) -> Result<(), Box<
     Ok(())
 }
 
-/// Processed chat messages ready for gRPC generation
+/// Processed chat messages ready for gRPC generation.
+///
+/// The multimodal intermediate lives on `ProcessingState`, not here.
 #[derive(Debug)]
 pub struct ProcessedMessages {
     pub text: String,
-    /// Preprocessed multimodal intermediate (deferred assembly).
-    /// Populated during preparation when multimodal content is detected.
-    /// Assembled into backend-specific `MultimodalData` in request_building.
-    pub(crate) multimodal_intermediate: Option<multimodal::MultimodalIntermediate>,
     pub stop_sequences: Option<StringOrArray>,
 }
 
