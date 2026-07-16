@@ -262,7 +262,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
         _body: &SpeechRequest,
-        _prompt_speech: AudioFile,
+        _prompt_speech: Option<AudioFile>,
         _model_id: &str,
     ) -> Response {
         (

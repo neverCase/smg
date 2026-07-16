@@ -886,7 +886,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         body: &SpeechRequest,
-        prompt_speech: AudioFile,
+        prompt_speech: Option<AudioFile>,
         route: &'static str,
         model_id: &str,
     ) -> Response {
@@ -2197,28 +2197,29 @@ fn build_transcription_form(body: &TranscriptionRequest, audio: AudioFile) -> Re
     Ok(form)
 }
 
-fn build_speech_form(body: &SpeechRequest, prompt_speech: AudioFile) -> Result<Form, String> {
-    let AudioFile {
-        bytes,
-        file_name,
-        content_type,
-    } = prompt_speech;
-
-    // Wrap the already-buffered Bytes in a reqwest Body (Arc refcount, no
-    // additional copy) instead of Part::bytes, which would force a Vec copy.
-    let file_len = bytes.len() as u64;
-    let mut file_part =
-        Part::stream_with_length(reqwest::Body::from(bytes), file_len).file_name(file_name);
-    if let Some(ct) = content_type.as_deref() {
-        file_part = file_part
-            .mime_str(ct)
-            .map_err(|e| format!("Invalid audio content-type '{ct}': {e}"))?;
-    }
-
+fn build_speech_form(body: &SpeechRequest, prompt_speech: Option<AudioFile>) -> Result<Form, String> {
     let mut form = Form::new()
-        .part("prompt_speech", file_part)
         .text("input", body.input.clone())
         .text("model", body.model.clone());
+
+    // 如果有 prompt_speech，添加到 form
+    if let Some(audio) = prompt_speech {
+        let AudioFile {
+            bytes,
+            file_name,
+            content_type,
+        } = audio;
+
+        let file_len = bytes.len() as u64;
+        let mut file_part =
+            Part::stream_with_length(reqwest::Body::from(bytes), file_len).file_name(file_name);
+        if let Some(ct) = content_type.as_deref() {
+            file_part = file_part
+                .mime_str(ct)
+                .map_err(|e| format!("Invalid audio content-type '{ct}': {e}"))?;
+        }
+        form = form.part("prompt_speech", file_part);
+    }
 
     if let Some(ref voice) = body.voice {
         form = form.text("voice", voice.clone());
@@ -2628,7 +2629,7 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
         body: &SpeechRequest,
-        prompt_speech: AudioFile,
+        prompt_speech: Option<AudioFile>,
         model_id: &str,
     ) -> Response {
         self.route_multipart_speech(

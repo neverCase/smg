@@ -934,7 +934,7 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
         body: &SpeechRequest,
-        prompt_speech: AudioFile,
+        prompt_speech: Option<AudioFile>,
         model_id: &str,
     ) -> Response {
         let router = self.select_router_for_request(Some(model_id));

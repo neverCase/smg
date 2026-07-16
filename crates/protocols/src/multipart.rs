@@ -46,7 +46,7 @@ pub struct ImageVariationMultipart {
 #[cfg(feature = "axum")]
 pub struct AudioSpeechMultipart {
     pub request: SpeechRequest,
-    pub prompt_speech: AudioFile,
+    pub prompt_speech: Option<AudioFile>,
 }
 
 #[cfg(feature = "axum")]
@@ -503,16 +503,16 @@ impl<S: Send + Sync> FromRequest<S> for AudioSpeechMultipart {
                     let file_name = field.file_name().map(str::to_string);
                     let content_type = field.content_type().map(str::to_string);
                     let bytes = field.bytes().await.map_err(|e| {
-                        bad_request(format!("Failed to read image file bytes: {e}"))
+                        bad_request(format!("Failed to read prompt_speech file bytes: {e}"))
                     })?;
 
                     if bytes.is_empty() {
-                        return Err(bad_request("Uploaded 'image' part is empty".to_string()));
+                        return Err(bad_request("Uploaded 'prompt_speech' part is empty".to_string()));
                     }
 
                     audios.push(AudioFile {
                         bytes,
-                        file_name: file_name.unwrap_or_else(|| "image".to_string()),
+                        file_name: file_name.unwrap_or_else(|| "prompt_speech".to_string()),
                         content_type,
                     });
                 },
@@ -590,12 +590,15 @@ impl<S: Send + Sync> FromRequest<S> for AudioSpeechMultipart {
         }
         request.model = request.model.trim().to_string();
 
+        let prompt_speech = audios.into_iter().next();
 
-        if audios.is_empty() {
-            return Err(bad_request("Missing required 'prompt_speech' part(s)".to_string()));
+        // 校验：如果没有 prompt_speech，则 voice 必填
+        if prompt_speech.is_none() && request.voice.is_none() {
+            return Err(bad_request(
+                "Either 'prompt_speech' audio or 'voice' field must be provided".to_string()
+            ));
         }
-        let prompt_speech = audios.into_iter().next().unwrap();
-        
+
         Ok(AudioSpeechMultipart { request, prompt_speech })
     }
 }
