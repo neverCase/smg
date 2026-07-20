@@ -10,8 +10,8 @@ use tokio::sync::Mutex;
 use crate::{
     parsers::{
         CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Glm4MoeParser,
-        JsonParser, KimiK2Parser, LlamaParser, MinimaxM2Parser, MistralParser, PassthroughParser,
-        PythonicParser, QwenParser, QwenXmlParser, Step3Parser,
+        InklingParser, JsonParser, KimiK2Parser, LlamaParser, MinimaxM2Parser, MistralParser,
+        PassthroughParser, PythonicParser, QwenParser, QwenXmlParser, SarashinaParser, Step3Parser,
     },
     traits::ToolParser,
 };
@@ -239,13 +239,18 @@ impl ParserRegistry {
         if let Some(parser_name) = mapping.get(model) {
             return Some(parser_name.clone());
         }
-        // Try prefix matching (longest pattern wins)
+        // Case-insensitive substring matching (longest pattern wins) so namespaced
+        // and differently-cased ids (e.g. "org/Inkling-Chat") still resolve.
+        let model_lower = model.to_lowercase();
         mapping
             .iter()
-            .filter(|(pattern, _)| {
-                pattern.ends_with('*') && model.starts_with(&pattern[..pattern.len() - 1])
+            .filter_map(|(pattern, parser_name)| {
+                let stem = pattern.strip_suffix('*')?;
+                model_lower
+                    .contains(&stem.to_lowercase())
+                    .then_some((stem, parser_name))
             })
-            .max_by_key(|(pattern, _)| pattern.len())
+            .max_by_key(|(stem, _)| stem.len())
             .map(|(_, parser_name)| parser_name.clone())
     }
 
@@ -321,10 +326,16 @@ impl ParserFactory {
         registry.register_parser("glm45_moe", || Box::new(Glm4MoeParser::glm45()));
         registry.register_parser("glm47_moe", || Box::new(Glm4MoeParser::glm47()));
         registry.register_parser("step3", || Box::new(Step3Parser::new()));
+        registry.register_parser("sarashina", || Box::new(SarashinaParser::new()));
         registry.register_parser_with_structural_tag(
             "kimik2",
             || Box::new(KimiK2Parser::new()),
             KimiK2Parser::build_structural_tag,
+        );
+        registry.register_parser_with_structural_tag(
+            "inkling",
+            || Box::new(InklingParser::new()),
+            InklingParser::build_structural_tag,
         );
         registry.register_parser("minimax_m2", || Box::new(MinimaxM2Parser::new()));
         registry.register_parser("cohere", || Box::new(CohereParser::new()));
@@ -393,6 +404,10 @@ impl ParserFactory {
         registry.map_model("glm-5*", "glm47_moe");
         registry.map_model("glm-*", "json");
 
+        // Sarashina models
+        registry.map_model("sarashina*", "sarashina");
+        registry.map_model("Sarashina*", "sarashina");
+
         // Step3 models
         registry.map_model("step3*", "step3");
         registry.map_model("Step-3*", "step3");
@@ -401,6 +416,10 @@ impl ParserFactory {
         registry.map_model("kimi-k2*", "kimik2");
         registry.map_model("Kimi-K2*", "kimik2");
         registry.map_model("moonshot*/Kimi-K2*", "kimik2");
+
+        // Inkling models use TML JSON tool calls.
+        registry.map_model("inkling*", "inkling");
+        registry.map_model("Inkling*", "inkling");
 
         // MiniMax models
         registry.map_model("minimax*", "minimax_m2");
