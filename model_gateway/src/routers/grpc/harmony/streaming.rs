@@ -25,8 +25,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, error};
 
 use super::{
-    builder::convert_harmony_logprobs, processor::ResponsesIterationResult,
-    types::HarmonyChannelDelta, HarmonyParserAdapter,
+    builder::{convert_harmony_logprobs, try_harmony_encoding},
+    processor::ResponsesIterationResult,
+    types::HarmonyChannelDelta,
+    HarmonyParserAdapter,
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
@@ -155,6 +157,16 @@ impl HarmonyStreamingProcessor {
                 );
                 let _ = tx.send(Ok(SseEncoder::done()));
             }
+            // Batch results exist only on the completions pipeline.
+            context::ExecutionResult::Batch { .. } => {
+                error!("Harmony streaming not supported for batched results");
+                utils::send_error_sse(
+                    &tx,
+                    "Batched results not supported in Harmony streaming",
+                    "invalid_request_error",
+                );
+                let _ = tx.send(Ok(SseEncoder::done()));
+            }
         }
 
         // Return SSE response
@@ -273,9 +285,10 @@ impl HarmonyStreamingProcessor {
 
                     // Convert logprobs if present and requested
                     let chunk_logprobs = if original_request.logprobs {
+                        let encoding = try_harmony_encoding()?;
                         chunk_wrapper
                             .output_logprobs()
-                            .map(|lp| convert_harmony_logprobs(&lp))
+                            .map(|lp| convert_harmony_logprobs(encoding, &lp))
                     } else {
                         None
                     };
@@ -548,6 +561,10 @@ impl HarmonyStreamingProcessor {
             }
             context::ExecutionResult::Embedding { .. } => {
                 Err("Embeddings not supported in Responses API streaming".to_string())
+            }
+            // Batch results exist only on the completions pipeline.
+            context::ExecutionResult::Batch { .. } => {
+                Err("Batched results not supported in Responses API streaming".to_string())
             }
         }
     }

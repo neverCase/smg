@@ -324,7 +324,7 @@ mod grpc_router_type_tests {
 
     /// Build an `AppContext` for a gRPC `RoutingMode` with the components
     /// `GrpcRouter::new` needs (parser factories always; an initialized MCP
-    /// orchestrator for Regular, which is the only mode that reads it).
+    /// orchestrator for Regular/PD, which build the responses contexts).
     async fn grpc_ctx(mode: RoutingMode) -> Arc<AppContext> {
         let config = RouterConfig::builder()
             .mode(mode)
@@ -371,10 +371,7 @@ mod grpc_router_type_tests {
         )
     }
 
-    // Multi-thread runtime: building the Regular router eagerly constructs the
-    // Harmony pipeline, whose one-shot encoding load uses `block_in_place`
-    // (which panics on a current-thread runtime).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn grpc_router_type_reflects_disaggregation_mode() {
         let cases = [
             (
