@@ -1364,6 +1364,7 @@ mod tests {
             kv_event_monitor: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             remote_auth_client: None,
+            audit_sink: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         })
