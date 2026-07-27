@@ -18,7 +18,7 @@ use tracing::warn;
 use crate::{
     config::RouterConfig,
     worker::{registry::WorkerId, worker::worker_to_info, WorkerRegistry, WorkerType},
-    workflow::{Job, JobQueue},
+    workflow::{Job, JobQueue, WorkerRegistrationMode},
 };
 
 /// Error types for worker service operations
@@ -279,6 +279,7 @@ impl WorkerService {
 
         let job = Job::AddWorker {
             config: Box::new(config),
+            registration_mode: WorkerRegistrationMode::CreateOnly,
         };
 
         self.get_job_queue()?
@@ -303,12 +304,27 @@ impl WorkerService {
     ) -> Result<UpdateWorkerResult, WorkerServiceError> {
         let worker_id = Self::parse_worker_id(worker_id_raw)?;
 
-        let url = self
-            .worker_registry
-            .get_url_by_id(&worker_id)
-            .ok_or_else(|| WorkerServiceError::NotFound {
-                worker_id: worker_id_raw.to_string(),
-            })?;
+        let existing =
+            self.worker_registry
+                .get(&worker_id)
+                .ok_or_else(|| WorkerServiceError::NotFound {
+                    worker_id: worker_id_raw.to_string(),
+                })?;
+        let url = existing.url().to_string();
+
+        // A data-parallel router expands one spec into one worker per rank,
+        // each registered under a rank-suffixed URL. Re-running registration
+        // for a single ID cannot express that, so refuse here instead of
+        // answering 202 and failing in the background.
+        if self.router_config.dp_aware {
+            return Err(WorkerServiceError::BadRequest {
+                message: format!(
+                    "Worker '{url}' belongs to a data-parallel group. \
+                    PUT is not supported for data-parallel workers. \
+                    Use DELETE + POST instead."
+                ),
+            });
+        }
 
         // Validate that the URL in the request body matches the existing worker.
         // URL changes are not supported via replace — use DELETE + POST instead.
@@ -322,10 +338,18 @@ impl WorkerService {
             });
         }
 
-        // Re-run the full registration workflow (model discovery, etc.)
-        // The workflow uses register_or_replace() which does overwrite-then-diff.
+        // Re-run the full registration workflow (model discovery, etc.).
+        // The workflow registers with overwrite-then-diff, bound to the ID and
+        // revision validated above: the job runs after this call returns 202,
+        // so a concurrent DELETE, DELETE + POST, or second PUT must make the
+        // write fail rather than resurrect this worker, overwrite its
+        // successor, or restore this specification over a newer one.
         let job = Job::AddWorker {
             config: Box::new(config),
+            registration_mode: WorkerRegistrationMode::ReplaceById {
+                worker_id: worker_id.as_str().to_string(),
+                expected_revision: existing.revision(),
+            },
         };
 
         let job_queue = self.get_job_queue()?;
