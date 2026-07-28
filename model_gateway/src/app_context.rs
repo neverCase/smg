@@ -20,6 +20,7 @@ use crate::{
     observability::audit_sink::{AuditConfig, AuditSink},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
+    rate_limit::RateLimitManager,
     routers::{
         common::{openai_bridge::FormatRegistry, realtime::RealtimeRegistry},
         grpc::multimodal::MultimodalConfigRegistry,
@@ -53,6 +54,7 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
+    pub rate_limit_manager: Option<Arc<RateLimitManager>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub multimodal_config_registry: Arc<MultimodalConfigRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
@@ -102,6 +104,7 @@ pub struct AppContextBuilder {
     client: Option<Client>,
     router_config: Option<RouterConfig>,
     rate_limiter: Option<Arc<TokenBucket>>,
+    rate_limit_manager: Option<Arc<RateLimitManager>>,
     tokenizer_registry: Option<Arc<TokenizerRegistry>>,
     reasoning_parser_factory: Option<ReasoningParserFactory>,
     tool_parser_factory: Option<ToolParserFactory>,
@@ -156,6 +159,7 @@ impl AppContextBuilder {
             client: None,
             router_config: None,
             rate_limiter: None,
+            rate_limit_manager: None,
             tokenizer_registry: None,
             reasoning_parser_factory: None,
             tool_parser_factory: None,
@@ -191,6 +195,16 @@ impl AppContextBuilder {
     pub fn rate_limiter(mut self, rate_limiter: Option<Arc<TokenBucket>>) -> Self {
         self.rate_limiter = rate_limiter;
         self
+    }
+
+    /// Build the tenant rate limiter from config. `Ok(None)` (feature
+    /// disabled) is a valid, non-fatal outcome. `Err` (enabled but the
+    /// policy YAML failed to load/parse/validate) fails startup — an
+    /// operator who explicitly turned rate limiting on must not get a
+    /// gateway that silently runs unlimited.
+    fn maybe_rate_limit_manager(mut self, config: &RouterConfig) -> Result<Self, String> {
+        self.rate_limit_manager = RateLimitManager::from_config(config)?;
+        Ok(self)
     }
 
     pub fn tokenizer_registry(mut self, tokenizer_registry: Arc<TokenizerRegistry>) -> Self {
@@ -358,6 +372,7 @@ impl AppContextBuilder {
                 .ok_or(AppContextBuildError::MissingField("client"))?,
             router_config,
             rate_limiter: self.rate_limiter,
+            rate_limit_manager: self.rate_limit_manager,
             tokenizer_registry: self
                 .tokenizer_registry
                 .ok_or(AppContextBuildError::MissingField("tokenizer_registry"))?,
@@ -412,6 +427,7 @@ impl AppContextBuilder {
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
+            .maybe_rate_limit_manager(&router_config)?
             .with_tokenizer_registry()
             .with_reasoning_parser_factory()
             .with_tool_parser_factory()
@@ -778,5 +794,42 @@ mod tests {
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
         }));
+    }
+
+    #[test]
+    fn maybe_rate_limit_manager_disabled_is_ok_none() {
+        let config = RouterConfig::default();
+        let result = AppContextBuilder::new().maybe_rate_limit_manager(&config);
+        assert!(result.is_ok());
+        assert!(result.unwrap().rate_limit_manager.is_none());
+    }
+
+    #[test]
+    fn maybe_rate_limit_manager_enabled_with_missing_file_fails_startup() {
+        let config = RouterConfig::builder()
+            .tenant_rate_limit_enabled(true)
+            .tenant_rate_limit_config(Some("/nonexistent/rate_limit.yaml".to_string()))
+            .build_unchecked();
+        assert!(AppContextBuilder::new()
+            .maybe_rate_limit_manager(&config)
+            .is_err());
+    }
+
+    #[test]
+    fn maybe_rate_limit_manager_enabled_with_valid_policy_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rate_limit.yaml");
+        std::fs::write(
+            &path,
+            "default_policy:\n  tokens_per_minute: 1000\n  requests_per_minute: 60\n",
+        )
+        .unwrap();
+        let config = RouterConfig::builder()
+            .tenant_rate_limit_enabled(true)
+            .tenant_rate_limit_config(Some(path.to_str().unwrap().to_string()))
+            .build_unchecked();
+        let result = AppContextBuilder::new().maybe_rate_limit_manager(&config);
+        assert!(result.is_ok());
+        assert!(result.unwrap().rate_limit_manager.is_some());
     }
 }

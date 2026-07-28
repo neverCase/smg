@@ -872,4 +872,21 @@ mod tests {
             assert_eq!(serialized.get("return_audio"), Some(&Value::Bool(value)));
         }
     }
+
+    #[test]
+    fn chat_request_accepts_function_tool_without_parameters() {
+        // https://github.com/lightseekorg/smg/issues/1974 — omitting
+        // `parameters` is spec-legal and must not reject the request.
+        let value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {"type": "function", "function": {"name": "web_search", "description": ""}}
+            ],
+        });
+        let request: ChatCompletionRequest =
+            serde_json::from_value(value).expect("request must deserialize");
+        let tools = request.tools.expect("tools must be present");
+        assert_eq!(tools[0].function.parameters, json!({}));
+    }
 }

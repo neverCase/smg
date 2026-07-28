@@ -38,16 +38,21 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
-    GetLoadsReqOutput,
     ProfileReq,
     ProfileReqType,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
@@ -93,9 +98,9 @@ def _filtered_sampling_defaults(params: dict | None) -> dict:
 
 
 def _convert_loads_to_protobuf(
-    result: GetLoadsReqOutput,
+    result: LoadSnapshot,
 ) -> sglang_scheduler_pb2.SchedulerLoad:
-    """Convert GetLoadsReqOutput dataclass to protobuf SchedulerLoad message."""
+    """Convert a LoadSnapshot to a protobuf SchedulerLoad message."""
     scheduler_load = sglang_scheduler_pb2.SchedulerLoad(
         dp_rank=result.dp_rank,
         num_running_reqs=result.num_running_reqs,
@@ -211,6 +216,18 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.scheduler_info = scheduler_info
         self.start_time = time.time()
         self.health_servicer = health_servicer
+        # SamplingParams.normalize requires a tokenizer whenever string stops
+        # are used; the scheduler matches them with its own tokenizer.
+        if server_args.skip_tokenizer_init:
+            self.tokenizer = None
+        else:
+            self.tokenizer = get_tokenizer(
+                server_args.tokenizer_path,
+                tokenizer_mode=server_args.tokenizer_mode,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                tokenizer_backend=server_args.tokenizer_backend,
+            )
         self.mm_receiver = None
         if (
             self.server_args.language_only
@@ -365,7 +382,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         # Create a special health check request
         sampling_params = SGLSamplingParams(max_new_tokens=1, temperature=0.0)
-        sampling_params.normalize(tokenizer=None)
+        sampling_params.normalize(tokenizer=self.tokenizer)
 
         # Create health check request
         is_generation = self.scheduler_info.get("is_generation")
@@ -377,12 +394,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 rid=rid,
                 input_text="",
                 input_ids=to_token_id_array([0]),
+                input_embeds=None,
+                mm_inputs=None,
+                token_type_ids=None,
                 sampling_params=sampling_params,
                 return_logprob=False,
                 logprob_start_len=-1,
                 top_logprobs_num=0,
                 stream=False,
-                mm_inputs=None,
                 token_ids_logprob=None,
                 require_reasoning=False,
             )
@@ -396,7 +415,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 rid=rid,
                 input_text="",
                 input_ids=to_token_id_array([0]),
-                image_inputs=None,
+                mm_inputs=None,
                 token_type_ids=[0],
                 sampling_params=sampling_params,
             )
@@ -586,8 +605,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """
         Get comprehensive load metrics for all DP ranks.
 
-        Uses the communicator pattern to fetch real-time metrics,
-        providing full parity with the HTTP /v1/loads endpoint.
+        Reads the schedulers' published LoadSnapshots, providing full
+        parity with the HTTP /v1/loads endpoint.
         """
         logger.debug("Receive get loads request")
 
@@ -676,7 +695,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         )
 
         req = ProfileReq(
-            type=ProfileReqType.START_PROFILE,
+            req_type=ProfileReqType.START_PROFILE,
             output_dir=request.output_dir if request.HasField("output_dir") else None,
             start_step=request.start_step if request.HasField("start_step") else None,
             num_steps=request.num_steps if request.HasField("num_steps") else None,
@@ -695,7 +714,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     ) -> common_pb2.ProfileResponse:
         """Stop the profiler and export traces."""
         logger.debug("Receive stop profile request")
-        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+        req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
         return await self._run_profile_req(req, "Stop profiling", context)
 
     async def _run_profile_req(
@@ -921,7 +940,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             image_urls=image_urls,
             rid=grpc_req.request_id,
         )
-        tokenized_req.need_wait_for_image = bool(encode_req.need_wait_for_image)
+        tokenized_req.need_wait_for_mm_inputs = bool(encode_req.need_wait_for_mm_inputs)
         tokenized_req.num_items_assigned = encode_req.num_items_assigned
 
     # Helper methods for request/response conversion
@@ -940,7 +959,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         # Convert sampling params
         sampling_params = self._convert_sampling_params(grpc_req.sampling_params)
-        sampling_params.normalize(tokenizer=None)
+        sampling_params.normalize(tokenizer=self.tokenizer)
 
         # Extract disaggregated params if present
         bootstrap_host = None
@@ -974,7 +993,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             rid=grpc_req.request_id,
             input_text=input_text,
             input_ids=input_ids,
+            input_embeds=None,
             mm_inputs=mm_inputs,
+            token_type_ids=None,
             sampling_params=sampling_params,
             return_logprob=grpc_req.return_logprob,
             logprob_start_len=(
@@ -1001,8 +1022,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         arr = np.frombuffer(tensor_data.data, dtype=np_dtype).reshape(shape)
         return torch.from_numpy(arr)
 
-    def _parse_mm_inputs(self, mm_proto) -> MultimodalInputs:
-        """Parse proto MultimodalInputs into a MultimodalInputs object for the scheduler."""
+    def _parse_mm_inputs(self, mm_proto) -> MultimodalProcessorOutput:
+        """Parse proto MultimodalInputs into a MultimodalProcessorOutput for the scheduler."""
         # Decode pixel_values from typed TensorData field
         pixel_values = self._decode_tensor_data(mm_proto.pixel_values)
 
@@ -1030,7 +1051,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         im_token_id = mm_proto.im_token_id if mm_proto.HasField("im_token_id") else None
 
-        return MultimodalInputs(
+        return MultimodalProcessorOutput(
             mm_items=[mm_item],
             im_token_id=im_token_id,
         )
@@ -1054,13 +1075,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # The scheduler logic expects an integer, not None.
         sampling_params.max_new_tokens = 0
 
-        sampling_params.normalize(tokenizer=None)
+        sampling_params.normalize(tokenizer=self.tokenizer)
 
         return TokenizedEmbeddingReqInput(
             rid=grpc_req.request_id,
             input_text=input_text,
             input_ids=input_ids,
-            image_inputs=None,
+            mm_inputs=None,
             token_type_ids=list(grpc_req.token_type_ids),
             sampling_params=sampling_params,
         )

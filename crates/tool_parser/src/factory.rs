@@ -10,8 +10,9 @@ use tokio::sync::Mutex;
 use crate::{
     parsers::{
         CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Glm4MoeParser,
-        InklingParser, JsonParser, KimiK2Parser, LlamaParser, MinimaxM2Parser, MistralParser,
-        PassthroughParser, PythonicParser, QwenParser, QwenXmlParser, SarashinaParser, Step3Parser,
+        InklingParser, JsonParser, KimiK2Parser, KimiK3Parser, LlamaParser, MinimaxM2Parser,
+        MistralParser, PassthroughParser, PythonicParser, QwenParser, QwenXmlParser,
+        SarashinaParser, Step3Parser,
     },
     traits::ToolParser,
 };
@@ -333,6 +334,11 @@ impl ParserFactory {
             KimiK2Parser::build_structural_tag,
         );
         registry.register_parser_with_structural_tag(
+            "kimi_k3",
+            || Box::new(KimiK3Parser::new()),
+            KimiK3Parser::build_structural_tag,
+        );
+        registry.register_parser_with_structural_tag(
             "inkling",
             || Box::new(InklingParser::new()),
             InklingParser::build_structural_tag,
@@ -416,6 +422,15 @@ impl ParserFactory {
         registry.map_model("kimi-k2*", "kimik2");
         registry.map_model("Kimi-K2*", "kimik2");
         registry.map_model("moonshot*/Kimi-K2*", "kimik2");
+        registry.map_model("kimi-k3*", "kimi_k3");
+        registry.map_model("Kimi-K3*", "kimi_k3");
+        registry.map_model("moonshot*/Kimi-K3*", "kimi_k3");
+        // Underscore spellings (e.g. `kimi_k3`, `Kimi_K3`) as used by some
+        // checkpoint ids; mirrors the reasoning-parser factory, whose glob
+        // matching is case-insensitive but still enumerates both separators.
+        registry.map_model("kimi_k3*", "kimi_k3");
+        registry.map_model("Kimi_K3*", "kimi_k3");
+        registry.map_model("moonshot*/Kimi_K3*", "kimi_k3");
 
         // Inkling models use TML JSON tool calls.
         registry.map_model("inkling*", "inkling");

@@ -416,11 +416,18 @@ pub struct Tool {
     pub function: Function,
 }
 
+/// Per the OpenAI spec, omitting `parameters` defines a function with an
+/// empty parameter list, so a missing field deserializes to an empty schema.
+fn empty_parameters_schema() -> Value {
+    Value::Object(serde_json::Map::new())
+}
+
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Function {
     pub name: String,
     pub description: Option<String>,
+    #[serde(default = "empty_parameters_schema")]
     pub parameters: Value, // JSON Schema
     /// Whether to enable strict schema adherence (OpenAI structured outputs)
     pub strict: Option<bool>,
@@ -899,5 +906,14 @@ mod tests {
         assert!(ConversationRef::Id(String::new()).is_empty());
         assert!(!ConversationRef::Id("conv_1".to_string()).is_empty());
         assert!(ConversationRef::Object { id: String::new() }.is_empty());
+    }
+
+    #[test]
+    fn function_deserializes_without_parameters() {
+        // Per the OpenAI spec, omitting `parameters` defines a function with
+        // an empty parameter list.
+        let value = json!({"name": "web_search", "description": ""});
+        let function: Function = serde_json::from_value(value).expect("parameterless function");
+        assert_eq!(function.parameters, json!({}));
     }
 }

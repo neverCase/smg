@@ -25,13 +25,12 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     FlushCacheReqOutput,
     GetInternalStateReqOutput,
-    GetLoadsReqInput,
-    GetLoadsReqOutput,
     HealthCheckOutput,
     ProfileReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.load_snapshot import LoadSnapshot, create_load_snapshot_reader
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     calibrate_time_diff,
@@ -238,11 +237,14 @@ class GrpcRequestManager:
         # Bootstrap server (passed from serve_grpc, not started here)
         self.bootstrap_server = bootstrap_server
 
+        # Schedulers publish per-dp-rank LoadSnapshots (SHM; zmq for
+        # multi-node DP). This manager fills sglang's TokenizerManager role.
+        self.load_snapshot_reader = create_load_snapshot_reader(
+            server_args, port_args, caller="TokenizerManager"
+        )
+
         # Communicators for request/response patterns with scheduler
         # Note: These must be initialized after send_to_scheduler socket is created
-        self.get_loads_communicator = _GrpcCommunicator(
-            self.send_to_scheduler, fan_out=server_args.dp_size
-        )
         self.profile_communicator = _GrpcCommunicator(
             self.send_to_scheduler, fan_out=server_args.dp_size
         )
@@ -567,8 +569,6 @@ class GrpcRequestManager:
             self.flush_cache_communicator.handle_recv(recv_obj)
         elif isinstance(recv_obj, GetInternalStateReqOutput):
             self.get_internal_state_communicator.handle_recv(recv_obj)
-        elif isinstance(recv_obj, GetLoadsReqOutput):
-            self.get_loads_communicator.handle_recv(recv_obj)
         else:
             return False
         return True
@@ -938,6 +938,11 @@ class GrpcRequestManager:
             except Exception as e:
                 logger.warning(f"Error shutting down bootstrap server: {e}")
 
+        try:
+            self.load_snapshot_reader.close()
+        except Exception as e:
+            logger.warning(f"Error closing load snapshot reader: {e}")
+
         # Close ZMQ sockets
         self.recv_from_scheduler.close()
         if self.recv_from_tokenizer is not None:
@@ -957,30 +962,41 @@ class GrpcRequestManager:
             "last_receive_time": self.last_receive_tstamp,
         }
 
-    async def get_loads(
-        self, include: list[str], dp_rank: int | None = None
-    ) -> list[GetLoadsReqOutput]:
+    async def get_loads(self, include: list[str], dp_rank: int | None = None) -> list[LoadSnapshot]:
         """
-        Get comprehensive load metrics from the scheduler.
-
-        This method uses the communicator pattern to send GetLoadsReqInput to the
-        scheduler and wait for GetLoadsReqOutput responses.
+        Get load metrics from the schedulers' published LoadSnapshots.
 
         Args:
             include: List of metric sections to include (core, memory, spec, lora, disagg, queues, all)
             dp_rank: Optional DP rank filter (None for all ranks)
 
         Returns:
-            List of GetLoadsReqOutput objects, one per scheduler/DP rank
+            List of LoadSnapshot objects, one per scheduler/DP rank
         """
-        req = GetLoadsReqInput(include=include, dp_rank=dp_rank)
-        results = await self.get_loads_communicator(req)
+        sections = set(include) if include else {"all"}
+        invalid = sections - LoadSnapshot.VALID_SECTIONS
+        if invalid:
+            raise ValueError(
+                f"Invalid include sections: {sorted(invalid)}. "
+                f"Valid options: {sorted(LoadSnapshot.VALID_SECTIONS)}"
+            )
 
-        # Filter by dp_rank if specified
+        snapshots = self.load_snapshot_reader.read_all()
         if dp_rank is not None:
-            results = [r for r in results if r.dp_rank == dp_rank]
-
-        return results
+            snapshots = [s for s in snapshots if s.dp_rank == dp_rank]
+        if "all" not in sections:
+            for snapshot in snapshots:
+                if "memory" not in sections:
+                    snapshot.memory = None
+                if "spec" not in sections:
+                    snapshot.speculative = None
+                if "lora" not in sections:
+                    snapshot.lora = None
+                if "disagg" not in sections:
+                    snapshot.disaggregation = None
+                if "queues" not in sections:
+                    snapshot.queues = None
+        return snapshots
 
     # Communicators that callers may address through send_communicator_req.
     _PUBLIC_COMMUNICATORS = frozenset(
@@ -988,7 +1004,6 @@ class GrpcRequestManager:
             "profile_communicator",
             "flush_cache_communicator",
             "get_internal_state_communicator",
-            "get_loads_communicator",
         }
     )
 

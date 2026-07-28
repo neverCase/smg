@@ -468,6 +468,17 @@ struct CliArgs {
     #[arg(long, default_value_t = 32, help_heading = "Priority Scheduler")]
     priority_scheduler_tenant_metric_top_n: u32,
 
+    // ==================== Tenant Rate Limit ====================
+    /// Enable per-tenant LLM token/request rate limiting. When unset
+    /// (default), no rate limiter is constructed.
+    #[arg(long, help_heading = "Tenant Rate Limit")]
+    tenant_rate_limit_enabled: bool,
+
+    /// Path to the tenant-rate-limit YAML. Required when
+    /// `--tenant-rate-limit-enabled` is set.
+    #[arg(long, help_heading = "Tenant Rate Limit")]
+    tenant_rate_limit_config: Option<String>,
+
     /// Token bucket refill rate (tokens per second)
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
@@ -1399,6 +1410,8 @@ impl CliArgs {
             .priority_scheduler_default_max_class(self.priority_scheduler_default_max_class.clone())
             .priority_scheduler_config(self.priority_scheduler_config.clone())
             .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
+            .tenant_rate_limit_enabled(self.tenant_rate_limit_enabled)
+            .tenant_rate_limit_config(self.tenant_rate_limit_config.clone())
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(RetryConfig {
                 max_retries: self.retry_max_retries,

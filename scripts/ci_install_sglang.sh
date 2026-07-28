@@ -21,7 +21,7 @@ echo "Using uv version: $(uv --version)"
 # Install CUDA toolkit (nvcc) — required for SGLang JIT kernel compilation.
 # SGLang >= 0.5.9 JIT-compiles CUDA kernels (RoPE, etc.) at runtime via tvm_ffi,
 # which invokes nvcc. The CI runners have CUDA runtime (driver) but not the compiler.
-# sglang 0.5.12 pins torch==2.11.0, whose default PyPI wheels are CUDA 13, so the
+# sglang 0.5.16 pins torch==2.11.0, whose default PyPI wheels are CUDA 13, so the
 # compiler must be nvcc 13 to match the runtime headers (a 12.x nvcc is replaced).
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 if [ ! -x "${CUDA_HOME}/bin/nvcc" ] || ! "${CUDA_HOME}/bin/nvcc" --version | grep -q "release 13\."; then
@@ -43,18 +43,7 @@ fi
 
 # Install SGLang with all dependencies
 echo "Installing SGLang..."
-uv pip install --prerelease=allow "sglang[all]==0.5.12.post1"
-
-# Work around NVIDIA/cutlass#3259 until the fix ships in CUTLASS 4.6.
-uv pip install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==4.5.2"
-
-# sglang 0.5.12.post1 leaves its `kernels` dependency unpinned, so the resolver
-# picks kernels >=0.15, which requires LayerRepository(revision=/version=) —
-# an argument the transformers 5.6.0 hub_kernels integration (pinned by sglang)
-# does not pass. `import sglang` then dies at module load with
-# "ValueError: Either a revision or a version must be specified."
-# Pin to the band sglang upstream main now uses; drop once a release carries it.
-uv pip install "kernels>=0.14.1,<0.15"
+uv pip install --prerelease=allow "sglang[all]==0.5.16"
 
 # Install flashinfer-jit-cache: sglang bundles flashinfer_python but only for attention ops.
 # Multi-GPU models need trtllm_comm kernels (fused allreduce + layernorm) which FlashInfer
@@ -72,13 +61,13 @@ fi
 
 # Install mooncake for SGLang PD disaggregation (KV transfer)
 # Mooncake's native transfer engine requires InfiniBand/RDMA libraries at runtime.
-# Package and pin track upstream sglang v0.5.12.post1 CI on the cu13 stack
+# Package and pin track upstream sglang v0.5.16 CI on the cu13 stack
 # (cuda13 wheel variant + nvrtc, since torch 2.11 defaults to CUDA 13):
-# https://github.com/sgl-project/sglang/blob/v0.5.12.post1/scripts/ci/cuda/ci_install_dependency.sh
+# https://github.com/sgl-project/sglang/blob/v0.5.16/scripts/ci/cuda/ci_install_dependency.sh
 echo "Installing mooncake system dependencies..."
 sudo apt-get install -y --no-install-recommends libnuma-dev libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
 echo "Installing mooncake..."
-uv pip install mooncake-transfer-engine-cuda13==0.3.10.post2 nvidia-cuda-nvrtc
+uv pip install mooncake-transfer-engine-cuda13==0.3.11.post1 nvidia-cuda-nvrtc
 
 # Install gRPC packages from source (not PyPI) so PR changes are always tested
 echo "Installing smg-grpc-proto and smg-grpc-servicer from source..."
