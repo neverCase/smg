@@ -1139,7 +1139,7 @@ pub fn build_app(
         middleware::route_request_meta_middleware,
     ))
     .route_layer(axum::middleware::from_fn_with_state(
-        auth_config.clone(),
+        serving_auth_config.clone(),
         middleware::auth_middleware,
     ));
 

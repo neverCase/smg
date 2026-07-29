@@ -622,6 +622,9 @@ async fn run_flush_loop(
     cfg: AuditConfig,
     stats: Arc<Stats>,
 ) {
+    // 保持 stats 在循环期间存活
+    let _stats_guard = stats.clone();
+
     let mut buf: Vec<AuditLog> = Vec::with_capacity(cfg.batch_size);
     let mut ticker = tokio::time::interval(cfg.flush_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
