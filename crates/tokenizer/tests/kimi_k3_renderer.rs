@@ -180,6 +180,11 @@ fn thinking_effort_invalid_is_rejected() {
 /// End-to-end: a tokenizer loaded from a K3 directory (no chat template at all)
 /// must load successfully, detect the K3 renderer, and render XTML through
 /// `apply_chat_template`.
+///
+/// `apply_chat_template` stands in for the checkpoint's `tokenization_kimi`
+/// wrapper, so its output is the plain fixture *plus* the `max` effort
+/// directive. The expected bytes are the `thinking_effort_low` fixture with its
+/// effort word swapped — the directive is identical at every level.
 #[test]
 fn tokenizer_loads_and_renders_k3_without_chat_template() {
     let dir = TempDir::new().unwrap();
@@ -205,5 +210,11 @@ fn tokenizer_loads_and_renders_k3_without_chat_template() {
         )
         .expect("K3 render should succeed");
 
-    assert_eq!(rendered, fixture_text("plain_user_thinking"));
+    let expected = fixture_text("thinking_effort_low")
+        .replace("`thinking_effort=low`", "`thinking_effort=max`");
+    assert_eq!(rendered, expected);
+    assert!(
+        rendered.ends_with(&fixture_text("plain_user_thinking")),
+        "the directive is the only addition: {rendered}"
+    );
 }

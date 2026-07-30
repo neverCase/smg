@@ -16,10 +16,20 @@ use serde_json::json;
 use tracing::warn;
 
 use crate::{
-    config::RouterConfig,
+    config::{validate_worker_url, RouterConfig},
     worker::{registry::WorkerId, worker::worker_to_info, WorkerRegistry, WorkerType},
     workflow::{Job, JobQueue, WorkerRegistrationMode},
 };
+
+/// Validate the URL of an incoming worker-management request, translating a
+/// config-layer rejection into `400 Bad Request`. Must run before
+/// `WorkerRegistry::reserve_id_for_url` so rejected input can never leave an
+/// orphaned reservation (#1533).
+fn validate_worker_url_request(url: &str) -> Result<(), WorkerServiceError> {
+    validate_worker_url(url).map_err(|e| WorkerServiceError::BadRequest {
+        message: e.to_string(),
+    })
+}
 
 /// Error types for worker service operations
 #[derive(Debug)]
@@ -256,6 +266,8 @@ impl WorkerService {
         &self,
         config: WorkerSpec,
     ) -> Result<CreateWorkerResult, WorkerServiceError> {
+        validate_worker_url_request(&config.url)?;
+
         if self.router_config.api_key.is_some() && config.api_key.is_none() {
             warn!(
                 "Adding worker {} without API key while router has API key configured. \
@@ -563,5 +575,53 @@ mod tests {
         let result = service.list_workers(Some("moonshotai/Kimi-K2.5"));
         assert_eq!(result.workers.len(), 1);
         assert_eq!(result.total, 1);
+    }
+
+    fn worker_spec(url: &str) -> WorkerSpec {
+        serde_json::from_value(json!({ "url": url })).expect("worker spec")
+    }
+
+    #[tokio::test]
+    async fn create_worker_rejects_schemeless_url_before_reserving() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = make_service(registry);
+
+        let err = service
+            .create_worker(worker_spec("10.0.0.5:8000"))
+            .await
+            .expect_err("schemeless URL must be rejected at the boundary");
+
+        assert!(matches!(err, WorkerServiceError::BadRequest { .. }));
+        assert_eq!(err.error_code(), "BAD_REQUEST");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_worker_rejects_mixed_case_scheme() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = make_service(registry);
+
+        let err = service
+            .create_worker(worker_spec("HTTP://10.0.0.5:8000"))
+            .await
+            .expect_err("mixed-case scheme must be rejected at the boundary");
+
+        assert!(matches!(err, WorkerServiceError::BadRequest { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_worker_accepts_schemed_url() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = make_service(registry);
+
+        // The harness leaves the job queue uninitialized, so a valid URL
+        // passes boundary validation and stops at queue submission —
+        // proving validation did not reject it.
+        let err = service
+            .create_worker(worker_spec("grpc://10.0.0.5:8000"))
+            .await
+            .expect_err("queue is uninitialized in the test harness");
+
+        assert!(matches!(err, WorkerServiceError::QueueNotInitialized));
     }
 }

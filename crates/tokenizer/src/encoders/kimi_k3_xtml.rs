@@ -28,13 +28,13 @@
 //! their special-token ids while surrounding text is encoded as ordinary BPE —
 //! a cross-cutting change across this renderer family, tracked as future work.
 //!
-//! # Deferred (TODO)
+//! # Image prompts are not built here
 //!
-//! The following `build_chat_segments` branches are intentionally not ported yet
-//! (not exercised by the current gRPC path / golden fixtures):
-//! - multimodal `image_prompts` substitution (image parts render as the bare
-//!   `<|kimi_image_placeholder|>` marker; a separate multimodal task will wire
-//!   real image prompts through).
+//! The reference splices a per-image `<|media_begin|>image {w}x{h}…` block in
+//! afterwards (`kimi_k3_processor.py::update_raw_text`). This renderer runs
+//! before any media is fetched, so those dimensions do not exist yet: the
+//! gateway emits one bare `<|media_pad|>` anchor per image and expands it
+//! during prompt expansion — see `llm_multimodal::registry::kimi_k3`.
 
 use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
@@ -47,7 +47,17 @@ const SEP_TOKEN: &str = "<|sep|>";
 const END_OF_MSG_TOKEN: &str = "<|end_of_msg|>";
 const IMAGE_PLACEHOLDER: &str = "<|kimi_image_placeholder|>";
 
-/// Render a Kimi-K3 chat prompt to an XTML `String`.
+/// The effort the reference applies when a request names none.
+///
+/// `build_chat_segments` injects no directive; the served entry point above it
+/// (`tokenization_kimi.apply_chat_template`, which vLLM calls) first runs
+/// `kwargs.setdefault("thinking_effort", "max")`.
+pub const DEFAULT_THINKING_EFFORT: &str = "max";
+
+/// Render a Kimi-K3 chat prompt to an XTML `String`, exactly as the Python
+/// `build_chat_segments` does — emitting no `thinking-effort` directive when
+/// the request names none. Callers standing in for the served entry point want
+/// [`apply_kimi_k3_xtml_with_effort_default`].
 ///
 /// `params.tools` (when non-empty) produces the leading `tool-declare` system
 /// message. `params.add_generation_prompt` appends the assistant generation
@@ -57,6 +67,24 @@ const IMAGE_PLACEHOLDER: &str = "<|kimi_image_placeholder|>";
 /// `response` for both the generation-prompt tail and (per-turn) any prior
 /// assistant reasoning.
 pub fn apply_kimi_k3_xtml(messages: &[Value], params: &ChatTemplateParams) -> Result<String> {
+    render_xtml(messages, params, None)
+}
+
+/// Render as the *served* reference entry point does: like
+/// [`apply_kimi_k3_xtml`], except that a request naming no effort falls back to
+/// [`DEFAULT_THINKING_EFFORT`] rather than emitting no directive.
+pub fn apply_kimi_k3_xtml_with_effort_default(
+    messages: &[Value],
+    params: &ChatTemplateParams,
+) -> Result<String> {
+    render_xtml(messages, params, Some(DEFAULT_THINKING_EFFORT))
+}
+
+fn render_xtml(
+    messages: &[Value],
+    params: &ChatTemplateParams,
+    default_effort: Option<&str>,
+) -> Result<String> {
     // Re-sort tool results by tool_call_id, then normalize each message
     // (deep-sort tool schemas, coerce tool-call arguments) — both side-effect
     // free, mirroring the Python entry point.
@@ -95,11 +123,10 @@ pub fn apply_kimi_k3_xtml(messages: &[Value], params: &ChatTemplateParams) -> Re
     //      `minimal`/`none` already switch thinking off upstream and `medium` has
     //      no K3 equivalent, so such values emit no directive rather than erroring
     //      on an otherwise-valid OpenAI field.
+    //   3. Absent both, `default_effort` — `None` for the bare port, `Some("max")`
+    //      for the served entry point. See [`DEFAULT_THINKING_EFFORT`].
     //
-    // Absent both, no directive is emitted and the model applies its intrinsic
-    // `max` default — matching the reference, which injects nothing when
-    // `thinking_effort` is unset. `preserve_thinking` (which some callers send
-    // alongside the effort) is not read by the reference renderer and is ignored.
+    // `preserve_thinking` is not read by the reference renderer and is ignored.
     if thinking {
         if let Some(effort_val) = params
             .template_kwargs
@@ -122,6 +149,7 @@ pub fn apply_kimi_k3_xtml(messages: &[Value], params: &ChatTemplateParams) -> Re
             .and_then(|k| k.get("reasoning_effort"))
             .and_then(Value::as_str)
             .filter(|e| matches!(*e, "low" | "high" | "max"))
+            .or(default_effort)
         {
             push_thinking_effort(&mut out, effort);
         }
@@ -315,8 +343,9 @@ fn push_internal_system_message(out: &mut String, message_type: &str, body: &str
 
 /// Render `content` (string, or an OpenAI content-part array) into `out`.
 ///
-/// Image parts emit the bare `<|kimi_image_placeholder|>` marker; real
-/// `image_prompts` substitution is deferred (see module docs).
+/// Image parts emit the reference's bare `<|kimi_image_placeholder|>` marker.
+/// The gateway does not reach that branch: K3 reports the `String` content
+/// format, so media parts arrive already flattened into the message text.
 fn push_content(out: &mut String, content: Option<&Value>) {
     match content {
         Some(Value::String(s)) => out.push_str(s),
@@ -989,14 +1018,74 @@ mod tests {
 
     #[test]
     fn no_effort_directive_when_unspecified() {
-        // Byte-parity with the reference: absent both keys, nothing is injected
-        // (the model applies its intrinsic `max` default).
+        // Byte-parity with `build_chat_segments`: absent both keys this entry
+        // point injects nothing. The served wrapper above it does — see
+        // `served_entry_point_defaults_effort_to_max`.
         let messages = vec![json!({"role": "user", "content": "Hi"})];
         let kwargs = HashMap::new();
         let rendered = apply_kimi_k3_xtml(&messages, &params_kw(None, &kwargs, true)).unwrap();
         assert!(
             !rendered.contains("type=\"thinking-effort\""),
             "no directive should be injected by default: {rendered}"
+        );
+    }
+
+    #[test]
+    fn served_entry_point_defaults_effort_to_max() {
+        // `tokenization_kimi.apply_chat_template` setdefaults the effort to
+        // `max`, so a request naming none still gets the directive.
+        let messages = vec![json!({"role": "user", "content": "Hi"})];
+        let kwargs = HashMap::new();
+        let rendered =
+            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &kwargs, true))
+                .unwrap();
+        assert!(
+            rendered.contains("Now the system is invoked with `thinking_effort=max`."),
+            "served path must default to max: {rendered}"
+        );
+    }
+
+    #[test]
+    fn served_effort_default_yields_to_a_requested_effort() {
+        let messages = vec![json!({"role": "user", "content": "Hi"})];
+        for (kwargs, expected) in [
+            (
+                HashMap::from([("thinking_effort".to_string(), json!("low"))]),
+                "low",
+            ),
+            (
+                HashMap::from([("reasoning_effort".to_string(), json!("high"))]),
+                "high",
+            ),
+        ] {
+            let rendered =
+                apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &kwargs, true))
+                    .unwrap();
+            assert!(
+                rendered.contains(&format!(
+                    "Now the system is invoked with `thinking_effort={expected}`."
+                )),
+                "requested effort must win over the default: {rendered}"
+            );
+            assert!(
+                !rendered.contains("thinking_effort=max`."),
+                "default must not also be emitted: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn served_effort_default_suppressed_when_thinking_off() {
+        let messages = vec![json!({"role": "user", "content": "Hi"})];
+        let kwargs = HashMap::new();
+        let rendered = apply_kimi_k3_xtml_with_effort_default(
+            &messages,
+            &params_kw(Some(false), &kwargs, true),
+        )
+        .unwrap();
+        assert!(
+            !rendered.contains("type=\"thinking-effort\""),
+            "no effort directive when thinking is off: {rendered}"
         );
     }
 

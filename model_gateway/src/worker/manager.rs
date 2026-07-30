@@ -50,6 +50,12 @@ struct WorkerResponse {
 }
 
 /// Fan out requests to workers in parallel
+///
+/// Requests are addressed to `worker.base_url()`, so under `--dp-aware`
+/// every rank of the same base worker targets the rank-free endpoint —
+/// `worker.url()` carries an `@{dp_rank}` suffix that is SMG-internal and
+/// not a valid server address (#1993). Callers that want one request per
+/// base worker must dedupe by base URL first (see `get_engine_metrics`).
 async fn fan_out(
     workers: &[Arc<dyn Worker>],
     client: &reqwest::Client,
@@ -60,7 +66,7 @@ async fn fan_out(
         .iter()
         .map(|worker| {
             let client = client.clone();
-            let url = worker.url().to_string();
+            let url = worker.base_url().to_string();
             let full_url = format!("{url}/{endpoint}");
             let api_key = worker.api_key().cloned();
             let method = method.clone();
@@ -989,6 +995,15 @@ impl WorkerManager {
             return EngineMetricsResult::Err("No available workers".to_string());
         }
 
+        // Scrape each base worker once: under `--dp-aware` all ranks share
+        // the base URL, so per-rank fan-out would repeat identical scrapes
+        // (#1993).
+        let mut seen = HashSet::new();
+        let workers: Vec<Arc<dyn Worker>> = workers
+            .into_iter()
+            .filter(|w| seen.insert(w.base_url().to_string()))
+            .collect();
+
         let responses = fan_out(&workers, client, "metrics", reqwest::Method::GET).await;
 
         let mut metric_packs = Vec::new();
@@ -1018,7 +1033,13 @@ impl WorkerManager {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
 
@@ -1039,6 +1060,89 @@ mod tests {
                 })
                 .build(),
         )
+    }
+
+    fn make_dp_worker(base: &str, rank: usize, size: usize) -> Arc<dyn Worker> {
+        let spec: openai_protocol::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+            "url": format!("{base}@{rank}"),
+            "dp_base_url": base,
+            "dp_rank": rank,
+            "dp_size": size,
+        }))
+        .expect("dp worker spec");
+        Arc::new(BasicWorkerBuilder::from_spec(spec).build())
+    }
+
+    /// Tiny HTTP stub counting GET /metrics hits; returns its base URL.
+    async fn start_metrics_stub(hits: Arc<AtomicUsize>) -> String {
+        let app = axum::Router::new().route(
+            "/metrics",
+            axum::routing::get(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    "# HELP test_metric stub\n# TYPE test_metric gauge\ntest_metric 1\n"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub address");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("stub serve");
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn engine_metrics_scrapes_dp_workers_via_base_url_once() {
+        // Two DP ranks share one base worker. The `@{rank}` suffix in
+        // worker.url() is not a valid endpoint; metrics must be scraped
+        // from base_url(), once per base worker (#1993).
+        let hits = Arc::new(AtomicUsize::new(0));
+        let base = start_metrics_stub(hits.clone()).await;
+
+        let registry = WorkerRegistry::new();
+        registry.register(make_dp_worker(&base, 0, 2)).unwrap();
+        registry.register(make_dp_worker(&base, 1, 2)).unwrap();
+
+        let client = reqwest::Client::new();
+        let result = WorkerManager::get_engine_metrics(&registry, &client).await;
+
+        assert!(
+            matches!(result, EngineMetricsResult::Ok(_)),
+            "expected metrics scrape to succeed"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "base worker must be scraped once, not per DP rank"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_metrics_scrapes_each_distinct_base_worker() {
+        let hits_a = Arc::new(AtomicUsize::new(0));
+        let base_a = start_metrics_stub(hits_a.clone()).await;
+        let hits_b = Arc::new(AtomicUsize::new(0));
+        let base_b = start_metrics_stub(hits_b.clone()).await;
+
+        let registry = WorkerRegistry::new();
+        registry.register(make_dp_worker(&base_a, 0, 2)).unwrap();
+        registry.register(make_dp_worker(&base_a, 1, 2)).unwrap();
+        registry.register(make_dp_worker(&base_b, 0, 1)).unwrap();
+
+        let client = reqwest::Client::new();
+        let result = WorkerManager::get_engine_metrics(&registry, &client).await;
+
+        assert!(matches!(result, EngineMetricsResult::Ok(_)));
+        assert_eq!(hits_a.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 1);
     }
 
     fn cfg(success_threshold: u32, failure_threshold: u32) -> HealthCheckConfig {
