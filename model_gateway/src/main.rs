@@ -373,6 +373,14 @@ struct CliArgs {
     #[arg(long, help_heading = "Service Discovery (Kubernetes)", value_parser = parse_model_id_from)]
     model_id_from: Option<String>,
 
+    /// Accept an extra client-facing model name for a served model
+    /// (format: alias=canonical, repeatable). Applied to every locally
+    /// registered worker whose model ID equals the canonical side,
+    /// including workers registered by Kubernetes service discovery.
+    /// Matching is case-sensitive.
+    #[arg(long = "model-alias", action = ArgAction::Append, value_parser = parse_model_alias, help_heading = "Service Discovery (Kubernetes)")]
+    model_alias: Vec<String>,
+
     // ==================== Logging ====================
     /// Directory to store log files
     #[arg(long, help_heading = "Logging")]
@@ -837,6 +845,26 @@ fn parse_model_id_from(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
+/// Validate `--model-alias` value at CLI parse time (format: alias=canonical).
+fn parse_model_alias(s: &str) -> Result<String, String> {
+    let Some((alias, canonical)) = s.split_once('=') else {
+        return Err(format!(
+            "Invalid model-alias value '{s}'. Expected: <alias>=<canonical>"
+        ));
+    };
+    if alias.is_empty() || canonical.is_empty() {
+        return Err(format!(
+            "Invalid model-alias value '{s}'. Alias and canonical model ID must be non-empty"
+        ));
+    }
+    if alias == canonical {
+        return Err(format!(
+            "Invalid model-alias value '{s}'. Alias must differ from the canonical model ID"
+        ));
+    }
+    Ok(s.to_string())
+}
+
 /// Parse role mapping from CLI format "idp_role=gateway_role"
 #[expect(
     clippy::print_stderr,
@@ -964,12 +992,15 @@ impl CliArgs {
     }
 
     fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
-        for url in worker_urls {
-            if url.starts_with("grpc://") || url.starts_with("grpcs://") {
-                return ConnectionMode::Grpc;
-            }
-        }
-        ConnectionMode::Http
+        // First worker URL that declares ipc:// or grpc:// wins; http:// and bare
+        // host:port fall through to the HTTP default. See ConnectionMode::from_url.
+        worker_urls
+            .iter()
+            .find_map(|url| match ConnectionMode::from_url(url) {
+                mode @ (Some(ConnectionMode::Zmq) | Some(ConnectionMode::Grpc)) => mode,
+                _ => None,
+            })
+            .unwrap_or(ConnectionMode::Http)
     }
 
     fn parse_selector(selector_list: &[String]) -> HashMap<String, String> {
@@ -1387,6 +1418,29 @@ impl CliArgs {
             _ => (None, None, None),
         };
 
+        // clap validated each entry's shape; here we only reject the same
+        // alias naming two different canonical models, which would make the
+        // routing outcome depend on argument order.
+        let mut model_aliases: HashMap<String, String> = HashMap::new();
+        for entry in &self.model_alias {
+            let Some((alias, canonical)) = entry.split_once('=') else {
+                return Err(ConfigError::InvalidValue {
+                    field: "model_alias".to_string(),
+                    value: entry.clone(),
+                    reason: "Expected: <alias>=<canonical>".to_string(),
+                });
+            };
+            if let Some(previous) = model_aliases.insert(alias.to_string(), canonical.to_string()) {
+                if previous != canonical {
+                    return Err(ConfigError::InvalidValue {
+                        field: "model_alias".to_string(),
+                        value: alias.to_string(),
+                        reason: format!("Alias maps to both '{previous}' and '{canonical}'"),
+                    });
+                }
+            }
+        }
+
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -1464,6 +1518,7 @@ impl CliArgs {
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
+            .model_aliases(model_aliases)
             .maybe_oracle(oracle)
             .maybe_postgres(postgres)
             .maybe_redis(redis)
@@ -1860,5 +1915,16 @@ mod tests {
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.runtime_worker_threads, None);
+    }
+
+    #[test]
+    fn conflicting_model_aliases_are_rejected() {
+        let cli = cli_args_from(&["--model-alias", "x=a", "--model-alias", "x=b"]);
+
+        assert!(matches!(
+            cli.to_router_config(vec![], vec![]),
+            Err(ConfigError::InvalidValue { field, reason, .. })
+                if field == "model_alias" && reason == "Alias maps to both 'a' and 'b'"
+        ));
     }
 }

@@ -14,7 +14,7 @@ use super::{
         DEFAULT_WORKER_HTTP_TIMEOUT_SECS,
     },
 };
-use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
+use crate::{observability::metrics::Metrics, routers::grpc::backend_client::BackendClient};
 
 /// Builder for creating BasicWorker instances with fluent API.
 ///
@@ -27,7 +27,7 @@ pub struct BasicWorkerBuilder {
     health_config: Option<HealthCheckConfig>,
     health_endpoint: String,
     circuit_breaker_config: CircuitBreakerConfig,
-    grpc_client: Option<GrpcClient>,
+    backend_client: Option<BackendClient>,
     /// Pre-built per-worker HTTP client (if not set, a default is created).
     http_client: Option<reqwest::Client>,
     /// Resolved resilience config (if not set, defaults are used).
@@ -47,7 +47,7 @@ impl BasicWorkerBuilder {
             health_config: None,
             health_endpoint: "/health".to_string(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
-            grpc_client: None,
+            backend_client: None,
             http_client: None,
             resilience: None,
             initial_status: None,
@@ -61,7 +61,7 @@ impl BasicWorkerBuilder {
             health_config: None,
             health_endpoint: "/health".to_string(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
-            grpc_client: None,
+            backend_client: None,
             http_client: None,
             resilience: None,
             initial_status: None,
@@ -77,7 +77,7 @@ impl BasicWorkerBuilder {
             health_config: None,
             health_endpoint: "/health".to_string(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
-            grpc_client: None,
+            backend_client: None,
             http_client: None,
             resilience: None,
             initial_status: None,
@@ -161,8 +161,8 @@ impl BasicWorkerBuilder {
     }
 
     /// Set gRPC client for gRPC workers
-    pub fn grpc_client(mut self, client: GrpcClient) -> Self {
-        self.grpc_client = Some(client);
+    pub fn backend_client(mut self, client: BackendClient) -> Self {
+        self.backend_client = Some(client);
         self
     }
 
@@ -237,8 +237,14 @@ impl BasicWorkerBuilder {
 
         use tokio::sync::OnceCell;
 
-        // Derive bootstrap_host from URL at construction time
-        self.spec.bootstrap_host = parse_bootstrap_host(&self.spec.url);
+        // bootstrap_host is a PD/TCP-disaggregation concept (a host:port peer),
+        // so derive it only for transports that carry a host. An ipc:// ZMQ
+        // worker has no host; leave bootstrap_host empty rather than forcing the
+        // URL through host:port parsing (which would warn and default to
+        // localhost).
+        if self.spec.connection_mode != ConnectionMode::Zmq {
+            self.spec.bootstrap_host = parse_bootstrap_host(&self.spec.url);
+        }
 
         // Resolve health config: use explicit config if set, otherwise
         // apply per-worker overrides from spec.health to defaults.
@@ -253,7 +259,7 @@ impl BasicWorkerBuilder {
         };
 
         // Use OnceCell for lock-free gRPC client access after initialization
-        let grpc_client = Arc::new(match self.grpc_client {
+        let backend_client = Arc::new(match self.backend_client {
             Some(client) => {
                 let cell = OnceCell::new();
                 // Pre-set the client if provided (blocking set is fine during construction)
@@ -296,7 +302,7 @@ impl BasicWorkerBuilder {
                 metadata.spec.url.clone(),
             )),
             metadata,
-            grpc_client,
+            backend_client,
             models_override: Arc::new(ArcSwap::from_pointee(WorkerModels::Wildcard)),
             http_client,
             resilience,

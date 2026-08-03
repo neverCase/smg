@@ -425,9 +425,9 @@ pub(crate) fn chat_to_responses(
                 .completion_tokens_details
                 .as_ref()
                 .and_then(|d| d.reasoning_tokens),
-            prompt_tokens_details: None, // Chat response doesn't have this
+            prompt_tokens_details: u.prompt_tokens_details.clone(),
         };
-        ResponsesUsage::Classic(usage_info)
+        ResponsesUsage::Modern(usage_info.to_response_usage())
     });
 
     // Generate response
@@ -444,9 +444,59 @@ pub(crate) fn chat_to_responses(
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::StreamOptions;
+    use openai_protocol::{
+        chat::{ChatChoice, ChatCompletionMessage},
+        common::{StreamOptions, Usage},
+    };
 
     use super::*;
+
+    #[test]
+    fn chat_to_responses_serializes_responses_api_usage() {
+        let chat_response = ChatCompletionResponse::builder("chatcmpl_test", "test-model")
+            .choices(vec![ChatChoice {
+                index: 0,
+                message: ChatCompletionMessage {
+                    role: "assistant".to_string(),
+                    content: Some("done".to_string()),
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                logprobs: None,
+                finish_reason: Some("stop".to_string()),
+                matched_stop: None,
+                hidden_states: None,
+            }])
+            .usage(
+                Usage::from_counts(12, 7)
+                    .with_cached_tokens(3)
+                    .with_reasoning_tokens(2),
+            )
+            .build();
+
+        let response = chat_to_responses(
+            &chat_response,
+            &ResponsesRequest::default(),
+            Some("resp_test".to_string()),
+        )
+        .expect("chat response should convert");
+        let wire = serde_json::to_value(response).expect("response should serialize");
+        let usage = wire.get("usage").expect("usage should be present");
+
+        assert_eq!(usage.get("input_tokens"), Some(&serde_json::json!(12)));
+        assert_eq!(usage.get("output_tokens"), Some(&serde_json::json!(7)));
+        assert_eq!(usage.get("total_tokens"), Some(&serde_json::json!(19)));
+        assert_eq!(
+            usage.pointer("/input_tokens_details/cached_tokens"),
+            Some(&serde_json::json!(3))
+        );
+        assert_eq!(
+            usage.pointer("/output_tokens_details/reasoning_tokens"),
+            Some(&serde_json::json!(2))
+        );
+        assert!(usage.get("prompt_tokens").is_none());
+        assert!(usage.get("completion_tokens").is_none());
+    }
 
     #[test]
     fn test_text_input_conversion() {

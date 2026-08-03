@@ -24,7 +24,10 @@ use tokio::{sync::OnceCell, time};
 use super::{CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult, UNKNOWN_MODEL_ID};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
-    routers::{common::header_utils::extract_routing_key, grpc::client::GrpcClient},
+    routers::{
+        common::header_utils::extract_routing_key,
+        grpc::{backend_client::BackendClient, client::GrpcClient},
+    },
 };
 
 /// Default HTTP client timeout for worker requests (in seconds)
@@ -81,16 +84,27 @@ async fn admin_http_post(
 }
 
 /// Unwrap the optional gRPC client for an admin op, erroring when absent.
-fn require_grpc_client(
+fn require_backend_client(
     url: &str,
     operation: &str,
-    client: Option<Arc<GrpcClient>>,
-) -> WorkerResult<Arc<GrpcClient>> {
+    client: Option<Arc<BackendClient>>,
+) -> WorkerResult<Arc<BackendClient>> {
     client.ok_or_else(|| WorkerError::OperationFailed {
         url: url.to_string(),
         operation: operation.to_string(),
-        reason: "no gRPC client available".to_string(),
+        reason: "no backend client available".to_string(),
     })
+}
+
+/// Error for an admin op invoked on a ZMQ worker. ZMQ backend operations are
+/// wired in a follow-up; until then a ZMQ worker is recognized but its admin
+/// surface is unavailable (it never routes through the gRPC client).
+fn zmq_admin_unsupported(url: &str, operation: &str) -> WorkerError {
+    WorkerError::OperationFailed {
+        url: url.to_string(),
+        operation: operation.to_string(),
+        reason: "admin operations are not yet supported for ZMQ workers".to_string(),
+    }
 }
 
 /// Map a gRPC admin-op outcome (`success` flag plus message) to a
@@ -490,11 +504,11 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Get or create a gRPC client for this worker
     /// Returns None for HTTP workers, Some(client) for gRPC workers
-    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<GrpcClient>>>;
+    async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>>;
 
     /// Reset the gRPC client connection (for reconnection scenarios)
     /// No-op for HTTP workers
-    async fn reset_grpc_client(&self) -> WorkerResult<()> {
+    async fn reset_backend_client(&self) -> WorkerResult<()> {
         Ok(())
     }
     async fn grpc_health_check(&self) -> WorkerResult<bool>;
@@ -523,8 +537,11 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                 .await
             }
             ConnectionMode::Grpc => {
-                let client =
-                    require_grpc_client(self.url(), "flush_cache", self.get_grpc_client().await?)?;
+                let client = require_backend_client(
+                    self.url(),
+                    "flush_cache",
+                    self.get_backend_client().await?,
+                )?;
                 let result = client.flush_cache(0.0).await;
                 admin_grpc_result(
                     self.url(),
@@ -532,6 +549,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                     result.map(|r| (r.success, r.message)),
                 )
             }
+            ConnectionMode::Zmq => Err(zmq_admin_unsupported(self.url(), "flush_cache")),
         }
     }
 
@@ -556,10 +574,10 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                 .await
             }
             ConnectionMode::Grpc => {
-                let client = require_grpc_client(
+                let client = require_backend_client(
                     self.url(),
                     "start_profile",
-                    self.get_grpc_client().await?,
+                    self.get_backend_client().await?,
                 )?;
                 let req = common_proto::StartProfileRequest {
                     output_dir: options.output_dir.clone(),
@@ -577,6 +595,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                     result.map(|r| (r.success, r.message)),
                 )
             }
+            ConnectionMode::Zmq => Err(zmq_admin_unsupported(self.url(), "start_profile")),
         }
     }
 
@@ -596,8 +615,11 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                 .await
             }
             ConnectionMode::Grpc => {
-                let client =
-                    require_grpc_client(self.url(), "stop_profile", self.get_grpc_client().await?)?;
+                let client = require_backend_client(
+                    self.url(),
+                    "stop_profile",
+                    self.get_backend_client().await?,
+                )?;
                 let result = client.stop_profile().await;
                 admin_grpc_result(
                     self.url(),
@@ -605,6 +627,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                     result.map(|r| (r.success, r.message)),
                 )
             }
+            ConnectionMode::Zmq => Err(zmq_admin_unsupported(self.url(), "stop_profile")),
         }
     }
 }
@@ -619,6 +642,7 @@ impl ConnectionModeExt for ConnectionMode {
         match self {
             ConnectionMode::Http => metrics_labels::CONNECTION_HTTP,
             ConnectionMode::Grpc => metrics_labels::CONNECTION_GRPC,
+            ConnectionMode::Zmq => metrics_labels::CONNECTION_ZMQ,
         }
     }
 }
@@ -940,7 +964,7 @@ pub struct BasicWorker {
     pub circuit_breaker: ArcSwap<CircuitBreaker>,
     /// Lazily initialized gRPC client for gRPC workers.
     /// Uses OnceCell for lock-free reads after initialization.
-    pub grpc_client: Arc<OnceCell<Arc<GrpcClient>>>,
+    pub backend_client: Arc<OnceCell<Arc<BackendClient>>>,
     /// Runtime-mutable models override (for lazy discovery).
     /// When not `Wildcard`, overrides metadata.models for routing decisions.
     /// Uses `ArcSwap` for lock-free reads on the hot path (`supports_model`).
@@ -957,7 +981,7 @@ impl Clone for BasicWorker {
             metadata: self.metadata.clone(),
             runtime: ArcSwap::from(self.runtime.load_full()),
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
-            grpc_client: Arc::clone(&self.grpc_client),
+            backend_client: Arc::clone(&self.backend_client),
             models_override: Arc::clone(&self.models_override),
             http_client: self.http_client.clone(),
             resilience: self.resilience.clone(),
@@ -973,7 +997,7 @@ impl fmt::Debug for BasicWorker {
             .field("status", &runtime.status())
             .field("revision", &runtime.revision())
             .field("circuit_breaker_state", &self.circuit_breaker_state())
-            .field("grpc_client", &"<OnceCell>")
+            .field("backend_client", &"<OnceCell>")
             .finish()
     }
 }
@@ -1054,6 +1078,9 @@ impl Worker for BasicWorker {
         let probe_ok = match &self.metadata.spec.connection_mode {
             ConnectionMode::Http => self.http_health_check().await?,
             ConnectionMode::Grpc => self.grpc_health_check().await?,
+            // ZMQ liveness lands with the backend client; until then a ZMQ
+            // worker is recognized but never becomes ready (not routable).
+            ConnectionMode::Zmq => false,
         };
 
         if probe_ok {
@@ -1202,14 +1229,17 @@ impl Worker for BasicWorker {
         !self.models_override.load().is_wildcard() || !self.metadata.spec.models.is_wildcard()
     }
 
-    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<GrpcClient>>> {
+    async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {
         match self.metadata.spec.connection_mode {
-            ConnectionMode::Http => Ok(None),
+            // Neither HTTP nor ZMQ has a gRPC client. A ZMQ worker's backend
+            // client is a separate type wired in a follow-up; it is never a
+            // gRPC client.
+            ConnectionMode::Http | ConnectionMode::Zmq => Ok(None),
             ConnectionMode::Grpc => {
                 // OnceCell provides lock-free reads after initialization.
                 // get_or_try_init only acquires internal lock on first call.
                 let client = self
-                    .grpc_client
+                    .backend_client
                     .get_or_try_init(|| async {
                         let runtime_str = self.metadata.spec.runtime_type.to_string();
                         tracing::info!(
@@ -1225,7 +1255,7 @@ impl Worker for BasicWorker {
                                     runtime_str,
                                     self.metadata.spec.url
                                 );
-                                Ok(Arc::new(client))
+                                Ok(Arc::new(BackendClient::Grpc(client)))
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -1246,11 +1276,11 @@ impl Worker for BasicWorker {
         }
     }
 
-    async fn reset_grpc_client(&self) -> WorkerResult<()> {
+    async fn reset_backend_client(&self) -> WorkerResult<()> {
         // OnceCell doesn't support resetting. This is intentional for lock-free performance.
         // If a connection fails, the worker should be removed and re-added.
         tracing::debug!(
-            "reset_grpc_client called for {} (no-op with OnceCell)",
+            "reset_backend_client called for {} (no-op with OnceCell)",
             self.metadata.spec.url
         );
         Ok(())
@@ -1258,8 +1288,8 @@ impl Worker for BasicWorker {
 
     async fn grpc_health_check(&self) -> WorkerResult<bool> {
         let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
-        let maybe = self.get_grpc_client().await?;
-        let Some(grpc_client) = maybe else {
+        let maybe = self.get_backend_client().await?;
+        let Some(backend_client) = maybe else {
             tracing::error!(
                 "Worker {} is not a gRPC worker but connection mode is gRPC",
                 self.metadata.spec.url
@@ -1267,7 +1297,7 @@ impl Worker for BasicWorker {
             return Ok(false);
         };
 
-        match time::timeout(timeout, grpc_client.health_check()).await {
+        match time::timeout(timeout, backend_client.health_check()).await {
             Ok(Ok(resp)) => {
                 tracing::debug!(
                     "gRPC health OK for {}: healthy={}",

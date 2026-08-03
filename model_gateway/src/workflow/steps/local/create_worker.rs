@@ -63,17 +63,34 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         let kv_role = labels.remove("kv_role");
         let kv_engine_id = labels.remove("kv_engine_id").filter(|s| !s.is_empty());
 
-        // Determine model_id: config.models > discovered labels > UNKNOWN_MODEL_ID
-        let model_id = config
-            .models
-            .primary()
-            .map(|m| m.id.clone())
-            .or_else(|| labels.get("served_model_name").cloned())
-            .or_else(|| labels.get("model_id").cloned())
-            .or_else(|| labels.get("model_path").cloned())
-            .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
+        let model_id = resolve_model_id(config, &labels);
+        // ZMQ EngineCore does not report a served model name over the wire, so a
+        // ZMQ worker's model identity must come from config (`--model-path`).
+        // Without it the worker would register as UNKNOWN and be unroutable, so
+        // fail loudly at registration rather than silently.
+        let model_id = if model_id == UNKNOWN_MODEL_ID && *connection_mode == ConnectionMode::Zmq {
+            app_context
+                .router_config
+                .model_path
+                .as_deref()
+                .ok_or_else(|| WorkflowError::StepFailed {
+                    step_id: StepId::new("create_worker"),
+                    message: format!(
+                        "ZMQ worker {} has no model identity: EngineCore does not report a \
+                         served model name, so --model-path (or a model_id label) is required",
+                        config.url
+                    ),
+                })?
+        } else {
+            model_id
+        };
 
-        let model_card = build_model_card(&model_id, config, &labels);
+        let model_card = build_model_card(
+            model_id,
+            config,
+            &labels,
+            &app_context.router_config.model_aliases,
+        );
 
         let runtime_type = match context.data.detected_runtime_type.as_deref() {
             Some(s) => s.parse::<RuntimeType>().unwrap_or(config.runtime_type),
@@ -196,10 +213,27 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
     }
 }
 
+/// Resolve the canonical model ID before aliases are applied.
+///
+/// Kubernetes service discovery creates a spec without model cards, so its
+/// canonical ID comes from the backend's `served_model_name`. Router aliases
+/// are deliberately absent from this function and cannot change discovery.
+fn resolve_model_id<'a>(config: &'a WorkerSpec, labels: &'a HashMap<String, String>) -> &'a str {
+    config
+        .models
+        .primary()
+        .map(|model| model.id.as_str())
+        .or_else(|| labels.get("served_model_name").map(String::as_str))
+        .or_else(|| labels.get("model_id").map(String::as_str))
+        .or_else(|| labels.get("model_path").map(String::as_str))
+        .unwrap_or(UNKNOWN_MODEL_ID)
+}
+
 fn build_model_card(
     model_id: &str,
     config: &WorkerSpec,
     labels: &HashMap<String, String>,
+    model_aliases: &HashMap<String, String>,
 ) -> ModelCard {
     let user_provided = config.models.find(model_id).is_some();
     let mut card = config
@@ -280,6 +314,18 @@ fn build_model_card(
         card.model_type |= ModelType::VISION;
     }
 
+    // Router-level alias map (`--model-alias alias=canonical`): attach every
+    // alias that names this canonical model. This is the only alias entry
+    // point for automatically registered workers (startup URLs, Kubernetes
+    // service discovery) — the backend reports a single served model name, so
+    // it can never declare aliases itself. A user-provided card keeps its own
+    // aliases; duplicates are skipped so re-registration stays idempotent.
+    for (alias, canonical) in model_aliases {
+        if canonical == &card.id && alias != &card.id && !card.aliases.contains(alias) {
+            card.aliases.push(alias.clone());
+        }
+    }
+
     card
 }
 
@@ -306,12 +352,14 @@ fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
         || url.starts_with("https://")
         || url.starts_with("grpc://")
         || url.starts_with("grpcs://")
+        || url.starts_with("ipc://")
     {
         url.to_string()
     } else {
         match connection_mode {
             ConnectionMode::Http => format!("http://{url}"),
             ConnectionMode::Grpc => format!("grpc://{url}"),
+            ConnectionMode::Zmq => format!("ipc://{url}"),
         }
     }
 }
@@ -319,6 +367,7 @@ fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::WorkerRegistry;
 
     #[test]
     fn normalize_url_preserves_existing_schemes() {
@@ -350,5 +399,95 @@ mod tests {
             normalize_url("localhost:30001", ConnectionMode::Grpc),
             "grpc://localhost:30001"
         );
+    }
+
+    fn alias_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(alias, canonical)| (alias.to_string(), canonical.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn model_alias_map_attaches_matching_aliases_to_discovered_card() {
+        // The service-discovery path supplies no user card, so the card is
+        // built from the discovered model ID alone; the router-level alias
+        // map is the only way it can gain aliases.
+        let spec = WorkerSpec::new("http://worker:8080");
+        let aliases = alias_map(&[
+            ("GLM-5.2-Coding", "GLM-5.2"),
+            ("other-alias", "other-model"),
+        ]);
+
+        let card = build_model_card("GLM-5.2", &spec, &HashMap::new(), &aliases);
+
+        assert_eq!(card.id, "GLM-5.2");
+        assert_eq!(card.aliases, vec!["GLM-5.2-Coding".to_string()]);
+    }
+
+    #[test]
+    fn service_discovery_keeps_served_model_name_canonical() {
+        // Service discovery supplies an empty model list. Metadata discovery
+        // supplies the backend's served_model_name.
+        let spec = WorkerSpec::new("http://worker:8080");
+        let labels = HashMap::from([
+            ("served_model_name".to_string(), "GLM-5.2".to_string()),
+            ("model_id".to_string(), "GLM-5.2-Coding".to_string()),
+            ("model_path".to_string(), "unrelated-alias".to_string()),
+        ]);
+        let aliases = alias_map(&[
+            ("GLM-5.2-Coding", "GLM-5.2"),
+            ("unrelated-alias", "other-model"),
+        ]);
+
+        let model_id = resolve_model_id(&spec, &labels);
+        let card = build_model_card(model_id, &spec, &labels, &aliases);
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new(&spec.url).model(card).build());
+        let registry = WorkerRegistry::new();
+        registry.register(worker.clone()).unwrap();
+
+        assert_eq!(worker.model_id(), "GLM-5.2");
+        assert_eq!(registry.get_by_model("GLM-5.2").len(), 1);
+        assert_eq!(registry.get_by_model("GLM-5.2-Coding").len(), 1);
+        assert_eq!(
+            registry.resolve_model_alias("GLM-5.2-Coding").as_deref(),
+            Some("GLM-5.2")
+        );
+        assert!(registry.get_by_model("unrelated-alias").is_empty());
+    }
+
+    #[test]
+    fn model_alias_map_is_case_sensitive_and_skips_self_reference() {
+        let spec = WorkerSpec::new("http://worker:8080");
+        // Wrong-case canonical must not match; an alias equal to the model ID
+        // must not be attached (it would shadow the canonical entry).
+        let aliases = alias_map(&[("glm-5.2-coding", "glm-5.2"), ("GLM-5.2", "GLM-5.2")]);
+
+        let card = build_model_card("GLM-5.2", &spec, &HashMap::new(), &aliases);
+
+        assert!(card.aliases.is_empty());
+    }
+
+    #[test]
+    fn model_alias_map_does_not_duplicate_user_provided_alias() {
+        // POST /workers can already carry aliases in the spec; the router map
+        // must merge, not duplicate, so repeated registration stays stable.
+        let mut spec = WorkerSpec::new("http://worker:8080");
+        let card_with_alias = ModelCard::new("GLM-5.2").with_alias("GLM-5.2-Coding");
+        spec.models = vec![card_with_alias].into();
+        let aliases = alias_map(&[("GLM-5.2-Coding", "GLM-5.2"), ("glm-5.2", "GLM-5.2")]);
+
+        let card = build_model_card("GLM-5.2", &spec, &HashMap::new(), &aliases);
+
+        assert_eq!(
+            card.aliases
+                .iter()
+                .filter(|a| *a == "GLM-5.2-Coding")
+                .count(),
+            1
+        );
+        assert!(card.aliases.contains(&"glm-5.2".to_string()));
+        assert_eq!(card.aliases.len(), 2);
     }
 }
