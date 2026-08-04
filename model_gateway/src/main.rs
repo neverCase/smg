@@ -18,7 +18,7 @@ use smg::{
     server::{self, ServerConfig},
     service_discovery::{ModelIdSource, ServiceDiscoveryConfig},
     version,
-    worker::ConnectionMode,
+    worker::{ConnectionMode, RuntimeType},
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::MeshServerConfig;
@@ -75,6 +75,8 @@ pub enum Backend {
     Vllm,
     #[value(name = "trtllm")]
     Trtllm,
+    #[value(name = "tokenspeed")]
+    Tokenspeed,
     #[value(name = "openai")]
     Openai,
     #[value(name = "anthropic")]
@@ -89,6 +91,7 @@ impl std::fmt::Display for Backend {
             Backend::Sglang => "sglang",
             Backend::Vllm => "vllm",
             Backend::Trtllm => "trtllm",
+            Backend::Tokenspeed => "tokenspeed",
             Backend::Openai => "openai",
             Backend::Anthropic => "anthropic",
             Backend::Gemini => "gemini",
@@ -302,6 +305,10 @@ struct CliArgs {
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
     worker_startup_timeout_secs: u64,
+
+    /// Grace period in seconds before the first worker startup check
+    #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
+    worker_startup_delay: u64,
 
     /// Interval in seconds between worker startup checks
     #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
@@ -1395,6 +1402,20 @@ impl CliArgs {
         }
         let connection_mode = Self::determine_connection_mode(&all_urls);
 
+        // `--backend` normally only steers the routing mode. Over ZMQ it
+        // additionally pins the startup workers' runtime: the shared EngineCore
+        // handshake carries no engine identity, so the wire protocol cannot be
+        // probed and must be declared. HTTP/gRPC keep auto-detection (None).
+        let startup_worker_runtime_type = if connection_mode == ConnectionMode::Zmq {
+            match self.backend {
+                Some(Backend::Vllm) => Some(RuntimeType::Vllm),
+                Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         let history_backend = match self.history_backend.as_str() {
             "none" => HistoryBackend::None,
             "oracle" => HistoryBackend::Oracle,
@@ -1445,6 +1466,7 @@ impl CliArgs {
             .mode(mode)
             .policy(policy)
             .connection_mode(connection_mode)
+            .startup_worker_runtime_type(startup_worker_runtime_type)
             .host(&self.host)
             .port(self.port)
             .health_check_port(self.health_check_port)
@@ -1452,6 +1474,7 @@ impl CliArgs {
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
+            .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .engine_metrics(self.engine_metrics)
@@ -1915,6 +1938,69 @@ mod tests {
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.runtime_worker_threads, None);
+    }
+
+    /// Over ZMQ, `--backend` pins the startup workers' runtime (the shared
+    /// EngineCore handshake cannot be probed for a wire protocol). The pin must
+    /// reach `RouterConfig` and survive nesting into
+    /// `ServerConfig.router_config` — two-path config-plumbing guard.
+    #[test]
+    fn zmq_backend_pins_startup_worker_runtime_in_both_configs() {
+        let cli = cli_args_from(&[
+            "--backend",
+            "tokenspeed",
+            "--worker-urls",
+            "ipc:///tmp/smg-zmq/engine-0",
+        ]);
+
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.connection_mode, ConnectionMode::Zmq);
+        assert_eq!(
+            router_config.startup_worker_runtime_type,
+            Some(RuntimeType::TokenSpeed),
+            "--backend tokenspeed must pin the ZMQ startup worker runtime"
+        );
+
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(
+            server_config.router_config.startup_worker_runtime_type,
+            Some(RuntimeType::TokenSpeed),
+            "the runtime pin must survive into ServerConfig via to_server_config"
+        );
+    }
+
+    /// The runtime pin only disambiguates the ZMQ wire protocol: gRPC (and
+    /// HTTP) workers keep backend auto-detection even when `--backend` names an
+    /// engine, and a ZMQ deployment without `--backend` stays unpinned
+    /// (detect_backend's vLLM default applies).
+    #[test]
+    fn startup_worker_runtime_stays_unpinned_off_the_zmq_path() {
+        let grpc = cli_args_from(&[
+            "--backend",
+            "tokenspeed",
+            "--worker-urls",
+            "grpc://localhost:30001",
+        ]);
+        let router_config = grpc.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.connection_mode, ConnectionMode::Grpc);
+        assert_eq!(router_config.startup_worker_runtime_type, None);
+
+        let zmq_no_backend = cli_args_from(&["--worker-urls", "ipc:///tmp/smg-zmq/engine-0"]);
+        let router_config = zmq_no_backend.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.connection_mode, ConnectionMode::Zmq);
+        assert_eq!(router_config.startup_worker_runtime_type, None);
+
+        let zmq_vllm = cli_args_from(&[
+            "--backend",
+            "vllm",
+            "--worker-urls",
+            "ipc:///tmp/smg-zmq/engine-0",
+        ]);
+        let router_config = zmq_vllm.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(
+            router_config.startup_worker_runtime_type,
+            Some(RuntimeType::Vllm)
+        );
     }
 
     #[test]

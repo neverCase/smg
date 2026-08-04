@@ -9,7 +9,7 @@ use super::{
     RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry,
     TokenizerCacheConfig, TraceConfig,
 };
-use crate::worker::ConnectionMode;
+use crate::worker::{ConnectionMode, RuntimeType};
 
 /// Builder for RouterConfig that wraps the config itself
 /// This eliminates field duplication and stays in sync automatically
@@ -147,6 +147,13 @@ impl RouterConfigBuilder {
 
     // ==================== Connection ====================
 
+    /// Explicit runtime for startup workers over ZMQ (`None` keeps
+    /// auto-detection for HTTP/gRPC; see `RouterConfig::startup_worker_runtime_type`).
+    pub fn startup_worker_runtime_type(mut self, runtime: Option<RuntimeType>) -> Self {
+        self.config.startup_worker_runtime_type = runtime;
+        self
+    }
+
     pub fn connection_mode(mut self, mode: ConnectionMode) -> Self {
         self.config.connection_mode = mode;
         self
@@ -196,6 +203,11 @@ impl RouterConfigBuilder {
 
     pub fn worker_startup_timeout_secs(mut self, timeout: u64) -> Self {
         self.config.worker_startup_timeout_secs = timeout;
+        self
+    }
+
+    pub fn worker_startup_delay_secs(mut self, delay: u64) -> Self {
+        self.config.worker_startup_delay_secs = delay;
         self
     }
 

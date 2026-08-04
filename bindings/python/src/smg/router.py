@@ -45,6 +45,10 @@ def backend_from_str(backend_str: str | None) -> BackendType:
         "sglang": BackendType.Sglang,
         "openai": BackendType.Openai,
         "anthropic": BackendType.Anthropic,
+        # Engine backends: routing behaves like the default; over ZMQ they pin
+        # the startup workers' wire protocol (vLLM EngineCore vs TokenSpeed).
+        "vllm": BackendType.Vllm,
+        "tokenspeed": BackendType.Tokenspeed,
     }
     backend_lower = backend_str.lower()
     if backend_lower not in backend_map:
@@ -153,8 +157,11 @@ class Router:
         worker_startup_timeout_secs: Timeout in seconds for worker startup and
             registration. Large models can take significant time to load into GPU
             memory. Default: 1800 (30 minutes)
+        worker_startup_delay: Grace period in seconds before the first worker
+            startup check fires. Leaves the engine alone this long, then polls
+            every worker_startup_check_interval. Default: 0
         worker_startup_check_interval: Interval in seconds between checks for worker
-            initialization. Default: 10
+            initialization. Default: 30
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to
             cached worker if the match rate exceeds threshold, otherwise routes to the
             worker with the smallest tree. Default: 0.5

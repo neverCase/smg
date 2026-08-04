@@ -202,6 +202,7 @@ class RouterArgs:
     mesh_peer_urls: list[str] = dataclasses.field(default_factory=list)
     # Append new fields here to preserve positional callers.
     model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
+    worker_startup_delay: int = 0
 
     @staticmethod
     def add_cli_args(
@@ -553,6 +554,12 @@ class RouterArgs:
                 "Timeout in seconds for worker startup and registration (default: 1800 / 30 minutes)."
                 " Large models can take significant time to load into GPU memory."
             ),
+        )
+        pd_group.add_argument(
+            f"--{prefix}worker-startup-delay",
+            type=int,
+            default=RouterArgs.worker_startup_delay,
+            help="Grace period in seconds before the first worker startup check (default: 0)",
         )
         pd_group.add_argument(
             f"--{prefix}worker-startup-check-interval",
@@ -985,8 +992,11 @@ class RouterArgs:
             f"--{prefix}backend",
             type=str,
             default=RouterArgs.backend,
-            choices=["sglang", "openai", "anthropic"],
-            help="Backend runtime to use (default: sglang)",
+            choices=["sglang", "openai", "anthropic", "vllm", "tokenspeed"],
+            help=(
+                "Backend runtime to use (default: sglang). For ZMQ workers, vllm/"
+                "tokenspeed also pin the wire protocol (it cannot be auto-detected)"
+            ),
         )
         backend_group.add_argument(
             f"--{prefix}enable-wasm",

@@ -9,7 +9,10 @@ pub use smg_data_connector::{
 };
 
 use super::{validation::ConfigValidator, ConfigResult};
-use crate::{tenant::DEFAULT_TENANT_HEADER_NAME, worker::ConnectionMode};
+use crate::{
+    tenant::DEFAULT_TENANT_HEADER_NAME,
+    worker::{ConnectionMode, RuntimeType},
+};
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +20,13 @@ pub struct RouterConfig {
     pub mode: RoutingMode,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
+    /// Explicit runtime for the startup workers (`--worker-urls`), set from
+    /// `--backend` when the connection mode is ZMQ. The ZMQ handshake is shared
+    /// across engine runtimes, so the wire protocol cannot be probed and must
+    /// be declared up front; HTTP/gRPC workers keep auto-detection and ignore
+    /// this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_worker_runtime_type: Option<RuntimeType>,
     pub policy: PolicyConfig,
     /// Per-request sticky-routing override (honors `X-SMG-Routing-Key`).
     #[serde(default)]
@@ -36,6 +46,11 @@ pub struct RouterConfig {
     pub max_payload_size: usize,
     pub request_timeout_secs: u64,
     pub worker_startup_timeout_secs: u64,
+    /// Grace period before the first worker-startup check fires. The engine is
+    /// left alone for this long, then polled every
+    /// `worker_startup_check_interval_secs`.
+    #[serde(default)]
+    pub worker_startup_delay_secs: u64,
     pub worker_startup_check_interval_secs: u64,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
@@ -848,6 +863,7 @@ impl Default for RouterConfig {
             max_payload_size: 536_870_912,     // 512MB
             request_timeout_secs: 1800,        // 30 minutes
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
+            worker_startup_delay_secs: 0,
             worker_startup_check_interval_secs: 30,
             load_monitor_interval_secs: 10,
             engine_metrics: false,
@@ -885,6 +901,7 @@ impl Default for RouterConfig {
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
+            startup_worker_runtime_type: None,
             model_path: None,
             tokenizer_path: None,
             chat_template: None,
