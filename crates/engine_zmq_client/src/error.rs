@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-//
 // Error variants for the vLLM EngineCore protocol are adapted from the
 // Apache-2.0 reference `vllm-engine-core-client` (vllm-project/vllm,
 // rust/src/engine-core-client/src/error.rs). See crate root for provenance.
@@ -53,6 +51,8 @@ pub enum Error {
         context: &'static str,
         field: &'static str,
     },
+    #[error("invalid structured outputs params: {message}")]
+    InvalidStructuredOutputsParams { message: String },
     #[error("request `{request_id}` is already in flight")]
     DuplicateRequestId { request_id: String },
     #[error("data parallel rank {rank} is out of range for {num_engines} engine(s)")]

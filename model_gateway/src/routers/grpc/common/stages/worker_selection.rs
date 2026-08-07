@@ -370,8 +370,9 @@ impl WorkerSelectionStage {
             return None;
         }
 
-        // Select using policies
-        let policy = self.policy_registry.get_policy_or_default(model_id);
+        // Independent P/D policies so stateful ones (e.g. round_robin) don't share a counter.
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
 
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
@@ -385,29 +386,28 @@ impl WorkerSelectionStage {
             hash_ring,
             leg: WorkerLeg::Prefill,
         };
-        let prefill_idx = self
-            .policy_registry
-            .select_worker(&policy, &available_prefill, &info)?;
+        let prefill_idx =
+            self.policy_registry
+                .select_worker(&prefill_policy, &available_prefill, &info)?;
         info.leg = WorkerLeg::Decode;
-        let decode_idx = self
-            .policy_registry
-            .select_worker(&policy, &available_decode, &info)?;
+        let decode_idx =
+            self.policy_registry
+                .select_worker(&decode_policy, &available_decode, &info)?;
 
         let model = model_id;
-        let policy_name = policy.name();
 
         // Record worker selection metrics for both prefill and decode
         Metrics::record_worker_selection(
             metrics_labels::WORKER_PREFILL,
             metrics_labels::CONNECTION_GRPC,
             model,
-            policy_name,
+            prefill_policy.name(),
         );
         Metrics::record_worker_selection(
             metrics_labels::WORKER_DECODE,
             metrics_labels::CONNECTION_GRPC,
             model,
-            policy_name,
+            decode_policy.name(),
         );
 
         Some((
@@ -659,4 +659,176 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use openai_protocol::worker::HealthCheckConfig;
+
+    use super::*;
+    use crate::{
+        config::types::PolicyConfig,
+        policies::PolicyFactory,
+        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard},
+    };
+
+    fn no_health_check() -> HealthCheckConfig {
+        HealthCheckConfig {
+            disable_health_check: true,
+            ..Default::default()
+        }
+    }
+
+    fn register_pd_workers(
+        registry: &WorkerRegistry,
+        model_id: &str,
+        n: usize,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut prefill_urls = Vec::with_capacity(n);
+        let mut decode_urls = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let url = format!("grpc://127.0.0.1:{}", 8000 + i);
+            prefill_urls.push(url.clone());
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(model_id))
+                        .worker_type(WorkerType::Prefill)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+
+        for i in 0..n {
+            let url = format!("grpc://127.0.0.1:{}", 8100 + i);
+            decode_urls.push(url.clone());
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(model_id))
+                        .worker_type(WorkerType::Decode)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .build(),
+                ))
+                .unwrap();
+        }
+
+        (prefill_urls, decode_urls)
+    }
+
+    fn hit_counts_in_order(urls: &[String], hits: &HashMap<String, usize>) -> Vec<usize> {
+        urls.iter()
+            .map(|url| hits.get(url).copied().unwrap_or(0))
+            .collect()
+    }
+
+    /// Correctness bar for PD round-robin: every worker in both pools is hit
+    /// equally across 40 `select_pd_pair` calls.
+    fn assert_even_pd_round_robin_coverage(
+        prefill_urls: &[String],
+        decode_urls: &[String],
+        prefill_hits: &HashMap<String, usize>,
+        decode_hits: &HashMap<String, usize>,
+    ) {
+        assert_eq!(
+            hit_counts_in_order(prefill_urls, prefill_hits),
+            vec![10, 10, 10, 10],
+            "even PD round-robin coverage: every prefill worker should get 10/40"
+        );
+        assert_eq!(
+            hit_counts_in_order(decode_urls, decode_hits),
+            vec![10, 10, 10, 10],
+            "even PD round-robin coverage: every decode worker should get 10/40"
+        );
+    }
+
+    /// Drive `select_pd_pair` through the stage (uses `get_prefill_policy` /
+    /// `get_decode_policy` internally) and count selections by worker URL.
+    fn count_select_pd_pair_hits(
+        stage: &WorkerSelectionStage,
+        model_id: &str,
+        iterations: usize,
+    ) -> (HashMap<String, usize>, HashMap<String, usize>) {
+        let mut prefill_hits = HashMap::new();
+        let mut decode_hits = HashMap::new();
+        for _ in 0..iterations {
+            let (prefill, decode, _) = stage
+                .select_pd_pair(model_id, None, None, None)
+                .expect("select_pd_pair should return a pair");
+            *prefill_hits.entry(prefill.url().to_string()).or_default() += 1;
+            *decode_hits.entry(decode.url().to_string()).or_default() += 1;
+        }
+        (prefill_hits, decode_hits)
+    }
+
+    #[test]
+    #[should_panic(expected = "even PD round-robin coverage")]
+    fn select_pd_pair_shared_round_robin_fails_even_coverage() {
+        // Same correctness bar as the independent test. One shared RoundRobin
+        // Arc for P/D advances the counter twice per request, so even coverage
+        // must fail (this test is expected to panic on that assertion).
+        let model_id = "test-model-shared";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);
+
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let shared = PolicyFactory::create_from_config(&PolicyConfig::RoundRobin);
+        policy_registry.set_prefill_policy(Arc::clone(&shared));
+        policy_registry.set_decode_policy(shared);
+        assert!(Arc::ptr_eq(
+            &policy_registry.get_prefill_policy(),
+            &policy_registry.get_decode_policy()
+        ));
+
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            policy_registry,
+            WorkerSelectionMode::PrefillDecode,
+        );
+        let (prefill_hits, decode_hits) = count_select_pd_pair_hits(&stage, model_id, 40);
+        assert_even_pd_round_robin_coverage(
+            &prefill_urls,
+            &decode_urls,
+            &prefill_hits,
+            &decode_hits,
+        );
+    }
+
+    #[test]
+    fn select_pd_pair_independent_round_robin_passes_even_coverage() {
+        // Production PD startup: two independent RoundRobinPolicy instances.
+        // Same correctness bar; this configuration must pass.
+        let model_id = "test-model-independent";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);
+
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        policy_registry
+            .set_prefill_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        policy_registry
+            .set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        assert!(!Arc::ptr_eq(
+            &policy_registry.get_prefill_policy(),
+            &policy_registry.get_decode_policy()
+        ));
+
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            policy_registry,
+            WorkerSelectionMode::PrefillDecode,
+        );
+        let (prefill_hits, decode_hits) = count_select_pd_pair_hits(&stage, model_id, 40);
+        assert_even_pd_round_robin_coverage(
+            &prefill_urls,
+            &decode_urls,
+            &prefill_hits,
+            &decode_hits,
+        );
+    }
 }

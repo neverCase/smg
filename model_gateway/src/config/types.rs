@@ -630,6 +630,10 @@ pub struct DiscoveryConfig {
     /// PD mode decode
     pub decode_selector: HashMap<String, String>,
     pub bootstrap_port_annotation: String,
+    /// Annotation listing a pod's worker data ports (comma-separated).
+    /// Absent on a pod = single worker at `port`.
+    #[serde(default = "default_worker_ports_annotation")]
+    pub worker_ports_annotation: String,
     /// Router node discovery for HA (Kubernetes label selector)
     #[serde(default)]
     pub router_selector: HashMap<String, String>,
@@ -645,6 +649,10 @@ fn default_router_mesh_port_annotation() -> String {
     "sglang.ai/mesh-port".to_string()
 }
 
+fn default_worker_ports_annotation() -> String {
+    "smg.ai/worker-ports".to_string()
+}
+
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
@@ -657,6 +665,7 @@ impl Default for DiscoveryConfig {
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            worker_ports_annotation: default_worker_ports_annotation(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: default_router_mesh_port_annotation(),
             model_id_source: None,
@@ -1323,6 +1332,7 @@ mod tests {
             prefill_selector: selector.clone(),
             decode_selector: selector.clone(),
             bootstrap_port_annotation: "custom.io/port".to_string(),
+            worker_ports_annotation: "smg.ai/worker-ports".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
@@ -1603,6 +1613,7 @@ mod tests {
                 prefill_selector: selectors.clone(),
                 decode_selector: selectors,
                 bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
+                worker_ports_annotation: "smg.ai/worker-ports".to_string(),
                 router_selector: HashMap::new(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: None,
