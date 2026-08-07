@@ -103,7 +103,7 @@ async fn detect_via_models_endpoint(
         .ok_or_else(|| format!("/v1/models returned empty data array from {models_url}"))?;
 
     match first_model.owned_by.as_deref() {
-        Some("sglang" | "nvidia") => Ok("sglang".to_string()),
+        Some("sglang" | "nvidia" | "local") => Ok("sglang".to_string()),
         Some("vllm") => Ok("vllm".to_string()),
         Some("diffusers") => Ok("vllm".to_string()),
         Some("funaudiollm") => Ok("vllm".to_string()),
