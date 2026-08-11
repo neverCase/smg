@@ -148,12 +148,11 @@ impl PipelineStage for MessageRequestBuildingStage {
             ctx.state.workers.as_ref(),
         );
 
-        // Resolve string `stop` sequences for engines that can't match them
-        // server-side (SGLang skip_tokenizer_init, and every direct-ZMQ
-        // backend): drop the strings, convert single-token stops to
-        // stop_token_ids; the router-side StopSequenceDecoder trims the text.
-        let is_zmq = builder_client.is_zmq();
-        helpers::resolve_string_stops(&mut proto_request, ctx.tokenizer_arc().as_ref(), is_zmq);
+        // The client resolves string `stop`s its engine can't match and
+        // reports the router's residual trim obligation; no transport
+        // knowledge needed here.
+        ctx.state.response.router_stop_obligations = builder_client
+            .finalize_generate_request(&mut proto_request, ctx.tokenizer_arc().as_ref());
 
         if self.inject_pd_metadata {
             if let Some(workers) = ctx.state.workers.as_ref() {

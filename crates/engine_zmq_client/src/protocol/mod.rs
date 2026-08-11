@@ -30,6 +30,22 @@ pub struct EngineLoad {
     pub kv_cache_usage: f64,
 }
 
+/// A *wave* is vLLM's term (not ours) for one round of work by a data-parallel
+/// group whose ranks step in lockstep: they all-reduce every step, so they drain
+/// the wave together and then all park. A request handed to one parked rank
+/// leaves the others asleep until someone starts the next wave. Upstream names:
+/// `current_wave`, `wave_complete`, `START_DP_WAVE` in
+/// `vllm/v1/engine/core.py`. Only vLLM's MoE data parallelism steps this way;
+/// dense DP ranks are independent and report no waves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveEvent {
+    /// The group drained this wave and is now parked (vLLM `wave_complete`).
+    Complete(u32),
+    /// A rank took a request for an already-drained wave and needs the rest of
+    /// the group started on this one (vLLM `start_wave`).
+    Start(u32),
+}
+
 /// A single per-request output decoded from one engine tick. Lets the
 /// engine-neutral connector route outputs to their request streams without
 /// knowing the concrete protocol payload.
@@ -52,6 +68,9 @@ pub struct EngineBatch<O> {
     pub finished_request_ids: Vec<String>,
     /// Per-rank load signal, when the protocol carries it (`None` otherwise).
     pub load: Option<EngineLoad>,
+    /// Wave-control notification from a lockstep engine group (`None` on every
+    /// ordinary tick).
+    pub wave: Option<WaveEvent>,
 }
 
 impl<O> Default for EngineBatch<O> {
@@ -61,6 +80,7 @@ impl<O> Default for EngineBatch<O> {
             outputs: Vec::new(),
             finished_request_ids: Vec::new(),
             load: None,
+            wave: None,
         }
     }
 }
@@ -92,6 +112,11 @@ pub trait EngineProtocol: Send + Sync + 'static {
     fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)>;
     /// Encode the abort payload for one request id.
     fn encode_abort(request_id: &str) -> Result<Vec<u8>>;
+    /// Encode "start `wave` on every rank but `exclude_engine_index`" (the one
+    /// already holding the request) as `(request-type frame, payload)`.
+    /// `Ok(None)` when the protocol has no wave protocol — its ranks run
+    /// independently, so there is nothing to wake.
+    fn encode_start_wave(wave: u32, exclude_engine_index: u32) -> Result<Option<(Bytes, Vec<u8>)>>;
     /// Decode one output message (frame 0 plus ordered aux frames) into a batch.
     fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>>;
 }

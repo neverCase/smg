@@ -25,10 +25,28 @@ use crate::{
             utils::tonic_ext::{TonicResultExt, TonicStatusExt},
         },
     },
-    worker::{RuntimeType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
+    worker::{
+        ConnectionModeExt, RuntimeType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
+    },
 };
 
 type StreamResult = Result<ProtoStream, tonic::Status>;
+
+/// Metric connection labels for the PD legs (a leg can be gRPC or ZMQ).
+fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
+    match workers {
+        WorkerSelection::Disaggregated {
+            prefill, decode, ..
+        } => (
+            prefill.connection_mode().as_metric_label(),
+            decode.connection_mode().as_metric_label(),
+        ),
+        WorkerSelection::Single { worker } => {
+            let label = worker.connection_mode().as_metric_label();
+            (label, label)
+        }
+    }
+}
 
 /// KV-transfer params tagged onto the NIXL prefill leg so the engine pins its
 /// KV blocks and returns the handoff params for the decode worker.
@@ -489,11 +507,13 @@ impl RequestExecutionStage {
             decode_result.cb_status_code(),
         );
 
+        let (prefill_label, decode_label) = pd_leg_labels(workers);
+
         // Handle prefill result
         let prefill_stream = prefill_result.map_err(|e| {
             Metrics::record_worker_error(
                 metrics_labels::WORKER_PREFILL,
-                metrics_labels::CONNECTION_GRPC,
+                prefill_label,
                 metrics_labels::ERROR_BACKEND,
             );
             error!(function = "execute_parallel_pd", error = %e, "Prefill worker failed to start");
@@ -507,7 +527,7 @@ impl RequestExecutionStage {
         let decode_stream = decode_result.map_err(|e| {
             Metrics::record_worker_error(
                 metrics_labels::WORKER_DECODE,
-                metrics_labels::CONNECTION_GRPC,
+                decode_label,
                 metrics_labels::ERROR_BACKEND,
             );
             error!(function = "execute_parallel_pd", error = %e, "Decode worker failed to start");
@@ -648,6 +668,7 @@ impl RequestExecutionStage {
         );
 
         // Send to prefill, wait for completion
+        let (prefill_label, decode_label) = pd_leg_labels(workers);
         let prefill_start = Instant::now();
         let mut prefill_stream = prefill_client
             .generate(prefill_request)
@@ -656,7 +677,7 @@ impl RequestExecutionStage {
                 workers.record_outcome_prefill(e.http_status().as_u16());
                 Metrics::record_worker_error(
                     metrics_labels::WORKER_PREFILL,
-                    metrics_labels::CONNECTION_GRPC,
+                    prefill_label,
                     metrics_labels::ERROR_BACKEND,
                 );
                 error!(function = "execute_sequential_pd", error = %e, "Prefill worker failed to start");
@@ -678,7 +699,7 @@ impl RequestExecutionStage {
                     workers.record_outcome_prefill(e.http_status().as_u16());
                     Metrics::record_worker_error(
                         metrics_labels::WORKER_PREFILL,
-                        metrics_labels::CONNECTION_GRPC,
+                        prefill_label,
                         metrics_labels::ERROR_BACKEND,
                     );
                     error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
@@ -769,7 +790,7 @@ impl RequestExecutionStage {
             workers.record_outcome_decode(e.http_status().as_u16());
             Metrics::record_worker_error(
                 metrics_labels::WORKER_DECODE,
-                metrics_labels::CONNECTION_GRPC,
+                decode_label,
                 metrics_labels::ERROR_BACKEND,
             );
             error!(function = "execute_sequential_pd", error = %e, "Decode worker failed to start");
@@ -803,9 +824,42 @@ impl RequestExecutionStage {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use smg_grpc_client::vllm_proto as vllm;
 
     use super::*;
+    use crate::worker::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerType};
+
+    #[test]
+    fn pd_leg_labels_reflect_each_legs_transport() {
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("ipc:///tmp/smg-test-prefill")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Zmq)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .build(),
+        );
+        let selection = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill,
+            decode,
+            runtime_type: RuntimeType::TokenSpeed,
+        };
+        assert_eq!(
+            pd_leg_labels(&selection),
+            (
+                metrics_labels::CONNECTION_ZMQ,
+                metrics_labels::CONNECTION_GRPC
+            ),
+            "each PD leg must carry its own transport label"
+        );
+    }
 
     #[test]
     fn kv_connector_mode_mooncake_uses_bootstrap_metadata() {

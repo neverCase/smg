@@ -37,6 +37,7 @@ use engine_zmq_client::{
     ConnectedEngine,
 };
 use futures::{stream::SelectAll, Stream, StreamExt};
+use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use smg_grpc_client::{tokenspeed_proto, vllm_proto as vllm};
 
@@ -125,6 +126,232 @@ fn eos_ids_from_value(value: Option<&serde_json::Value>) -> Vec<u32> {
         Some(id) => as_id(id).into_iter().collect(),
         None => Vec::new(),
     }
+}
+
+/// Request-time EOS backstop for the tokenizer-less EngineCore.
+///
+/// EOS injection has exactly one owner — this file. The connect-time
+/// [`EosTokenIds`] model-dir resolution has nothing to read when the worker's
+/// model id is a repo id rather than a local path, so the tokenizer's merged
+/// EOS set is folded into `stop_token_ids` here as the always-available
+/// backstop; without it an uncapped request generates to the full context
+/// window. Not needed for TokenSpeed (its scheduler stops at EOS itself) —
+/// the caller gates on runtime.
+pub(crate) fn fold_tokenizer_eos_backstop(
+    request: &mut ProtoGenerateRequest,
+    tokenizer: Option<&Arc<dyn Tokenizer>>,
+) {
+    let ProtoGenerateRequest::Vllm(req) = request else {
+        return;
+    };
+    let Some(params) = req.sampling_params.as_mut() else {
+        return;
+    };
+    if params.ignore_eos {
+        return;
+    }
+    if let Some(tokenizer) = tokenizer {
+        for &id in tokenizer.eos_token_ids() {
+            if !params.stop_token_ids.contains(&id) {
+                params.stop_token_ids.push(id);
+            }
+        }
+    }
+}
+
+/// Time to wait for a ZMQ engine to complete the startup handshake. Generous:
+/// the engine loads the model and profiles KV cache between INIT and READY.
+const ZMQ_CONNECT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Derive a deterministic TCP handshake port from the ipc data-plane path.
+///
+/// vLLM's headless engine dials a *TCP* handshake (`--data-parallel-address` +
+/// `--data-parallel-rpc-port`); making the port a pure function of the worker
+/// URL lets the operator compute the same `--data-parallel-rpc-port` without a
+/// side channel. FNV-1a keeps it stable across processes and builds. Mapped
+/// into 20000..=29999 to avoid well-known and typical ephemeral ranges.
+///
+/// `_zmq_handshake_port` in `bindings/python/src/smg/serve.py` mirrors this
+/// function — keep them in sync.
+fn derive_handshake_port(path: &str) -> u16 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in path.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // Map into 20000..=29999: below the Linux default ephemeral range
+    // (`net.ipv4.ip_local_port_range` = 32768..60999) so an outbound socket
+    // can't already hold the port. `hash % 10000` always fits u16.
+    20000 + (hash % 10000) as u16
+}
+
+/// Derive the ZMQ socket addresses for a worker from its base URL.
+///
+/// Mirrors vLLM's headless topology: the **handshake is TCP** (the engine dials
+/// it, so it matches `vllm serve --headless --data-parallel-rpc-port`), while
+/// the **data plane is `ipc://`** for the same-host fast path (SMG chooses these
+/// and hands them to the engine during the handshake INIT). The operator gives a
+/// single `ipc://<path>` base; SMG binds the ipc input/output at
+/// `<path>-in.sock` / `-out.sock` and derives the TCP handshake port from the
+/// path. A `WorkerSpec.zmq_handshake_address` override replaces the derived
+/// handshake address verbatim (it must be `tcp://`), for engines that dial a
+/// fixed, pre-agreed address — e.g. TokenSpeed's default dial target is
+/// `tcp://127.0.0.1:30500` (its `--data-parallel-address`/
+/// `--data-parallel-rpc-port` defaults, outside the derived 20000..=29999
+/// band), so setting the override to that value pairs a bare
+/// `ts serve --headless` with a manually registered worker.
+/// Returns `(handshake, input, output)`.
+fn zmq_socket_addresses(
+    base_url: &str,
+    handshake_override: Option<&str>,
+) -> Result<(String, String, String), String> {
+    let path = base_url
+        .strip_prefix("ipc://")
+        .ok_or_else(|| format!("ZMQ worker URL must be ipc://<path>, got '{base_url}'"))?;
+    let handshake = match handshake_override {
+        Some(address) => {
+            if !address.starts_with("tcp://") {
+                return Err(format!(
+                    "zmq_handshake_address must be a tcp:// address \
+                     (the engine dials a TCP handshake), got '{address}'"
+                ));
+            }
+            address.to_string()
+        }
+        None => format!("tcp://{ZMQ_LOOPBACK_HOST}:{}", derive_handshake_port(path)),
+    };
+    let input = format!("ipc://{path}-in.sock");
+    let output = format!("ipc://{path}-out.sock");
+    Ok((handshake, input, output))
+}
+
+/// Create the parent directory for a worker's `ipc://` sockets. Kept off the
+/// address computation (which is pure) and async so it doesn't block a runtime
+/// thread.
+///
+/// The ipc:// data-plane sockets SMG binds here carry no authentication, so the
+/// directory must be owner-controlled: when this call creates it, it is created
+/// 0700 (mode applied at mkdir time — no chmod window); when it already exists,
+/// its permissions are left untouched (never chmod a shared dir like `/tmp`)
+/// and it is rejected unless it is a real directory owned by the current user.
+async fn ensure_ipc_socket_dir(base_url: &str) -> Result<(), String> {
+    let path = base_url.strip_prefix("ipc://").unwrap_or(base_url);
+    let Some(parent) = Path::new(path).parent() else {
+        return Ok(());
+    };
+    // symlink_metadata: a symlinked parent must not redirect the checks (or the
+    // sockets) into a directory we did not verify.
+    let meta = match tokio::fs::symlink_metadata(parent).await {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = tokio::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            builder.mode(0o700);
+            builder
+                .create(parent)
+                .await
+                .map_err(|e| format!("failed to create ipc socket dir for {path}: {e}"))?;
+            tokio::fs::symlink_metadata(parent)
+                .await
+                .map_err(|e| format!("failed to stat ipc socket dir for {path}: {e}"))?
+        }
+        Err(e) => return Err(format!("failed to stat ipc socket dir for {path}: {e}")),
+    };
+    if !meta.is_dir() {
+        return Err(format!(
+            "ipc socket dir {} exists but is not a directory",
+            parent.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = rustix::process::geteuid().as_raw();
+        if meta.uid() != uid {
+            return Err(format!(
+                "ipc socket dir {} is owned by uid {} (expected {uid}); refusing to bind \
+                 unauthenticated ZMQ sockets in a directory owned by another user",
+                parent.display(),
+                meta.uid()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Remove a stale ipc socket file left by a previous gateway process, if any.
+/// Only ever unlinks sockets (never a regular file at the path), inside the
+/// owner-verified socket dir.
+async fn unlink_stale_socket(address: &str) -> Result<(), String> {
+    let Some(path) = address.strip_prefix("ipc://") else {
+        return Ok(());
+    };
+    match tokio::fs::symlink_metadata(path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("failed to stat ipc socket path {path}: {e}")),
+        Ok(meta) => {
+            use std::os::unix::fs::FileTypeExt;
+            if !meta.file_type().is_socket() {
+                return Err(format!(
+                    "ipc socket path {path} exists but is not a socket; refusing to unlink"
+                ));
+            }
+            tracing::info!("Removing stale ipc socket {path} from a previous gateway run");
+            tokio::fs::remove_file(path)
+                .await
+                .map_err(|e| format!("failed to remove stale ipc socket {path}: {e}"))
+        }
+    }
+}
+
+/// Bind the SMG-side ZMQ sockets and complete the handshake with the engine:
+/// the single connect path for a worker's `ipc://` URL, shared by the lazy
+/// client accessor and the background handshake driver. `model_id` is the
+/// config-resolved served model (EngineCore reports none). Errors are plain
+/// reasons; the worker layer wraps them in its own error type.
+pub(crate) async fn connect_for_worker(
+    base_url: &str,
+    model_id: String,
+    runtime: RuntimeType,
+    handshake_override: Option<&str>,
+) -> Result<ZmqEngineClient, String> {
+    let (handshake, input, output) = zmq_socket_addresses(base_url, handshake_override)?;
+    ensure_ipc_socket_dir(base_url).await?;
+    // ZMQ refuses to bind over an existing ipc socket file, so leftovers from
+    // a dead gateway would fail every reconnect with a bare transport error.
+    // The dir is verified owner-only above, and a live gateway can't leave
+    // these behind (each worker URL is bound by at most one process), so any
+    // existing socket file here is stale by construction.
+    unlink_stale_socket(&input).await?;
+    unlink_stale_socket(&output).await?;
+    // The engine can't stop at EOS on its own (it has no tokenizer or model
+    // config); resolve the EOS ids from the local model dir so every request
+    // carries them.
+    let model_dir = Path::new(&model_id);
+    let eos = if model_dir.is_dir() {
+        EosTokenIds::from_model_dir(model_dir)
+    } else {
+        tracing::warn!(
+            "ZMQ worker model id '{model_id}' is not a local model directory; connect-time \
+             EOS ids unavailable — relying on the tokenizer's EOS set, folded into stop \
+             tokens at request time"
+        );
+        EosTokenIds::default()
+    };
+    tracing::info!("Binding ZMQ client for worker {base_url} (handshake={handshake})");
+    ZmqEngineClient::connect(
+        &handshake,
+        &input,
+        &output,
+        1,
+        model_id,
+        eos,
+        runtime,
+        ZMQ_CONNECT_TIMEOUT,
+    )
+    .await
+    .map_err(|e| format!("Failed to connect ZMQ engine: {e}"))
 }
 
 /// Direct ZMQ connection to a same-host engine (vLLM EngineCore or TokenSpeed),
@@ -268,19 +495,29 @@ impl ZmqEngineClient {
                     .ok_or_else(|| tonic::Status::unavailable("no connected ZMQ engine"))?;
                 let mut streams = SelectAll::new();
                 for (index, sub) in fan_out_requests(*req).into_iter().enumerate() {
-                    // The engine returns the sampled logprob plus up to
-                    // `logprobs` ranked candidates per position; carry the
-                    // requested count so the stream can shape `top_logprobs`.
-                    let top_logprobs = sub
-                        .sampling_params
-                        .as_ref()
-                        .and_then(|sp| sp.logprobs)
-                        .filter(|&n| n > 0)
-                        .map_or(0, |n| n as usize);
                     let request = translate_request(sub, max_model_len, model_dtype, &self.eos)
                         .map_err(tonic::Status::invalid_argument)?;
+                    // The engine returns the sampled/prompt token's logprob
+                    // plus the requested ranked candidates per position; carry
+                    // the counts so the stream can shape both `top_logprobs`
+                    // lists. The first prompt token is reported with a `null`
+                    // logprob (nothing precedes it to condition on).
+                    let sampling = request.sampling_params.as_ref();
+                    let top_logprobs = ranked_candidate_count(sampling.and_then(|sp| sp.logprobs));
+                    let prompt_top_logprobs =
+                        ranked_candidate_count(sampling.and_then(|sp| sp.prompt_logprobs));
+                    let first_prompt_token = request
+                        .prompt_token_ids
+                        .as_ref()
+                        .and_then(|ids| ids.first().copied());
                     let stream = client.submit(request).await.map_err(zmq_status)?;
-                    streams.push(VllmGenerateStream::new(stream, index as u32, top_logprobs));
+                    streams.push(VllmGenerateStream::new(
+                        stream,
+                        index as u32,
+                        top_logprobs,
+                        prompt_top_logprobs,
+                        first_prompt_token,
+                    ));
                 }
                 Ok(ZmqGenerateStream::Vllm(streams))
             }
@@ -447,6 +684,17 @@ impl ZmqGenerateStream {
     pub fn mark_completed(&mut self) {}
 }
 
+/// Ranked candidates to emit per position for a requested logprob count:
+/// unset/`0` means the sampled (or prompt) token's own logprob only, and `-1`
+/// means every candidate the engine returned.
+fn ranked_candidate_count(requested: Option<i32>) -> usize {
+    match requested {
+        Some(n) if n < 0 => usize::MAX,
+        Some(n) => n as usize,
+        None => 0,
+    }
+}
+
 /// Accumulated per-request token counts shared by both stream mappers.
 #[derive(Default)]
 struct StreamState {
@@ -459,6 +707,10 @@ struct StreamState {
     /// `Complete`, so accumulate here and drain into `Complete`.
     output_logprobs_val: Vec<f32>,
     output_logprobs_idx: Vec<u32>,
+    /// Prompt (input) logprobs, accumulated across chunked-prefill ticks.
+    prompt_logprobs: Vec<vllm::InputTokenLogProb>,
+    prompt_token_ids: Vec<u32>,
+    prompt_top_logprobs: Vec<vllm::TopLogProbs>,
     /// Cumulative per-position ranked candidates (`top_logprobs`), accumulated
     /// alongside the sampled logprobs and drained into the terminal `Complete`.
     output_top_logprobs: Vec<vllm::TopLogProbs>,
@@ -473,6 +725,60 @@ impl StreamState {
             token_ids: std::mem::take(&mut self.output_logprobs_idx),
             top_logprobs: std::mem::take(&mut self.output_top_logprobs),
         })
+    }
+    /// Emit one engine tick as vLLM-proto responses. On a finish tick the
+    /// `Complete` (with the engine-specific finish reason and matched stop) is
+    /// returned directly — unless the tick also carried new tokens, in which
+    /// case a `Chunk` goes out first and the `Complete` is parked in `pending`
+    /// for the next poll. Non-finish ticks emit a plain `Chunk`.
+    fn emit_tick(
+        &mut self,
+        index: u32,
+        token_ids: Vec<u32>,
+        chunk_logprobs: Option<vllm::OutputLogProbs>,
+        finish: Option<(String, Option<vllm::generate_complete::MatchedStop>)>,
+        pending: &mut Option<vllm::GenerateResponse>,
+    ) -> vllm::GenerateResponse {
+        let chunk = |state: &Self, token_ids, chunk_logprobs| {
+            vllm::generate_response::Response::Chunk(vllm::GenerateStreamChunk {
+                token_ids,
+                prompt_tokens: state.prompt_tokens,
+                completion_tokens: state.completion_tokens,
+                cached_tokens: state.cached_tokens,
+                output_logprobs: chunk_logprobs,
+                index,
+                ..Default::default()
+            })
+        };
+        let response = match finish {
+            Some((finish_reason, matched_stop)) => {
+                let complete = vllm::GenerateResponse {
+                    response: Some(vllm::generate_response::Response::Complete(
+                        vllm::GenerateComplete {
+                            output_ids: std::mem::take(&mut self.output_ids),
+                            finish_reason,
+                            prompt_tokens: self.prompt_tokens,
+                            completion_tokens: self.completion_tokens,
+                            cached_tokens: self.cached_tokens,
+                            matched_stop,
+                            output_logprobs: self.take_complete_logprobs(),
+                            index,
+                            ..Default::default()
+                        },
+                    )),
+                };
+                if token_ids.is_empty() {
+                    return complete;
+                }
+                let chunk = chunk(self, token_ids, chunk_logprobs);
+                *pending = Some(complete);
+                chunk
+            }
+            None => chunk(self, token_ids, chunk_logprobs),
+        };
+        vllm::GenerateResponse {
+            response: Some(response),
+        }
     }
 }
 
@@ -489,6 +795,13 @@ pub struct VllmGenerateStream {
     /// only the sampled logprob (or nothing) was asked for, in which case no
     /// `top_logprobs` are emitted.
     top_logprobs: usize,
+    /// Ranked candidates per PROMPT position (`prompt_logprobs`); `0` off.
+    prompt_top_logprobs: usize,
+    /// First prompt token id; reported with a `null` logprob per the API
+    /// contract (nothing precedes it to condition on).
+    first_prompt_token: Option<u32>,
+    /// Prompt logprobs are attached to the first emitted chunk exactly once.
+    input_logprobs_emitted: bool,
     /// Terminal `Complete` held back when the finish tick also carried new
     /// tokens: streaming frontends decode text/logprobs from chunks only, so
     /// the tick's delta goes out as a `Chunk` first.
@@ -496,12 +809,21 @@ pub struct VllmGenerateStream {
 }
 
 impl VllmGenerateStream {
-    fn new(inner: EngineCoreStream, index: u32, top_logprobs: usize) -> Self {
+    fn new(
+        inner: EngineCoreStream,
+        index: u32,
+        top_logprobs: usize,
+        prompt_top_logprobs: usize,
+        first_prompt_token: Option<u32>,
+    ) -> Self {
         Self {
             inner,
             state: StreamState::default(),
             index,
             top_logprobs,
+            prompt_top_logprobs,
+            first_prompt_token,
+            input_logprobs_emitted: false,
             pending: None,
         }
     }
@@ -560,61 +882,105 @@ impl VllmGenerateStream {
         state.output_logprobs_idx.extend(tick_logprobs_idx);
         state.output_top_logprobs.extend(tick_top_logprobs);
 
-        let response = match output.finish_reason {
-            // An engine-side request failure (e.g. grammar compilation) must
-            // surface as an error, not as a normal completion with empty
-            // output — that would produce a 200 with no content.
-            Some(EngineCoreFinishReason::Error) => {
-                return Err(tonic::Status::internal(
-                    "engine finished the request with an error (see engine logs)",
-                ));
-            }
-            Some(reason) => {
-                let complete = vllm::GenerateResponse {
-                    response: Some(vllm::generate_response::Response::Complete(
-                        vllm::GenerateComplete {
-                            output_ids: std::mem::take(&mut state.output_ids),
-                            finish_reason: finish_reason_str(reason).to_string(),
-                            prompt_tokens: state.prompt_tokens,
-                            completion_tokens: state.completion_tokens,
-                            cached_tokens: state.cached_tokens,
-                            matched_stop: output.stop_reason.map(map_matched_stop),
-                            output_logprobs: state.take_complete_logprobs(),
-                            index: self.index,
-                            ..Default::default()
-                        },
-                    )),
-                };
-                if token_ids.is_empty() {
-                    return Ok(complete);
+        // Prompt logprobs accumulate the same way (chunked prefill delivers
+        // them incrementally); entry 0 per position is the actual prompt
+        // token. The API contract reports the first prompt token with a null
+        // logprob, so seed it once before the first scored position.
+        if let Some(prompt_logprobs) = &output.new_prompt_logprobs_tensors {
+            let decoded = prompt_logprobs.as_direct().ok_or_else(|| {
+                tonic::Status::internal("unresolved wire prompt logprobs in engine output")
+            })?;
+            if state.prompt_logprobs.is_empty() && !decoded.positions.is_empty() {
+                if let Some(first) = self.first_prompt_token {
+                    state
+                        .prompt_logprobs
+                        .push(vllm::InputTokenLogProb::default());
+                    state.prompt_token_ids.push(first);
+                    if self.prompt_top_logprobs > 0 {
+                        state.prompt_top_logprobs.push(vllm::TopLogProbs::default());
+                    }
                 }
-                // The finish tick carried new tokens: emit them as a `Chunk`
-                // first and hold the `Complete` for the next poll.
-                let chunk = vllm::generate_response::Response::Chunk(vllm::GenerateStreamChunk {
-                    token_ids,
-                    prompt_tokens: state.prompt_tokens,
-                    completion_tokens: state.completion_tokens,
-                    cached_tokens: state.cached_tokens,
-                    output_logprobs: chunk_logprobs,
-                    index: self.index,
-                    ..Default::default()
-                });
-                self.pending = Some(complete);
-                chunk
             }
-            None => vllm::generate_response::Response::Chunk(vllm::GenerateStreamChunk {
-                token_ids,
-                prompt_tokens: state.prompt_tokens,
-                completion_tokens: state.completion_tokens,
-                cached_tokens: state.cached_tokens,
-                output_logprobs: chunk_logprobs,
-                index: self.index,
-                ..Default::default()
-            }),
+            for position in &decoded.positions {
+                let Some(selected) = position.entries.first() else {
+                    continue;
+                };
+                state.prompt_logprobs.push(vllm::InputTokenLogProb {
+                    value: Some(selected.logprob),
+                });
+                state.prompt_token_ids.push(selected.token_id);
+                if self.prompt_top_logprobs > 0 {
+                    let mut top = vllm::TopLogProbs::default();
+                    for entry in position.entries.iter().take(self.prompt_top_logprobs) {
+                        top.values.push(entry.logprob);
+                        top.token_ids.push(entry.token_id);
+                    }
+                    state.prompt_top_logprobs.push(top);
+                }
+            }
+        }
+
+        // An engine-side request failure (e.g. grammar compilation) must
+        // surface as an error, not as a normal completion with empty output —
+        // that would produce a 200 with no content.
+        if matches!(output.finish_reason, Some(EngineCoreFinishReason::Error)) {
+            return Err(tonic::Status::internal(
+                "engine finished the request with an error (see engine logs)",
+            ));
+        }
+        let finish = output.finish_reason.map(|reason| {
+            (
+                finish_reason_str(reason).to_string(),
+                output.stop_reason.map(map_matched_stop),
+            )
+        });
+        let mut response = state.emit_tick(
+            self.index,
+            token_ids,
+            chunk_logprobs,
+            finish,
+            &mut self.pending,
+        );
+        self.attach_input_logprobs(&mut response);
+        Ok(response)
+    }
+
+    /// Attach the accumulated prompt logprobs: once on the first token-bearing
+    /// chunk (the proto puts them in the first chunk only) and on every
+    /// `Complete`, including one parked in `pending`. Prefill precedes the
+    /// first sampled token, so the set is whole by the time a chunk carries
+    /// tokens.
+    fn attach_input_logprobs(&mut self, response: &mut vllm::GenerateResponse) {
+        if self.state.prompt_logprobs.is_empty() {
+            return;
+        }
+        let input_logprobs = vllm::InputLogProbs {
+            token_logprobs: self.state.prompt_logprobs.clone(),
+            token_ids: self.state.prompt_token_ids.clone(),
+            top_logprobs: self.state.prompt_top_logprobs.clone(),
         };
-        Ok(vllm::GenerateResponse {
-            response: Some(response),
-        })
+        if let Some(vllm::generate_response::Response::Complete(parked)) = self
+            .pending
+            .as_mut()
+            .and_then(|pending| pending.response.as_mut())
+        {
+            parked.input_logprobs = Some(input_logprobs.clone());
+        }
+        match response.response.as_mut() {
+            Some(vllm::generate_response::Response::Chunk(chunk))
+                if !self.input_logprobs_emitted && !chunk.token_ids.is_empty() =>
+            {
+                chunk.input_logprobs = Some(input_logprobs);
+                self.input_logprobs_emitted = true;
+            }
+            // Later chunks never repeat them (the proto carries them in the
+            // first chunk only), and neither do token-less prefill chunks.
+            Some(vllm::generate_response::Response::Chunk(_)) => {}
+            Some(vllm::generate_response::Response::Complete(complete)) => {
+                complete.input_logprobs = Some(input_logprobs);
+            }
+            None => {}
+        }
     }
 }
 
@@ -664,7 +1030,10 @@ impl TokenSpeedGenerateStream {
         }
     }
 
-    fn map_output(&mut self, output: TokenSpeedOutput) -> vllm::GenerateResponse {
+    fn map_output(
+        &mut self,
+        output: TokenSpeedOutput,
+    ) -> Result<vllm::GenerateResponse, tonic::Status> {
         let state = &mut self.state;
         // TokenSpeed reports per-request token counts directly (cumulative for
         // completions), rather than vLLM's per-output prefill-stats deltas.
@@ -698,52 +1067,25 @@ impl TokenSpeedGenerateStream {
             .output_logprobs_idx
             .extend(output.output_logprobs_idx.iter().copied());
 
-        let response = match output.finish_reason {
-            Some(reason) => {
-                let complete = vllm::GenerateResponse {
-                    response: Some(vllm::generate_response::Response::Complete(
-                        vllm::GenerateComplete {
-                            output_ids: std::mem::take(&mut state.output_ids),
-                            finish_reason: normalize_finish_reason(&reason).to_string(),
-                            prompt_tokens: state.prompt_tokens,
-                            completion_tokens: state.completion_tokens,
-                            cached_tokens: state.cached_tokens,
-                            output_logprobs: state.take_complete_logprobs(),
-                            index: self.index,
-                            ..Default::default()
-                        },
-                    )),
-                };
-                if output.output_ids.is_empty() {
-                    return complete;
-                }
-                // The finish tick carried new tokens: emit them as a `Chunk`
-                // first and hold the `Complete` for the next poll.
-                let chunk = vllm::generate_response::Response::Chunk(vllm::GenerateStreamChunk {
-                    token_ids: output.output_ids,
-                    prompt_tokens: state.prompt_tokens,
-                    completion_tokens: state.completion_tokens,
-                    cached_tokens: state.cached_tokens,
-                    output_logprobs: chunk_logprobs,
-                    index: self.index,
-                    ..Default::default()
-                });
-                self.pending = Some(complete);
-                chunk
-            }
-            None => vllm::generate_response::Response::Chunk(vllm::GenerateStreamChunk {
-                token_ids: output.output_ids,
-                prompt_tokens: state.prompt_tokens,
-                completion_tokens: state.completion_tokens,
-                cached_tokens: state.cached_tokens,
-                output_logprobs: chunk_logprobs,
-                index: self.index,
-                ..Default::default()
-            }),
-        };
-        vllm::GenerateResponse {
-            response: Some(response),
+        // An engine-side failure must surface as an error, not a normal
+        // completion with empty output — mirroring the vLLM stream's guard.
+        if output.finish_reason.as_deref() == Some("error") {
+            return Err(tonic::Status::internal(
+                "engine finished the request with an error (see engine logs)",
+            ));
         }
+        // No matched_stop on this wire: TokenSpeed reports the finish reason
+        // only, and the router-side stop machinery owns string matching.
+        let finish = output
+            .finish_reason
+            .map(|reason| (normalize_finish_reason(&reason).to_string(), None));
+        Ok(state.emit_tick(
+            self.index,
+            output.output_ids,
+            chunk_logprobs,
+            finish,
+            &mut self.pending,
+        ))
     }
 }
 
@@ -760,7 +1102,7 @@ impl Stream for TokenSpeedGenerateStream {
             return Poll::Ready(Some(Ok(pending)));
         }
         match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(output))) => Poll::Ready(Some(Ok(this.map_output(output)))),
+            Poll::Ready(Some(Ok(output))) => Poll::Ready(Some(this.map_output(output))),
             Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(zmq_status(error)))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -786,17 +1128,27 @@ impl Stream for TokenSpeedGenerateStream {
 ///   pipeline de-duplicates (max per prompt), so nothing is counted n times.
 fn fan_out_requests(req: vllm::GenerateRequest) -> Vec<vllm::GenerateRequest> {
     let n = req.sampling_params.as_ref().map_or(1, |sp| sp.n.max(1));
+    fan_out_n(req, n, |sub, i| {
+        sub.request_id = format!("{}-{i}", sub.request_id);
+        if let Some(sp) = sub.sampling_params.as_mut() {
+            sp.n = 1;
+            // An explicit seed must still yield distinct samples per sub.
+            sp.seed = sp.seed.map(|seed| seed.wrapping_add(i as i32));
+        }
+    })
+}
+
+/// Shared n>1 fan-out scaffolding: clone the request into `n` subs and let
+/// `per_sub` apply the engine-specific rid suffix and sampling tweaks. An
+/// `n <= 1` request passes through untouched.
+fn fan_out_n<R: Clone>(req: R, n: u32, mut per_sub: impl FnMut(&mut R, u32)) -> Vec<R> {
     if n <= 1 {
         return vec![req];
     }
     (0..n)
         .map(|i| {
             let mut sub = req.clone();
-            sub.request_id = format!("{}-{i}", req.request_id);
-            if let Some(sp) = sub.sampling_params.as_mut() {
-                sp.n = 1;
-                sp.seed = sp.seed.map(|seed| seed.wrapping_add(i as i32));
-            }
+            per_sub(&mut sub, i);
             sub
         })
         .collect()
@@ -812,19 +1164,12 @@ fn fan_out_tokenspeed_requests(
     req: tokenspeed_proto::GenerateRequest,
 ) -> Vec<tokenspeed_proto::GenerateRequest> {
     let n = req.sampling_params.as_ref().map_or(1, |sp| sp.n.max(1));
-    if n <= 1 {
-        return vec![req];
-    }
-    (0..n)
-        .map(|i| {
-            let mut sub = req.clone();
-            sub.request_id = format!("{}-{i}", req.request_id);
-            if let Some(sp) = sub.sampling_params.as_mut() {
-                sp.n = 1;
-            }
-            sub
-        })
-        .collect()
+    fan_out_n(req, n, |sub, i| {
+        sub.request_id = format!("{}-{i}", sub.request_id);
+        if let Some(sp) = sub.sampling_params.as_mut() {
+            sp.n = 1;
+        }
+    })
 }
 
 /// Translate a TokenSpeed proto `GenerateRequest` into the wire
@@ -964,15 +1309,6 @@ fn translate_request(
         .data_parallel_rank
         .map(|rank| u32::try_from(rank).map_err(|_| format!("invalid data_parallel_rank: {rank}")))
         .transpose()?;
-    if let Some(sp) = req.sampling_params.as_ref() {
-        // n is not carried on the EngineCore wire; n>1 is fanned out into
-        // single-sample sub-requests by `generate` before translation.
-        // The ZMQ renderer path has no prompt-logprob merge, so the engine's
-        // prompt logprobs would be computed and then dropped.
-        if sp.prompt_logprobs.is_some() {
-            return Err("prompt logprobs are not supported over the ZMQ backend".to_string());
-        }
-    }
     // vLLM's frontend defaults an unset `max_tokens` to the remaining context
     // (`max_model_len - prompt_len`).
     let prompt_len = prompt_token_ids.as_ref().map_or(0, |ids| ids.len()) as u64;
@@ -1044,8 +1380,7 @@ fn translate_sampling(
         all_stop_token_ids,
         seed: sp.seed.map(i64::from),
         logprobs: sp.logprobs,
-        // prompt_logprobs is rejected in `translate_request` (no renderer
-        // support on the ZMQ path), so it is never forwarded.
+        prompt_logprobs: sp.prompt_logprobs,
         logit_bias,
         structured_outputs: sp.constraint.and_then(translate_constraint),
         ..EngineCoreSamplingParams::default()
@@ -1135,8 +1470,159 @@ mod tests {
         },
         EngineId,
     };
+    use llm_tokenizer::mock::MockTokenizer;
 
     use super::*;
+
+    #[tokio::test]
+    async fn unlink_stale_socket_removes_sockets_and_refuses_files() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("stale.sock");
+        // A bound-then-dropped listener leaves the socket file behind, exactly
+        // like a dead gateway does.
+        drop(UnixListener::bind(&sock_path).unwrap());
+        assert!(sock_path.exists());
+        let addr = format!("ipc://{}", sock_path.display());
+        unlink_stale_socket(&addr).await.unwrap();
+        assert!(!sock_path.exists(), "stale socket must be removed");
+
+        // Missing file: fine.
+        unlink_stale_socket(&addr).await.unwrap();
+
+        // A regular file at the path is not ours to delete.
+        std::fs::write(&sock_path, b"not a socket").unwrap();
+        let err = unlink_stale_socket(&addr).await.unwrap_err();
+        assert!(err.contains("not a socket"), "{err}");
+        assert!(sock_path.exists(), "regular file must survive");
+    }
+
+    #[test]
+    fn derive_handshake_port_matches_pinned_vectors() {
+        // Fixed vectors shared with `_zmq_handshake_port` in
+        // bindings/python/src/smg/serve.py — a change on either side breaks the
+        // engine/router port agreement, so these must stay in sync.
+        assert_eq!(derive_handshake_port("/tmp/smg-zmq/ts0.ipc"), 25152);
+        assert_eq!(derive_handshake_port("/tmp/smg-zmq/engine-31000"), 22714);
+        // Range invariant: every path maps into 20000..=29999.
+        for p in ["", "a", "/x/y/z.ipc", "very/long/path/with/segments.sock"] {
+            let port = derive_handshake_port(p);
+            assert!(
+                (20000..=29999).contains(&port),
+                "port {port} out of band for {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zmq_socket_addresses_derive_handshake_by_default() {
+        let (handshake, input, output) =
+            zmq_socket_addresses("ipc:///tmp/smg-zmq/ts0.ipc", None).unwrap();
+        assert_eq!(handshake, "tcp://127.0.0.1:25152");
+        assert_eq!(input, "ipc:///tmp/smg-zmq/ts0.ipc-in.sock");
+        assert_eq!(output, "ipc:///tmp/smg-zmq/ts0.ipc-out.sock");
+    }
+
+    #[test]
+    fn zmq_socket_addresses_honor_handshake_override() {
+        // TokenSpeed's default dial target — outside the derived band; the
+        // override must be bound verbatim while the data plane stays derived.
+        let (handshake, input, output) =
+            zmq_socket_addresses("ipc:///tmp/smg-zmq/ts0.ipc", Some("tcp://127.0.0.1:30500"))
+                .unwrap();
+        assert_eq!(handshake, "tcp://127.0.0.1:30500");
+        assert_eq!(input, "ipc:///tmp/smg-zmq/ts0.ipc-in.sock");
+        assert_eq!(output, "ipc:///tmp/smg-zmq/ts0.ipc-out.sock");
+    }
+
+    #[test]
+    fn zmq_socket_addresses_reject_non_tcp_override() {
+        // The engine dials a TCP handshake; a non-tcp override is a config
+        // error and must fail loudly rather than bind something unexpected.
+        let err = zmq_socket_addresses("ipc:///tmp/smg-zmq/ts0.ipc", Some("ipc:///tmp/hs.sock"))
+            .unwrap_err();
+        assert!(
+            err.contains("tcp://"),
+            "error must name the required scheme: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_ipc_socket_dir_creates_a_private_owner_only_dir() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("sockets");
+        let url = format!("ipc://{}/x.ipc", dir.display());
+        ensure_ipc_socket_dir(&url).await.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "created socket dir must be 0700");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_ipc_socket_dir_leaves_an_existing_owned_dir_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let url = format!("ipc://{}/x.ipc", dir.path().display());
+        ensure_ipc_socket_dir(&url).await.unwrap();
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "an existing dir must not be chmod'd");
+    }
+
+    #[tokio::test]
+    async fn ensure_ipc_socket_dir_rejects_a_non_directory_parent() {
+        let base = tempfile::tempdir().unwrap();
+        let file = base.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let url = format!("ipc://{}/x.ipc", file.display());
+        assert!(ensure_ipc_socket_dir(&url).await.is_err());
+    }
+
+    fn eos_request(stop_token_ids: Vec<u32>, ignore_eos: bool) -> ProtoGenerateRequest {
+        ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            sampling_params: Some(vllm::SamplingParams {
+                stop_token_ids,
+                ignore_eos,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+
+    fn eos_stop_ids(req: &ProtoGenerateRequest) -> &[u32] {
+        match req {
+            ProtoGenerateRequest::Vllm(r) => &r.sampling_params.as_ref().unwrap().stop_token_ids,
+            _ => panic!("expected vLLM request"),
+        }
+    }
+
+    #[test]
+    fn eos_backstop_appends_tokenizer_ids_without_duplicates() {
+        // MockTokenizer's EOS set is {999}.
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+
+        let mut req = eos_request(vec![7], false);
+        fold_tokenizer_eos_backstop(&mut req, Some(&tokenizer));
+        assert_eq!(eos_stop_ids(&req), &[7, 999]);
+
+        // Already-present EOS ids are not duplicated.
+        let mut req = eos_request(vec![999], false);
+        fold_tokenizer_eos_backstop(&mut req, Some(&tokenizer));
+        assert_eq!(eos_stop_ids(&req), &[999]);
+    }
+
+    #[test]
+    fn eos_backstop_respects_ignore_eos() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let mut req = eos_request(vec![7], true);
+        fold_tokenizer_eos_backstop(&mut req, Some(&tokenizer));
+        assert_eq!(eos_stop_ids(&req), &[7]);
+    }
 
     fn batch(
         request_id: &str,
@@ -1425,6 +1911,174 @@ mod tests {
             other => panic!("expected complete, got {other:?}"),
         }
         assert!(stream.next().await.is_none());
+
+        engine_task.await.unwrap();
+    }
+
+    /// Prompt logprobs end to end: the request carries `prompt_logprobs` to the
+    /// engine, and the engine's prompt tensors come back as `input_logprobs` on
+    /// the first token-bearing chunk (once) and on the terminal `Complete`.
+    #[tokio::test]
+    async fn generate_streams_prompt_logprobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "m".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::Vllm,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let client = client.expect("adapter connect");
+        let engine = engine.expect("mock engine");
+
+        // Prompt position for input token 2 (the engine scores every prompt
+        // token but the first), with one ranked candidate behind it.
+        let prompt_tensors = MaybeWireLogprobs::Direct(Logprobs {
+            positions: vec![PositionLogprobs {
+                entries: vec![
+                    TokenLogprob {
+                        token_id: 2,
+                        logprob: -0.5,
+                        rank: 3,
+                    },
+                    TokenLogprob {
+                        token_id: 20,
+                        logprob: -0.1,
+                        rank: 1,
+                    },
+                ],
+            }],
+        });
+        let prefill = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            outputs: vec![EngineCoreOutput {
+                request_id: "r1".to_string(),
+                new_token_ids: vec![10],
+                new_prompt_logprobs_tensors: Some(prompt_tensors),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let decode = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            outputs: vec![EngineCoreOutput {
+                request_id: "r1".to_string(),
+                new_token_ids: vec![11],
+                finish_reason: Some(EngineCoreFinishReason::Length),
+                ..Default::default()
+            }],
+            finished_requests: Some(BTreeSet::from(["r1".to_string()])),
+            ..Default::default()
+        });
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "engine task ends after responding"
+        )]
+        let engine_task = tokio::spawn(async move {
+            let (mut input, mut output) = engine.split();
+            let inbound = input.recv().await.unwrap();
+            let request = match inbound {
+                EngineInbound::Add(request) => request,
+                other => panic!("expected Add, got {other:?}"),
+            };
+            assert_eq!(
+                request.sampling_params.as_ref().unwrap().prompt_logprobs,
+                Some(1),
+                "prompt_logprobs reaches the engine"
+            );
+            output.send_outputs(&prefill).await.unwrap();
+            output.send_outputs(&decode).await.unwrap();
+        });
+
+        let req = vllm::GenerateRequest {
+            request_id: "r1".to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids: vec![1, 2],
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(2),
+                prompt_logprobs: Some(1),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+        let mut stream = client
+            .generate(ProtoGenerateRequest::Vllm(Box::new(req)))
+            .await
+            .expect("generate");
+
+        // Prompt token 1 leads with a null logprob (nothing precedes it); the
+        // requested count of 1 keeps the prompt token's own ranked entry.
+        let expect_input_logprobs = |logprobs: Option<vllm::InputLogProbs>, whose: &str| {
+            let logprobs = logprobs.unwrap_or_else(|| panic!("{whose} input logprobs"));
+            assert_eq!(logprobs.token_ids, vec![1, 2]);
+            assert_eq!(
+                logprobs.token_logprobs,
+                vec![
+                    vllm::InputTokenLogProb { value: None },
+                    vllm::InputTokenLogProb { value: Some(-0.5) },
+                ]
+            );
+            assert_eq!(
+                logprobs.top_logprobs,
+                vec![
+                    vllm::TopLogProbs::default(),
+                    vllm::TopLogProbs {
+                        values: vec![-0.5],
+                        token_ids: vec![2],
+                    },
+                ]
+            );
+        };
+
+        let first = stream.next().await.expect("chunk item").expect("chunk ok");
+        match first.response {
+            Some(vllm::generate_response::Response::Chunk(chunk)) => {
+                expect_input_logprobs(chunk.input_logprobs, "first chunk");
+            }
+            other => panic!("expected chunk, got {other:?}"),
+        }
+        // The finish tick carried a token, so its delta streams as a chunk
+        // first — without repeating the prompt logprobs.
+        let second = stream.next().await.expect("chunk item").expect("chunk ok");
+        match second.response {
+            Some(vllm::generate_response::Response::Chunk(chunk)) => {
+                assert!(
+                    chunk.input_logprobs.is_none(),
+                    "prompt logprobs ride the first chunk only"
+                );
+            }
+            other => panic!("expected chunk, got {other:?}"),
+        }
+        let complete = stream
+            .next()
+            .await
+            .expect("complete item")
+            .expect("complete ok");
+        match complete.response {
+            Some(vllm::generate_response::Response::Complete(complete)) => {
+                expect_input_logprobs(complete.input_logprobs, "complete");
+            }
+            other => panic!("expected complete, got {other:?}"),
+        }
 
         engine_task.await.unwrap();
     }
@@ -1769,19 +2423,31 @@ mod tests {
     }
 
     #[test]
-    fn vllm_rejects_unsupported_sampling_features() {
-        // Prompt logprobs have no renderer merge on the ZMQ path.
-        let err = translate_request(
+    fn vllm_forwards_prompt_logprobs() {
+        // Prompt logprobs ride the wire sampling params verbatim.
+        let request = translate_request(
             tokenized_req(vllm::SamplingParams {
-                prompt_logprobs: Some(1),
+                prompt_logprobs: Some(2),
                 ..Default::default()
             }),
             4096,
             ModelDtype::BFloat16,
             &EosTokenIds::default(),
         )
-        .expect_err("prompt logprobs rejected");
-        assert!(err.contains("prompt logprobs"), "{err}");
+        .expect("translated");
+        assert_eq!(
+            request.sampling_params.as_ref().unwrap().prompt_logprobs,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn ranked_candidate_count_maps_the_sentinels() {
+        assert_eq!(ranked_candidate_count(None), 0);
+        assert_eq!(ranked_candidate_count(Some(0)), 0);
+        assert_eq!(ranked_candidate_count(Some(3)), 3);
+        // -1 asks for every candidate the engine returned.
+        assert_eq!(ranked_candidate_count(Some(-1)), usize::MAX);
     }
 
     #[test]

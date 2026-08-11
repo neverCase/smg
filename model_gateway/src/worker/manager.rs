@@ -864,34 +864,53 @@ impl WorkerManager {
     }
 
     pub async fn flush_cache_all(worker_registry: &WorkerRegistry) -> FlushCacheResult {
-        let workers = worker_registry.get_all();
-        let total_workers = workers.len();
-        let http_workers = workers
+        let all_workers = worker_registry.get_all();
+        let total_workers = all_workers.len();
+        let http_workers = all_workers
             .iter()
             .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http))
             .count();
-        let grpc_workers = total_workers - http_workers;
+        // ZMQ engines have no cache-flush RPC; fan out only to workers that can
+        // succeed instead of reporting every ZMQ worker as failed.
+        let (workers, zmq_workers): (Vec<_>, Vec<_>) = all_workers
+            .into_iter()
+            .partition(|w| !matches!(w.connection_mode(), ConnectionMode::Zmq));
+        let zmq_skipped = zmq_workers.len();
+        let grpc_workers = total_workers - http_workers - zmq_skipped;
 
         if workers.is_empty() {
+            let message = if zmq_skipped > 0 {
+                format!(
+                    "No cache-flush-capable workers available \
+                     ({zmq_skipped} ZMQ workers skipped: no cache-flush RPC)"
+                )
+            } else {
+                "No workers available for cache flush".to_string()
+            };
+            info!("{}", message);
             return FlushCacheResult {
                 successful: vec![],
                 failed: vec![],
                 total_workers,
                 http_workers,
                 grpc_workers,
-                message: "No workers available for cache flush".to_string(),
+                zmq_workers: zmq_skipped,
+                message,
             };
         }
 
         info!(
-            "Flushing cache on {} workers ({} HTTP, {} gRPC)",
-            total_workers, http_workers, grpc_workers
+            "Flushing cache on {} workers ({} HTTP, {} gRPC, {} ZMQ skipped)",
+            workers.len(),
+            http_workers,
+            grpc_workers,
+            zmq_skipped
         );
 
         let (successful, failed) =
             Self::admin_fan_out(workers, |w| async move { w.flush_cache().await }).await;
 
-        let message = if failed.is_empty() {
+        let mut message = if failed.is_empty() {
             format!(
                 "Successfully flushed cache on all {} workers",
                 successful.len()
@@ -903,6 +922,11 @@ impl WorkerManager {
                 failed.len()
             )
         };
+        if zmq_skipped > 0 {
+            message.push_str(&format!(
+                " ({zmq_skipped} ZMQ workers skipped: no cache-flush RPC)"
+            ));
+        }
 
         info!("{}", message);
 
@@ -912,6 +936,7 @@ impl WorkerManager {
             total_workers,
             http_workers,
             grpc_workers,
+            zmq_workers: zmq_skipped,
             message,
         }
     }

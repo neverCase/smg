@@ -13,13 +13,14 @@ use tracing::{debug, warn};
 
 use crate::{
     middleware::{RequestId, TenantRequestMeta},
+    rate_limit::{ReservationAttachment, SharedReservationHandle},
     routers::grpc::{
-        context::{RequestType, WorkerSelection},
+        context::{LoadGuards, RequestType, WorkerSelection},
         proto_wrapper::ProtoGenerateRequest,
     },
     worker::{
-        sampling_defaults::SamplingDefaults, RuntimeType, Worker, DEFAULT_BOOTSTRAP_PORT,
-        DEFAULT_SAMPLING_PARAMS_LABEL,
+        sampling_defaults::SamplingDefaults, AttachedBody, RuntimeType, Worker,
+        DEFAULT_BOOTSTRAP_PORT, DEFAULT_SAMPLING_PARAMS_LABEL,
     },
 };
 
@@ -78,6 +79,28 @@ impl SamplingDefaultsMask {
 
     fn any(self) -> bool {
         self.temperature || self.top_p || self.top_k || self.min_p || self.repetition_penalty
+    }
+}
+
+/// Attach load guards and/or a rate-limit reservation to a streaming
+/// response body so each survives (and, for the reservation, resolves via
+/// `ReservationAttachment`'s `Drop`) exactly as long as the body does,
+/// regardless of how the client disconnects. A no-op returning `response`
+/// unchanged when both are `None`.
+pub(crate) fn attach_response_guards(
+    response: axum::response::Response,
+    guards: Option<LoadGuards>,
+    reservation: Option<Arc<SharedReservationHandle>>,
+) -> axum::response::Response {
+    match (guards, reservation) {
+        (Some(guards), Some(handle)) => {
+            AttachedBody::wrap_response(response, (guards, ReservationAttachment::new(handle)))
+        }
+        (Some(guards), None) => AttachedBody::wrap_response(response, guards),
+        (None, Some(handle)) => {
+            AttachedBody::wrap_response(response, ReservationAttachment::new(handle))
+        }
+        (None, None) => response,
     }
 }
 
@@ -364,43 +387,36 @@ fn encode_single_token_stops(
 /// any single-token stop as a `stop_token_ids` entry for early stopping; the
 /// router-side decoder handles the rest. This is the single resolution point
 /// shared by SGLang gRPC and every ZMQ backend.
+///
+/// Returns the stop strings that were stripped — the router's residual
+/// obligation: the engine will never match these, so response processing must
+/// trim them from the output text. Empty when the engine matches server-side.
 pub(crate) fn resolve_string_stops(
     request: &mut ProtoGenerateRequest,
     tokenizer: Option<&Arc<dyn Tokenizer>>,
-    is_zmq: bool,
-) {
+    token_only_wire: bool,
+) -> Vec<String> {
     // SGLang always needs it; the vLLM and TokenSpeed protos only when talking
-    // to a ZMQ backend (which is the sole path either reaches token-only).
+    // to a token-only wire (direct-ZMQ, the sole path either reaches that way).
     match request {
         ProtoGenerateRequest::Sglang(req) => {
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops, &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                return stops;
             }
         }
-        ProtoGenerateRequest::Vllm(req) if is_zmq => {
+        ProtoGenerateRequest::Vllm(req) if token_only_wire => {
+            // EOS injection for the tokenizer-less EngineCore is the ZMQ
+            // client's own policy (zmq_client::fold_tokenizer_eos_backstop),
+            // not part of shared stop resolution.
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops, &mut params.stop_token_ids, tokenizer);
-                // The engine only stops at EOS when the frontend supplies the
-                // ids, and the connect-time model-dir resolution has nothing
-                // to read when the worker's model id is a repo id rather than
-                // a local path. The tokenizer carries the merged EOS set, so
-                // fold it into the stop tokens as the always-available
-                // backstop — without it an uncapped request generates to the
-                // full context window.
-                if !params.ignore_eos {
-                    if let Some(tokenizer) = tokenizer {
-                        for &id in tokenizer.eos_token_ids() {
-                            if !params.stop_token_ids.contains(&id) {
-                                params.stop_token_ids.push(id);
-                            }
-                        }
-                    }
-                }
+                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                return stops;
             }
         }
-        ProtoGenerateRequest::TokenSpeed(req) if is_zmq => {
+        ProtoGenerateRequest::TokenSpeed(req) if token_only_wire => {
             // TokenSpeed over ZMQ receives token ids only, so its wire
             // translation drops raw `stop` strings; without this a single-token
             // user stop would never reach the engine as a `stop_token_ids`
@@ -409,11 +425,13 @@ pub(crate) fn resolve_string_stops(
             // stops at EOS itself, so its translation carries no frontend ids.
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops, &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                return stops;
             }
         }
         _ => {}
     }
+    Vec::new()
 }
 
 /// Inject PD bootstrap metadata for SGLang if needed.
@@ -452,7 +470,13 @@ fn inject_sglang_bootstrap_metadata(
         bootstrap_room: room_id,
     };
 
-    let sglang_request = request.as_sglang_mut();
+    // Guarded by the caller's runtime check, but match defensively: a non-SGLang
+    // proto here (e.g. a ZMQ backend reporting an unexpected runtime) must not
+    // take down the request task via the panicking accessor.
+    let ProtoGenerateRequest::Sglang(sglang_request) = request else {
+        warn!("PD bootstrap metadata requested for a non-SGLang request; skipping injection");
+        return;
+    };
     sglang_request.disaggregated_params = Some(disagg_params);
 
     debug!(
@@ -692,39 +716,14 @@ mod stop_resolution_tests {
         );
         assert!(params.stop_token_ids.is_empty());
 
-        // ZMQ vLLM (EngineCore sees token ids only) resolves like SGLang, and
-        // gains the tokenizer's EOS ids so generation always terminates.
+        // ZMQ vLLM (EngineCore sees token ids only) resolves like SGLang.
+        // EOS injection is the ZMQ client's own step, not stop resolution's
+        // (see zmq_client::fold_tokenizer_eos_backstop tests).
         let mut zmq = vllm_request(vec!["."], vec![]);
         resolve_string_stops(&mut zmq, Some(&mock_tokenizer()), true);
         let params = vllm_params(&zmq);
         assert!(params.stop.is_empty(), "ZMQ vLLM stop cleared");
-        assert_eq!(params.stop_token_ids, vec![6, 999]);
-    }
-
-    #[test]
-    fn vllm_zmq_appends_tokenizer_eos_ids() {
-        let mut req = vllm_request(vec![], vec![7]);
-        resolve_string_stops(&mut req, Some(&mock_tokenizer()), true);
-        assert_eq!(vllm_params(&req).stop_token_ids, vec![7, 999]);
-
-        // Already-present EOS ids are not duplicated.
-        let mut req = vllm_request(vec![], vec![999]);
-        resolve_string_stops(&mut req, Some(&mock_tokenizer()), true);
-        assert_eq!(vllm_params(&req).stop_token_ids, vec![999]);
-    }
-
-    #[test]
-    fn vllm_zmq_ignore_eos_skips_injection() {
-        let mut req = ProtoGenerateRequest::Vllm(Box::new(vllm_proto::GenerateRequest {
-            sampling_params: Some(vllm_proto::SamplingParams {
-                stop_token_ids: vec![7],
-                ignore_eos: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }));
-        resolve_string_stops(&mut req, Some(&mock_tokenizer()), true);
-        assert_eq!(vllm_params(&req).stop_token_ids, vec![7]);
+        assert_eq!(params.stop_token_ids, vec![6]);
     }
 
     #[test]
@@ -766,6 +765,54 @@ mod stop_resolution_tests {
             vec![6],
             "only the single-token stop, no EOS fold"
         );
+    }
+
+    #[test]
+    fn resolution_returns_router_obligations() {
+        // Strings stripped for the engine come back as the router's trim duty.
+        let mut req = sglang_request(vec![".", "Hello world"], vec![]);
+        let obligations = resolve_string_stops(&mut req, Some(&mock_tokenizer()), false);
+        assert_eq!(
+            obligations,
+            vec![".".to_string(), "Hello world".to_string()]
+        );
+
+        // gRPC vLLM matches stops server-side: nothing left for the router.
+        let mut req = vllm_request(vec!["."], vec![]);
+        assert!(resolve_string_stops(&mut req, Some(&mock_tokenizer()), false).is_empty());
+    }
+
+    #[test]
+    fn pd_bootstrap_injection_skips_non_sglang_requests() {
+        use super::{RuntimeType, Worker, WorkerSelection};
+        use crate::worker::{BasicWorkerBuilder, WorkerType};
+
+        // An SGLang-runtime worker selection paired with a non-SGLang proto
+        // (e.g. a misreporting backend) must skip injection, not panic.
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30000")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let selection = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: worker.clone(),
+            decode: worker,
+            runtime_type: RuntimeType::Sglang,
+        };
+
+        let mut req = vllm_request(vec!["."], vec![7]);
+        let before = match &req {
+            ProtoGenerateRequest::Vllm(inner) => (**inner).clone(),
+            _ => panic!("vllm_request builds a Vllm variant"),
+        };
+        super::maybe_inject_pd_metadata(&mut req, &selection);
+        match &req {
+            ProtoGenerateRequest::Vllm(inner) => {
+                assert_eq!(**inner, before, "request must be untouched");
+            }
+            _ => panic!("variant must be unchanged"),
+        }
     }
 
     #[test]

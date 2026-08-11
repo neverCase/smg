@@ -22,11 +22,12 @@ use crate::{
         client::{
             GenerateRequestBuildOptions, GrpcClient, HealthCheckResponse, ModelInfo, ServerInfo,
         },
+        common::stages::helpers,
         proto_wrapper::{
             finish_tokenspeed_request, finish_vllm_request, ProtoEmbedComplete, ProtoEmbedRequest,
             ProtoGenerateRequest, ProtoStream,
         },
-        zmq_client::ZmqEngineClient,
+        zmq_client::{fold_tokenizer_eos_backstop, ZmqEngineClient},
         MultimodalData,
     },
     worker::RuntimeType,
@@ -53,6 +54,32 @@ impl BackendClient {
     /// and cannot match string stops itself).
     pub fn is_zmq(&self) -> bool {
         matches!(self, Self::Zmq(_))
+    }
+
+    /// Finalize a built generate request for this backend's wire: resolve
+    /// string `stop`s the engine cannot match (token-only wires and SGLang's
+    /// `skip_tokenizer_init` workers) into `stop_token_ids`, folding in EOS
+    /// where the frontend owns stopping.
+    ///
+    /// Returns the router's residual obligation: the stop strings the engine
+    /// will never see, which response processing must trim from output text.
+    /// Empty when the engine matches stops server-side. This is the client's
+    /// own policy — callers need no transport knowledge.
+    pub fn finalize_generate_request(
+        &self,
+        request: &mut ProtoGenerateRequest,
+        tokenizer: Option<&std::sync::Arc<dyn llm_tokenizer::traits::Tokenizer>>,
+    ) -> Vec<String> {
+        let token_only_wire = self.is_zmq();
+        let router_stops = helpers::resolve_string_stops(request, tokenizer, token_only_wire);
+        if let Self::Zmq(client) = self {
+            // EngineCore has no tokenizer, so stopping at EOS is this
+            // frontend's job; TokenSpeed's scheduler stops at EOS itself.
+            if client.runtime() != RuntimeType::TokenSpeed {
+                fold_tokenizer_eos_backstop(request, tokenizer);
+            }
+        }
+        router_stops
     }
 
     /// Local liveness. gRPC has no cheap local flag (it uses a health RPC), so
@@ -218,7 +245,7 @@ impl BackendClient {
                         )
                     })
                 }
-                _ => {
+                RuntimeType::Vllm => {
                     let vllm_mm = zmq_vllm_mm(options.multimodal_inputs)?;
                     finish_vllm_request(vllm_mm, |mm| {
                         VllmEngineClient::build_generate_request_from_chat(
@@ -231,6 +258,9 @@ impl BackendClient {
                         )
                     })
                 }
+                other => Err(format!(
+                    "ZMQ backend reports unsupported runtime {other:?}; expected vLLM or TokenSpeed"
+                )),
             },
         }
     }
@@ -263,7 +293,7 @@ impl BackendClient {
                         )
                     })
                 }
-                _ => {
+                RuntimeType::Vllm => {
                     let vllm_mm = zmq_vllm_mm(options.multimodal_inputs)?;
                     finish_vllm_request(vllm_mm, |mm| {
                         VllmEngineClient::build_generate_request_from_messages(
@@ -276,6 +306,9 @@ impl BackendClient {
                         )
                     })
                 }
+                other => Err(format!(
+                    "ZMQ backend reports unsupported runtime {other:?}; expected vLLM or TokenSpeed"
+                )),
             },
         }
     }
@@ -301,7 +334,7 @@ impl BackendClient {
                     )?;
                     Ok(ProtoGenerateRequest::TokenSpeed(Box::new(req)))
                 }
-                _ => {
+                RuntimeType::Vllm => {
                     let req = VllmEngineClient::build_generate_request_from_completion(
                         request_id,
                         body,
@@ -310,6 +343,9 @@ impl BackendClient {
                     )?;
                     Ok(ProtoGenerateRequest::Vllm(Box::new(req)))
                 }
+                other => Err(format!(
+                    "ZMQ backend reports unsupported runtime {other:?}; expected vLLM or TokenSpeed"
+                )),
             },
         }
     }
@@ -335,7 +371,7 @@ impl BackendClient {
                     )?;
                     Ok(ProtoGenerateRequest::TokenSpeed(Box::new(req)))
                 }
-                _ => {
+                RuntimeType::Vllm => {
                     let req = VllmEngineClient::build_plain_generate_request(
                         request_id,
                         body,
@@ -344,6 +380,9 @@ impl BackendClient {
                     )?;
                     Ok(ProtoGenerateRequest::Vllm(Box::new(req)))
                 }
+                other => Err(format!(
+                    "ZMQ backend reports unsupported runtime {other:?}; expected vLLM or TokenSpeed"
+                )),
             },
         }
     }
