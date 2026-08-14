@@ -20,7 +20,10 @@ pub use auth::{auth_middleware, deny_all_middleware, AuthConfig};
 pub use concurrency::{
     concurrency_limit_middleware, ConcurrencyLimiter, QueueProcessor, QueuedRequest, TokenGuardBody,
 };
-pub use logging::{create_logging_layer, RequestLogger, RequestSpan, ResponseLogger};
+pub use logging::{
+    create_logging_layer, ProbeResponse, RequestLogger, RequestSpan, ResponseLogger,
+    StreamFailureLogger,
+};
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
 pub use remote_auth::{create_remote_auth_client, RemoteAuthClient};

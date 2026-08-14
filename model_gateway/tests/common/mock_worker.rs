@@ -1684,6 +1684,7 @@ async fn audio_transcriptions_handler(
 // Minimal rerank handler returning mock results; router shapes final response
 #[expect(
     clippy::unwrap_used,
+    clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
 async fn rerank_handler(
