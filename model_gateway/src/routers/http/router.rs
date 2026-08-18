@@ -21,7 +21,7 @@ use openai_protocol::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
         RealtimeTranscriptionSessionCreateRequest,
     },
-    rerank::{RerankRequest, RerankResponse, RerankResult},
+    rerank::{RerankDocument, RerankRequest, RerankResponse, RerankResult},
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
     images::{ImageGenerationRequest, ImageEditRequest, ImageFile, ImageVariationRequest},
@@ -3117,15 +3117,17 @@ mod tests {
         serde_json::to_vec(&vec![
             RerankResult {
                 relevance_score: 0.9,
-                document: Some("d1".to_string()),
+                document: Some(RerankDocument {
+                    text: "d1".to_string(),
+                }),
                 index: 0,
-                meta_info: None,
             },
             RerankResult {
                 relevance_score: 0.5,
-                document: Some("d2".to_string()),
+                document: Some(RerankDocument {
+                    text: "d2".to_string(),
+                }),
                 index: 1,
-                meta_info: None,
             },
         ])
         .unwrap()
