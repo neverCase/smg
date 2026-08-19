@@ -525,8 +525,9 @@ pub enum PolicyConfig {
         selection_temperature: f32,
     },
 
-    /// Power-of-two choices load balancing policy.
-    /// Randomly selects two workers and routes to the one with lower load.
+    /// Power-of-two choices policy: samples two workers and routes to the one
+    /// with the lower expected wait, scored like `least_load`
+    /// (`(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`).
     /// TODO: Implement per-policy load monitoring intervals.
     /// Currently, load_check_interval_secs is populated from RouterConfig.load_monitor_interval_secs,
     /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
@@ -559,6 +560,13 @@ pub enum PolicyConfig {
         /// per-replica generation rate; co-tunes with `kv_pressure_weight`.
         #[serde(default = "default_least_load_throughput")]
         default_throughput: f64,
+        /// Per-worker waiting-queue cap: skip workers whose reported waiting
+        /// requests, plus dispatches since their last poll, have reached this
+        /// count; when every candidate is at the cap, selection fails and the
+        /// request falls to the router's admission queue. `0` disables. Set
+        /// below the engine's max batch size.
+        #[serde(default)]
+        max_waiting_requests: u32,
     },
 
     #[serde(rename = "bucket")]
