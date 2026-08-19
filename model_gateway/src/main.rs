@@ -19,7 +19,7 @@ use smg::{
         TokenizerCacheConfig, TraceConfig,
     },
     observability::{
-        metrics::PrometheusConfig,
+        metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
         otel_trace::{is_otel_enabled, shutdown_otel},
     },
     server::{self, ServerConfig},
@@ -164,6 +164,14 @@ fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
         .ok_or_else(|| format!("invalid value '{value}'; expected inline, shm, auto, or rdma"))
 }
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(n) if n >= 1 => Ok(n),
+        Ok(_) => Err(format!("invalid value '{value}'; expected a count >= 1")),
+        Err(err) => Err(format!("invalid value '{value}': {err}")),
+    }
+}
+
 #[derive(Parser, Debug)]
 struct CliArgs {
     // ==================== Worker Configuration ====================
@@ -201,11 +209,14 @@ struct CliArgs {
     #[arg(long, default_value_t = 0.3, help_heading = "Routing Policy")]
     cache_threshold: f32,
 
-    /// Absolute threshold for load balancing trigger
+    /// Absolute load margin for the balancing check. For cache-aware routing
+    /// the selected worker spills to least-loaded when its load exceeds the
+    /// healthy-fleet mean by this many requests AND by balance_rel_threshold.
     #[arg(long, default_value_t = 64, help_heading = "Routing Policy")]
     balance_abs_threshold: usize,
 
-    /// Relative threshold for load balancing trigger
+    /// Relative load margin for the balancing check (multiple of the
+    /// healthy-fleet mean); fires only together with balance_abs_threshold.
     #[arg(long, default_value_t = 1.5, help_heading = "Routing Policy")]
     balance_rel_threshold: f32,
 
@@ -222,6 +233,19 @@ struct CliArgs {
     /// >= 1.0 disables it.
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
+
+    /// Cache-aware anti-hotspot decay: divide each candidate's overlap score
+    /// by 1 + overlap_decay * x, where x is the worker's waiting-prefill
+    /// backlog (blocks above the candidate minimum) per request block.
+    /// Requires backend load reporting. 0.0 disables.
+    #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
+    overlap_decay: f32,
+
+    /// Cache-aware softmax temperature over min-max normalized scores for
+    /// event-driven selection. 0.0 is exact argmax; larger values spread
+    /// picks across candidates.
+    #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
+    selection_temperature: f32,
 
     /// Interval in seconds between cache eviction operations
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
@@ -331,8 +355,14 @@ struct CliArgs {
 
     /// DP engines per startup ZMQ worker: each ipc:// worker becomes a grouped
     /// worker whose handshake awaits this many engines on one socket set.
-    #[arg(long, help_heading = "Worker Configuration")]
+    #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
     zmq_engine_count: Option<usize>,
+
+    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext),
+    /// multiplexing every request to a worker over one connection. Requires
+    /// every HTTP worker to serve HTTP/2 without an upgrade handshake.
+    #[arg(long, default_value_t = false, help_heading = "Worker Configuration")]
+    upstream_http2: bool,
 
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
@@ -472,6 +502,13 @@ struct CliArgs {
     /// Request timeout in seconds
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
+
+    /// Idle timeout in seconds for pooled upstream connections. Must stay
+    /// below the backend HTTP server's keep-alive timeout (vLLM and SGLang
+    /// default to 5), or reused connections the server already closed fail
+    /// non-idempotent sends. 0 keeps idle connections forever.
+    #[arg(long, default_value_t = 3, help_heading = "Request Handling")]
+    upstream_pool_idle_timeout_secs: u64,
 
     /// Grace period in seconds to wait for in-flight requests during shutdown
     #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
@@ -1139,6 +1176,8 @@ impl CliArgs {
                 block_size: self.block_size,
                 balance_token_usage_threshold: self.balance_token_usage_threshold,
                 overload_token_usage_threshold: self.overload_token_usage_threshold,
+                overlap_decay: self.overlap_decay,
+                selection_temperature: self.selection_temperature,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
@@ -1510,6 +1549,7 @@ impl CliArgs {
             .runtime_worker_threads(self.runtime_worker_threads)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
+            .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
@@ -1595,6 +1635,7 @@ impl CliArgs {
                 assignment_mode: Self::parse_assignment_mode(&self.assignment_mode),
             })
             .retries(!self.disable_retries)
+            .upstream_http2(self.upstream_http2)
             .circuit_breaker(!self.disable_circuit_breaker)
             .enable_wasm(self.enable_wasm)
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
@@ -1712,6 +1753,8 @@ impl CliArgs {
     reason = "pre-logger startup output and version display"
 )]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    register_jemalloc_as_global_allocator();
+
     // Check for version flags before parsing other args to avoid errors
     let args: Vec<String> = std::env::args().collect();
     for arg in &args {
@@ -1835,6 +1878,26 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    /// A grouped ZMQ handshake needs at least one engine, so `0` (and any
+    /// non-positive value) must be rejected at parse time rather than silently
+    /// degrading to an ungrouped worker.
+    #[test]
+    fn zmq_engine_count_rejects_non_positive() {
+        assert_eq!(
+            cli_args_from(&["--zmq-engine-count", "2"]).zmq_engine_count,
+            Some(2)
+        );
+        assert_eq!(cli_args_from(&[]).zmq_engine_count, None);
+
+        for bad in ["0", "-1"] {
+            let argv = ["smg", "--zmq-engine-count", bad];
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "--zmq-engine-count {bad} should be rejected"
+            );
+        }
     }
 
     /// The indexer prune flags are router-only settings and must flow into

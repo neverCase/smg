@@ -8,7 +8,12 @@
 //   `data_parallel_rank` remains authoritative.
 // - No DP coordinator process: for a lockstep engine group the connector plays
 //   the wake role itself, over the input socket each rank already listens on.
-// - No utility RPC (deferred).
+// - No utility RPC. Upstream's `call_utility` and its management wrappers
+//   (LoRA add/remove, prefix-cache reset, sleep/wake, profiling, weight
+//   updates) are out of scope: none of them is wired through SMG's ZMQ router
+//   path, so utility outputs decode to an empty batch the dispatcher ignores.
+//   Re-porting them means restoring upstream's call-id registry (u64 sequence
+//   numbers) alongside the request registry below.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -44,6 +49,14 @@ pub type TokenSpeedClient = Client<TokenSpeedProtocol>;
 /// The per-request output stream for the TokenSpeed connector.
 pub type TokenSpeedStream = RequestStream<TokenSpeedProtocol>;
 
+/// Per-request output channels are unbounded on purpose. The dispatcher fans
+/// one engine tick out to every request in it while holding the registry lock,
+/// so a bounded channel would let one slow consumer stall delivery for every
+/// other request on the transport — and backpressuring further, into the
+/// output PULL socket, would wedge the engine itself. Unboundedness is not
+/// unbounded memory: a request's queue is capped by its own generation
+/// (`max_tokens` outputs), a dropped stream auto-aborts it on the engine, and
+/// the buffer is freed with the stream.
 type OutputSender<O> = mpsc::UnboundedSender<Result<O>>;
 type OutputReceiver<O> = mpsc::UnboundedReceiver<Result<O>>;
 
@@ -80,16 +93,35 @@ impl<O: EngineOutput> RequestRegistry<O> {
     }
 
     /// Deliver one output to its request stream; drop the entry when terminal.
+    ///
+    /// The lookup key stays borrowed from the output, so the hot path — a
+    /// non-terminal token batch — never allocates one.
     fn route(&mut self, output: O) {
-        let request_id = output.request_id().to_string();
-        let Some(sender) = self.requests.get(&request_id) else {
-            trace!(%request_id, "output for unknown/finished request; dropping");
+        if output.finished() {
+            // Terminal: retire the entry before handing the output over, while
+            // its request id is still borrowable.
+            match self.requests.remove(output.request_id()) {
+                Some(sender) => {
+                    let _ = sender.send(Ok(output));
+                }
+                None => trace!(
+                    request_id = output.request_id(),
+                    "output for unknown/finished request; dropping"
+                ),
+            }
+            return;
+        }
+        let Some(sender) = self.requests.get(output.request_id()) else {
+            trace!(
+                request_id = output.request_id(),
+                "output for unknown/finished request; dropping"
+            );
             return;
         };
-        let finished = output.finished();
-        if sender.send(Ok(output)).is_err() || finished {
-            // Receiver gone (stream dropped) or request finished — stop tracking.
-            self.requests.remove(&request_id);
+        // A failed send hands the output back, so the receiver-gone (stream
+        // dropped) path retires the entry without an owned key either.
+        if let Err(mpsc::error::SendError(Ok(undelivered))) = sender.send(Ok(output)) {
+            self.requests.remove(undelivered.request_id());
         }
     }
 
@@ -109,15 +141,17 @@ impl<O: EngineOutput> RequestRegistry<O> {
     }
 }
 
-struct ClientInner<P: EngineProtocol> {
-    /// Shared input ROUTER send half (serialized across concurrent submits).
-    input_send: tokio::sync::Mutex<RouterSendHalf>,
-    engines: Vec<ConnectedEngine>,
-    registry: Mutex<RequestRegistry<P::Output>>,
-    /// Latest per-rank load, keyed by engine index. SMG's DP load signal.
-    /// Reported values only — `select_engine` never mutates this map; its
-    /// reservations live in `inflight`.
-    load: Mutex<HashMap<u32, EngineLoad>>,
+/// The DP routing signal: what the engines report and what this client knows
+/// it put there. Both maps live under one mutex because every reader and every
+/// writer touches them together — two mutexes made the acquisition order an
+/// invariant nothing enforced, and selection (load then in-flight) taking it
+/// opposite to release (in-flight then load) deadlocked the client.
+#[derive(Default)]
+struct RoutingState {
+    /// Latest per-rank load, keyed by engine index. Reported values only —
+    /// `select_engine` never mutates this map; its reservations live in
+    /// `inflight`.
+    load: HashMap<u32, EngineLoad>,
     /// This client's own unfinished request ids, per rank: a floor under the
     /// (possibly stale) reported load, so routing never trusts a snapshot that
     /// says an engine we just loaded is idle. Keyed by id rather than counted,
@@ -127,7 +161,15 @@ struct ClientInner<P: EngineProtocol> {
     /// count. Identity makes every release idempotent; counters would let one
     /// request retire several slots and leave the rank looking emptier than it
     /// is.
-    inflight: Mutex<HashMap<u32, HashSet<String>>>,
+    inflight: HashMap<u32, HashSet<String>>,
+}
+
+struct ClientInner<P: EngineProtocol> {
+    /// Shared input ROUTER send half (serialized across concurrent submits).
+    input_send: tokio::sync::Mutex<RouterSendHalf>,
+    engines: Vec<ConnectedEngine>,
+    registry: Mutex<RequestRegistry<P::Output>>,
+    routing: Mutex<RoutingState>,
     /// Rotates the selection scan start so all-zero ties (cold start, fresh
     /// stats) don't systematically favor the first engine.
     scan_start: AtomicUsize,
@@ -176,8 +218,9 @@ impl<P: EngineProtocol> ClientInner<P> {
                         rank,
                         num_engines: self.engines.len() as u32,
                     })?;
-                self.inflight
+                self.routing
                     .lock()
+                    .inflight
                     .entry(rank)
                     .or_default()
                     .insert(request_id.to_string());
@@ -189,8 +232,8 @@ impl<P: EngineProtocol> ClientInner<P> {
                         message: "no engines connected".to_string(),
                     });
                 }
-                let load = self.load.lock();
-                let mut inflight = self.inflight.lock();
+                let mut routing = self.routing.lock();
+                let RoutingState { load, inflight } = &mut *routing;
                 let count = self.engines.len();
                 let start = self.scan_start.fetch_add(1, Ordering::Relaxed) % count;
                 let mut best: Option<(f64, usize)> = None;
@@ -237,15 +280,15 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// rank's queue is empty; the KV term is left as reported (cache pages
     /// outlive requests).
     fn release<'a>(&self, engine_index: u32, request_ids: impl IntoIterator<Item = &'a String>) {
-        let mut inflight = self.inflight.lock();
-        let Some(ids) = inflight.get_mut(&engine_index) else {
+        let mut routing = self.routing.lock();
+        let Some(ids) = routing.inflight.get_mut(&engine_index) else {
             return;
         };
         for request_id in request_ids {
             ids.remove(request_id);
         }
         if ids.is_empty() {
-            if let Some(load) = self.load.lock().get_mut(&engine_index) {
+            if let Some(load) = routing.load.get_mut(&engine_index) {
                 load.num_running = 0;
                 load.num_waiting = 0;
             }
@@ -427,8 +470,7 @@ impl<P: EngineProtocol> Client<P> {
             input_send: tokio::sync::Mutex::new(input_send),
             engines,
             registry: Mutex::new(RequestRegistry::default()),
-            load: Mutex::new(HashMap::new()),
-            inflight: Mutex::new(HashMap::new()),
+            routing: Mutex::new(RoutingState::default()),
             scan_start: AtomicUsize::new(0),
             wave: lockstep.then(|| Mutex::new(0)),
             abort_tx,
@@ -468,11 +510,12 @@ impl<P: EngineProtocol> Client<P> {
     /// The latest per-rank load for one engine index (DP routing signal), if
     /// any batch has been seen from it yet.
     pub fn engine_load(&self, engine_index: u32) -> Option<EngineLoad> {
-        self.inner.load.lock().get(&engine_index).copied()
+        self.inner.routing.lock().load.get(&engine_index).copied()
     }
 
     /// Submit a request and return a stream of its outputs. The request is
-    /// routed by `data_parallel_rank` (SMG-pinned) or to the sole engine.
+    /// routed by `data_parallel_rank` (SMG-pinned) or, unpinned, to the
+    /// least-loaded engine (see [`ClientInner::select_engine`]).
     /// Dropping the returned stream before it finishes aborts the request.
     pub async fn submit(&self, request: P::Request) -> Result<RequestStream<P>> {
         P::validate(&request)?;
@@ -553,12 +596,6 @@ impl<P: EngineProtocol> Drop for Client<P> {
     }
 }
 
-/// If the engine emits no output for this long while requests are in flight, the
-/// dispatcher treats it as dead. A hard engine death (SIGKILL/OOM) sends no
-/// `ENGINE_CORE_DEAD` sentinel, and a bound PULL socket never errors when its
-/// PUSH peer vanishes — so silence is the only available death signal. Generous
-/// so a slow first token never trips it, while still bounding an otherwise
-/// infinite hang.
 /// Maximum time to wait for a single request frame to be accepted by an engine's
 /// input socket before treating the engine as wedged. A healthy engine drains its
 /// input continuously; a send that blocks this long means its event loop is stuck.
@@ -566,6 +603,19 @@ impl<P: EngineProtocol> Drop for Client<P> {
 /// [`ClientInner::send_to_engine`]).
 const ENGINE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// If the engine emits no output for this long while requests are in flight, the
+/// dispatcher treats it as dead. A hard engine death (SIGKILL/OOM) sends no
+/// `ENGINE_CORE_DEAD` sentinel, and a bound PULL socket never errors when its
+/// PUSH peer vanishes — so silence is the only available death signal. Generous
+/// so a slow first token never trips it, while still bounding an otherwise
+/// infinite hang.
+///
+/// The window is deliberately fixed rather than derived from context length:
+/// any single request whose first token takes longer than this — a lone
+/// million-token prefill on an otherwise idle transport — is failed as if the
+/// engine had died. Deployments that can prefill for minutes with no other
+/// traffic need this raised (per-worker configuration), not the watchdog
+/// removed: without it a killed engine hangs its requests forever.
 const ENGINE_SILENCE_DEATH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Route decoded outputs to per-request streams and forward auto-abort requests
@@ -581,18 +631,15 @@ async fn run_dispatcher<P: EngineProtocol>(
                 match output {
                     Some(Ok(batch)) => {
                         if let Some(load) = batch.load {
-                            inner.load.lock().insert(batch.engine_index, load);
+                            inner.routing.lock().load.insert(batch.engine_index, load);
                         }
                         if let Some(event) = batch.wave {
                             inner.observe_wave(event, batch.engine_index).await;
                         }
                         // Unique finished ids: a terminal output and the
                         // out-of-band finished list may name the same request.
-                        let mut finished: HashSet<String> = batch
-                            .finished_request_ids
-                            .iter()
-                            .cloned()
-                            .collect();
+                        let mut finished: HashSet<String> =
+                            batch.finished_request_ids.into_iter().collect();
                         let mut registry = inner.registry.lock();
                         for output in batch.outputs {
                             if output.finished() {
@@ -600,7 +647,7 @@ async fn run_dispatcher<P: EngineProtocol>(
                             }
                             registry.route(output);
                         }
-                        registry.remove_all(&batch.finished_request_ids);
+                        registry.remove_all(&finished);
                         drop(registry);
                         inner.release(batch.engine_index, &finished);
                     }
@@ -608,7 +655,7 @@ async fn run_dispatcher<P: EngineProtocol>(
                         if matches!(error, Error::EngineCoreDead | Error::Transport(_)) {
                             warn!(%error, "engine transport failed; failing all in-flight requests");
                             inner.registry.lock().fail_all(Arc::new(error));
-                            inner.inflight.lock().clear();
+                            inner.routing.lock().inflight.clear();
                             return;
                         }
                         // A per-message decode error is non-fatal; keep going.
@@ -637,7 +684,7 @@ async fn run_dispatcher<P: EngineProtocol>(
             () = tokio::time::sleep(ENGINE_SILENCE_DEATH_TIMEOUT) => {
                 let mut registry = inner.registry.lock();
                 if !registry.requests.is_empty() {
-                    inner.inflight.lock().clear();
+                    inner.routing.lock().inflight.clear();
                     warn!(
                         "no engine output for {ENGINE_SILENCE_DEATH_TIMEOUT:?} with in-flight \
                          requests; treating engine as dead"
@@ -655,7 +702,7 @@ async fn run_dispatcher<P: EngineProtocol>(
         .fail_all(Arc::new(Error::ClientClosed {
             message: "engine output stream ended".to_string(),
         }));
-    inner.inflight.lock().clear();
+    inner.routing.lock().inflight.clear();
 }
 
 /// Stream of outputs for one submitted request. Dropping it before the terminal
@@ -697,9 +744,16 @@ impl<P: EngineProtocol> Stream for RequestStream<P> {
                 self.finished = true;
                 Poll::Ready(Some(Err(error)))
             }
+            // The sender was dropped without a terminal output — the client was
+            // dropped out from under the stream, or the dispatcher stopped
+            // tracking the request. Surface it as an error: a clean end here is
+            // indistinguishable from a completed generation, and a truncated
+            // response must not look complete to the caller.
             Poll::Ready(None) => {
                 self.finished = true;
-                Poll::Ready(None)
+                Poll::Ready(Some(Err(Error::RequestStreamClosed {
+                    request_id: self.request_id.clone(),
+                })))
             }
             Poll::Pending => Poll::Pending,
         }
@@ -755,14 +809,7 @@ mod tests {
             ns.output_endpoint(),
         );
         let (transport, engine) = tokio::join!(
-            connect_handshake(
-                &handshake,
-                1,
-                "127.0.0.1",
-                Some(&input),
-                Some(&output),
-                TIMEOUT
-            ),
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
             connect_to_frontend(
                 &handshake,
                 EngineId::from_engine_index(0),
@@ -799,14 +846,7 @@ mod tests {
             connect_to_frontend(&handshake, EngineId::from_engine_index(rank), ready(rank))
         });
         let (transport, engines) = tokio::join!(
-            connect_handshake(
-                &handshake,
-                engine_count,
-                "127.0.0.1",
-                Some(&input),
-                Some(&output),
-                TIMEOUT
-            ),
+            connect_handshake(&handshake, engine_count, &input, &output, TIMEOUT),
             futures::future::join_all(engines),
         );
         let engines = engines.into_iter().map(Result::unwrap).collect();
@@ -895,6 +935,35 @@ mod tests {
         assert_eq!(second.new_token_ids, vec![11]);
         assert!(second.finished());
         // Terminal output ends the stream.
+        assert!(stream.next().await.is_none());
+    }
+
+    /// A stream that outlives its client is truncated, not complete: it must
+    /// report the truncation rather than end like a finished generation.
+    #[tokio::test]
+    async fn dropping_the_client_errors_live_streams() {
+        let (client, mut engine, _ns) = connect().await;
+        let mut stream = client
+            .submit(EngineCoreRequest {
+                request_id: "orphan".into(),
+                prompt_token_ids: Some(vec![1, 2, 3]),
+                ..EngineCoreRequest::default()
+            })
+            .await
+            .unwrap();
+        engine.recv_request().await.unwrap();
+
+        drop(client);
+
+        let error = stream
+            .next()
+            .await
+            .expect("a terminal error item")
+            .expect_err("truncation is not a clean end of stream");
+        assert!(
+            matches!(&error, Error::RequestStreamClosed { request_id } if request_id == "orphan"),
+            "unexpected error: {error}"
+        );
         assert!(stream.next().await.is_none());
     }
 
@@ -1165,6 +1234,57 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn selection_and_release_race_without_deadlocking() {
+        // Selection reads the reported load and the in-flight sets together;
+        // release retires an id and, when that empties the rank, zeroes its
+        // queue counts. While those maps had a mutex each, the two paths took
+        // them in opposite orders, so a submit racing the release of a rank's
+        // last request wedged both threads forever (parking_lot: no timeout,
+        // no poisoning). Under one lock the inversion is unexpressible; this
+        // stress test trips its deadline against the two-mutex version.
+        const THREADS: usize = 8;
+        const ITERATIONS: usize = 2_000;
+
+        let (client, _engines, _ns) = connect_ranks(4, false).await;
+        let inner = client.inner.clone();
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        // Plain threads, not tasks: the racing methods are synchronous, and a
+        // regression must not be able to wedge the runtime this test is
+        // waiting on.
+        let workers: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                let inner = inner.clone();
+                let completed = completed.clone();
+                std::thread::spawn(move || {
+                    for iteration in 0..ITERATIONS {
+                        let request_id = format!("race-{thread}-{iteration}");
+                        let engine_id = inner.select_engine(None, &request_id).unwrap();
+                        inner.release_one(&engine_id, &request_id);
+                    }
+                    completed.fetch_add(1, Ordering::Release);
+                })
+            })
+            .collect();
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while completed.load(Ordering::Acquire) < THREADS {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "selection racing release deadlocked"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        // Every reservation was released, so no rank carries a phantom floor.
+        let routing = inner.routing.lock();
+        assert!(routing.inflight.values().all(HashSet::is_empty));
+    }
+
     /// The `EngineId` of one connected rank, by index.
     fn engines_id(client: &EngineCoreClient, engine_index: u32) -> EngineId {
         client
@@ -1236,16 +1356,10 @@ mod tests {
             ns.input_endpoint(),
             ns.output_endpoint(),
         );
-        std::mem::forget(ns);
+        // Held for the test duration so the ipc files outlive the client.
+        let _ns = ns;
         let (transport, engine) = tokio::join!(
-            connect_handshake(
-                &handshake,
-                1,
-                "127.0.0.1",
-                Some(&input),
-                Some(&output),
-                TIMEOUT
-            ),
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
             connect_to_frontend(
                 &handshake,
                 EngineId::from_engine_index(0),
@@ -1424,5 +1538,73 @@ mod tests {
             EngineInbound::Add(request) => assert_eq!(request.request_id, "req-2"),
             other => panic!("independent rank expected only its Add, got {other:?}"),
         }
+    }
+
+    /// A rank that took a request for an already-drained wave asks the client
+    /// to start the next one (vLLM `start_wave`). Without a DP coordinator
+    /// nobody else answers that request, so the client must broadcast the wake
+    /// itself — to EVERY rank, at a wave the asking rank will still accept.
+    #[tokio::test]
+    async fn a_ranks_start_wave_request_wakes_the_whole_group() {
+        let (_client, mut engines, _ns) = connect_ranks(2, true).await;
+
+        // The rank is ahead of the client's clock (it self-incremented on its
+        // way out of the last wave), which is exactly the stale-wake trap.
+        let requested = 7;
+        engines[0]
+            .send_output(wave_control(0, DpControlMessage::StartWave(requested)))
+            .await
+            .unwrap();
+
+        assert!(next_wake(&mut engines[0]).await >= requested);
+        assert!(next_wake(&mut engines[1]).await >= requested);
+    }
+
+    /// A drain notification is bookkeeping, not a wake: `wave_complete` folds
+    /// into the clock but must NOT restart the group, or the ranks would never
+    /// stay parked and an idle group would spin.
+    #[tokio::test]
+    async fn wave_complete_updates_the_clock_without_waking() {
+        let (client, mut engines, _ns) = connect_ranks(2, true).await;
+
+        engines[0]
+            .send_output(wave_control(0, DpControlMessage::WaveComplete(3)))
+            .await
+            .unwrap();
+        tokio::time::timeout(TIMEOUT, async {
+            while *client.inner.wave.as_ref().unwrap().lock() <= 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the drained wave never reached the clock");
+
+        // The next submit is the first thing that may wake the group, and it
+        // must clear the wave the ranks parked on.
+        let _stream = client.submit(request_for("req-1", 1)).await.unwrap();
+        assert!(next_wake(&mut engines[0]).await > 3);
+    }
+
+    /// Independent ranks keep no wave clock, so a stray wave notification (a
+    /// mislabeled engine, say) must be ignored rather than panic or start
+    /// waking ranks that never park.
+    #[tokio::test]
+    async fn wave_notifications_from_independent_ranks_are_ignored() {
+        let (client, mut engines, _ns) = connect_ranks(2, false).await;
+
+        engines[0]
+            .send_output(wave_control(0, DpControlMessage::StartWave(2)))
+            .await
+            .unwrap();
+
+        let _stream = client.submit(request_for("req-1", 0)).await.unwrap();
+        match engines[0].recv().await.unwrap() {
+            EngineInbound::Add(request) => assert_eq!(request.request_id, "req-1"),
+            other => panic!("independent rank expected only its Add, got {other:?}"),
+        }
+        assert!(
+            client.inner.wave.is_none(),
+            "no clock for independent ranks"
+        );
     }
 }

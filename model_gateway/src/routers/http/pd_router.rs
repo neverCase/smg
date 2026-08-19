@@ -41,6 +41,7 @@ use crate::{
         },
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
+        http::router::send_with_stale_conn_retry,
         RouterTrait,
     },
     worker::{HashRing, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
@@ -98,7 +99,7 @@ impl PDRouter {
             }
         }
 
-        match request_builder.send().await {
+        match send_with_stale_conn_retry(request_builder).await {
             Ok(res) if res.status().is_success() => {
                 let response_headers = header_utils::preserve_response_headers(res.headers());
 
@@ -675,11 +676,11 @@ impl PDRouter {
         let runtime = prefill.metadata().spec.runtime_type.as_str();
         let dispatch_start = Instant::now();
         let prefill_fut = async {
-            let resp = prefill_request.send().await?;
+            let resp = send_with_stale_conn_retry(prefill_request).await?;
             Ok::<_, reqwest::Error>((dispatch_start.elapsed(), resp))
         };
         let decode_fut = async {
-            let resp = decode_request.send().await?;
+            let resp = send_with_stale_conn_retry(decode_request).await?;
             Ok::<_, reqwest::Error>((dispatch_start.elapsed(), resp))
         };
         let pd_result = tokio::try_join!(prefill_fut, decode_fut);
@@ -758,8 +759,9 @@ impl PDRouter {
                 None
             };
 
-            let response_headers =
+            let mut response_headers =
                 header_utils::preserve_response_headers(decode_response.headers());
+            header_utils::insert_routed_worker_id(&mut response_headers, decode.url());
 
             self.create_streaming_response(
                 decode_response.bytes_stream(),
@@ -772,7 +774,7 @@ impl PDRouter {
             )
         } else {
             // Non-streaming response
-            if context.return_logprob {
+            let mut response = if context.return_logprob {
                 self.process_non_streaming_response(
                     decode_response,
                     status,
@@ -797,7 +799,12 @@ impl PDRouter {
                         error::internal_error("read_response_failed", "Failed to read response")
                     }
                 }
-            }
+            };
+
+            // The decode worker is the one that produced the body the client
+            // sees, on both the merged-logprob and passthrough paths.
+            header_utils::insert_routed_worker_id(response.headers_mut(), decode.url());
+            response
         }
     }
 

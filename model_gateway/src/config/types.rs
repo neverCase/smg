@@ -51,6 +51,12 @@ pub struct RouterConfig {
     pub runtime_worker_threads: Option<usize>,
     pub max_payload_size: usize,
     pub request_timeout_secs: u64,
+    /// Idle timeout for pooled upstream connections. Must stay below the
+    /// backend HTTP server's keep-alive timeout (vLLM and SGLang default to
+    /// 5s), or the pool hands out connections the server has already closed
+    /// and non-idempotent sends fail. `0` keeps idle connections forever.
+    #[serde(default = "default_upstream_pool_idle_timeout_secs")]
+    pub upstream_pool_idle_timeout_secs: u64,
     pub worker_startup_timeout_secs: u64,
     /// Grace period before the first worker-startup check fires. The engine is
     /// left alone for this long, then polled every
@@ -200,6 +206,12 @@ pub struct RouterConfig {
     /// PEM format, loaded from ca_cert_paths during config creation
     #[serde(default)]
     pub ca_certificates: Vec<Vec<u8>>,
+    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext),
+    /// multiplexing every request to a worker over one connection instead of
+    /// one TCP connection per in-flight request. Requires every HTTP worker
+    /// to serve HTTP/2 without an upgrade handshake.
+    #[serde(default)]
+    pub upstream_http2: bool,
     /// Loaded from mcp_config_path during config creation
     #[serde(skip)]
     pub mcp_config: Option<smg_mcp::McpConfig>,
@@ -479,7 +491,14 @@ pub enum PolicyConfig {
     #[serde(rename = "cache_aware")]
     CacheAware {
         cache_threshold: f32,
+        /// Absolute load margin for the per-request candidate gate: the
+        /// selected worker spills to least-loaded when its load exceeds the
+        /// healthy-fleet mean by this many requests AND by
+        /// `balance_rel_threshold`.
         balance_abs_threshold: usize,
+        /// Relative load margin (multiple of the healthy-fleet mean) for the
+        /// per-request candidate gate; fires only together with
+        /// `balance_abs_threshold`.
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
@@ -493,8 +512,25 @@ pub enum PolicyConfig {
         /// triggers shedding regardless of spread. `>= 1.0` disables (default).
         #[serde(default = "default_balance_token_usage_threshold")]
         overload_token_usage_threshold: f32,
+        /// Anti-hotspot decay for event-driven overlap credit: each
+        /// candidate's overlap score is divided by `1 + overlap_decay * x`,
+        /// with `x` the worker's waiting-prefill backlog (blocks in excess of
+        /// the candidate minimum) per request block. `0.0` disables (default).
+        #[serde(default = "default_overlap_decay")]
+        overlap_decay: f32,
+        /// Softmax temperature for event-driven selection over min-max
+        /// normalized scores. `0.0` (default) is exact argmax with the
+        /// existing tie-breaks; larger values spread picks across candidates.
+        #[serde(default = "default_selection_temperature")]
+        selection_temperature: f32,
     },
 
+    /// Power-of-two choices load balancing policy.
+    /// Randomly selects two workers and routes to the one with lower load.
+    /// TODO: Implement per-policy load monitoring intervals.
+    /// Currently, load_check_interval_secs is populated from RouterConfig.load_monitor_interval_secs,
+    /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
+    /// future support of different polling cadences per policy.
     #[serde(rename = "power_of_two")]
     PowerOfTwo { load_check_interval_secs: u64 },
 
@@ -504,6 +540,10 @@ pub enum PolicyConfig {
     /// from the load monitor with in-flight correction. See `policies/least_load.rs`.
     #[serde(rename = "least_load")]
     LeastLoad {
+        /// TODO: Implement per-policy load monitoring intervals.
+        /// Currently, load_check_interval_secs is populated from RouterConfig.load_monitor_interval_secs,
+        /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
+        /// future support of different polling cadences per policy.
         #[serde(default = "default_least_load_interval")]
         load_check_interval_secs: u64,
         /// KV-pressure weight `λ_t` (seconds): the time-cost of KV contention,
@@ -587,12 +627,24 @@ fn default_balance_token_usage_threshold() -> f32 {
     1.0
 }
 
+fn default_overlap_decay() -> f32 {
+    0.0
+}
+
+fn default_selection_temperature() -> f32 {
+    0.0
+}
+
 fn default_prefix_token_count() -> usize {
     256
 }
 
 fn default_load_factor() -> f64 {
     1.25
+}
+
+fn default_upstream_pool_idle_timeout_secs() -> u64 {
+    3
 }
 
 fn default_prefix_hash_balance_abs_threshold() -> usize {
@@ -897,8 +949,9 @@ impl Default for RouterConfig {
             port: 3001,
             health_check_port: None,
             runtime_worker_threads: None,
-            max_payload_size: 536_870_912,     // 512MB
-            request_timeout_secs: 1800,        // 30 minutes
+            max_payload_size: 536_870_912, // 512MB
+            request_timeout_secs: 1800,    // 30 minutes
+            upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_delay_secs: 0,
             worker_startup_check_interval_secs: 30,
@@ -956,6 +1009,7 @@ impl Default for RouterConfig {
             tokenizer_cache: TokenizerCacheConfig::default(),
             client_identity: None,
             ca_certificates: vec![],
+            upstream_http2: false,
             mcp_config: None,
             enable_wasm: false,
             storage_hook_wasm_path: None,
@@ -1050,6 +1104,7 @@ mod tests {
         assert_eq!(config.port, 3001);
         assert_eq!(config.max_payload_size, 536_870_912);
         assert_eq!(config.request_timeout_secs, 1800);
+        assert_eq!(config.upstream_pool_idle_timeout_secs, 3);
         assert_eq!(config.worker_startup_timeout_secs, 1800);
         assert_eq!(config.worker_startup_check_interval_secs, 30);
         assert_eq!(config.load_monitor_interval_secs, 10);
@@ -1224,6 +1279,8 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -1248,6 +1305,8 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -1273,6 +1332,8 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         };
 
         match cache_aware {
@@ -1289,6 +1350,32 @@ mod tests {
                 assert!((balance_rel_threshold - 2.0).abs() < 0.0001);
                 assert_eq!(eviction_interval_secs, 600);
                 assert_eq!(max_tree_size, 5000);
+            }
+            _ => panic!("Expected CacheAware"),
+        }
+    }
+
+    #[test]
+    fn test_cache_aware_pressure_knobs_default_off_when_absent() {
+        // Config files written before the knobs existed must keep parsing,
+        // with both knobs off (behavior-preserving defaults).
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000
+        }"#;
+        let policy: PolicyConfig = serde_json::from_str(json).unwrap();
+        match policy {
+            PolicyConfig::CacheAware {
+                overlap_decay,
+                selection_temperature,
+                ..
+            } => {
+                assert_eq!(overlap_decay, 0.0);
+                assert_eq!(selection_temperature, 0.0);
             }
             _ => panic!("Expected CacheAware"),
         }
@@ -1686,6 +1773,8 @@ mod tests {
                 block_size: 16,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1719,6 +1808,8 @@ mod tests {
                 block_size: 16,
                 balance_token_usage_threshold: 1.0,
                 overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
             }),
             decode_policy: None,
         };
@@ -1778,6 +1869,8 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         };
 
         match pd.get_prefill_policy(&main_policy) {

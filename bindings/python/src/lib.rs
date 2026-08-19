@@ -406,6 +406,7 @@ struct Router {
     max_payload_size: usize,
     dp_aware: bool,
     dp_minimum_tokens_scheduler: bool,
+    upstream_http2: bool,
     api_key: Option<String>,
     log_dir: Option<String>,
     log_level: Option<String>,
@@ -509,6 +510,9 @@ struct Router {
     /// Appended last: positional constructor compatibility (see the field
     /// ordering rule on this struct's signature).
     zmq_engine_count: Option<usize>,
+    overlap_decay: f32,
+    selection_temperature: f32,
+    upstream_pool_idle_timeout_secs: u64,
 }
 
 impl Router {
@@ -587,12 +591,14 @@ impl Router {
                     block_size: self.block_size,
                     balance_token_usage_threshold: self.balance_token_usage_threshold,
                     overload_token_usage_threshold: self.overload_token_usage_threshold,
+                    overlap_decay: self.overlap_decay,
+                    selection_temperature: self.selection_temperature,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 5,
+                    load_check_interval_secs: self.load_monitor_interval,
                 },
                 PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad {
-                    load_check_interval_secs: 5,
+                    load_check_interval_secs: self.load_monitor_interval,
                     kv_pressure_weight: self.least_load_kv_pressure_weight,
                     mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                     default_throughput: self.least_load_default_throughput,
@@ -853,6 +859,8 @@ impl Router {
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .enable_wasm(self.enable_wasm)
             .dp_aware(self.dp_aware)
+            .upstream_http2(self.upstream_http2)
+            .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .routing_key_override(config::RoutingKeyOverrideConfig {
@@ -1009,6 +1017,10 @@ impl Router {
         prefix_token_count = 256,
         prefix_hash_load_factor = 1.25,
         prefix_hash_balance_abs_threshold = 10,
+        upstream_http2 = false,
+        overlap_decay = 0.0,
+        selection_temperature = 0.0,
+        upstream_pool_idle_timeout_secs = 3,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1142,6 +1154,10 @@ impl Router {
         prefix_token_count: usize,
         prefix_hash_load_factor: f64,
         prefix_hash_balance_abs_threshold: usize,
+        upstream_http2: bool,
+        overlap_decay: f32,
+        selection_temperature: f32,
+        upstream_pool_idle_timeout_secs: u64,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1192,6 +1208,7 @@ impl Router {
             max_payload_size,
             dp_aware,
             dp_minimum_tokens_scheduler,
+            upstream_http2,
             api_key,
             log_dir,
             log_level,
@@ -1289,6 +1306,9 @@ impl Router {
             worker_startup_delay,
             worker_ports_annotation,
             zmq_engine_count,
+            overlap_decay,
+            selection_temperature,
+            upstream_pool_idle_timeout_secs,
         })
     }
 
@@ -1471,6 +1491,8 @@ fn get_available_reasoning_parsers() -> Vec<String> {
 
 #[pymodule]
 fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    observability::metrics::register_jemalloc_as_global_allocator();
+
     m.add_class::<PolicyType>()?;
     m.add_class::<BackendType>()?;
     m.add_class::<HistoryBackendType>()?;

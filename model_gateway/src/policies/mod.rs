@@ -78,6 +78,13 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that don't use load information
     }
 
+    /// Whether routing consumes backend load snapshots, pushed via
+    /// [`Self::update_loads`] or read from the monitor's watch feed. The
+    /// `WorkerMonitor` skips backend load polling while no policy needs it.
+    fn needs_backend_loads(&self) -> bool {
+        false
+    }
+
     /// Drop any cached per-worker state for a removed worker.
     ///
     /// Called when a worker leaves the registry so load-aware policies don't
@@ -106,7 +113,16 @@ pub trait DPRankLoadPolicy: Send + Sync + Debug {
 #[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     pub cache_threshold: f32,
+    /// Absolute load margin for the per-request candidate gate: the selected
+    /// worker spills to least-loaded when its load exceeds the healthy-fleet
+    /// mean by this many requests AND by `balance_rel_threshold`. Requiring
+    /// both keeps the gate quiet on steady-state variance at low means
+    /// (absolute) without going blind to a deep queue at high means
+    /// (relative).
     pub balance_abs_threshold: usize,
+    /// Relative load margin (multiple of the healthy-fleet mean) for the
+    /// per-request candidate gate; fires only together with
+    /// `balance_abs_threshold`.
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
@@ -128,6 +144,21 @@ pub struct CacheAwareConfig {
     /// shedding load off a critically-saturated engine. A safety valve, best set
     /// high (e.g. 0.9). Requires `token_usage`; `>= 1.0` disables it (default).
     pub overload_token_usage_threshold: f32,
+    /// Anti-hotspot decay for event-driven overlap credit. Each candidate's
+    /// overlap score is multiplied by `1 / (1 + overlap_decay * x)`, where `x`
+    /// is the worker's waiting-prefill backlog (backend-reported waiting
+    /// uncached tokens, in blocks, in excess of the minimum among candidates)
+    /// divided by the request's block count. The least-backlogged candidate
+    /// always keeps full credit; workers without load data are never decayed.
+    /// `0.0` disables (default). Requires backend load reporting.
+    pub overlap_decay: f32,
+    /// Randomized selection among event-driven candidates. `0.0` (default) is
+    /// exact argmax with the existing tie-breaks. Above zero, candidates are
+    /// sampled by softmax over min-max-normalized scores divided by this
+    /// temperature — scale-free (only relative position within the current
+    /// score spread matters): small values mostly follow the best candidate,
+    /// large values approach uniform.
+    pub selection_temperature: f32,
 }
 
 impl Default for CacheAwareConfig {
@@ -143,6 +174,10 @@ impl Default for CacheAwareConfig {
             // balance e.g. 0.5 (spread) and/or overload e.g. 0.9 (ceiling).
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            // Both pressure knobs off by default: behavior is bit-identical
+            // to pre-knob selection until explicitly tuned.
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         }
     }
 }

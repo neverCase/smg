@@ -19,17 +19,25 @@ impl PolicyFactory {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::Passthrough => Arc::new(PassthroughPolicy::new()),
-            PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
+            PolicyConfig::PowerOfTwo { .. } => {
+                // TODO: Pass load_check_interval_secs to WorkerMonitor for per-policy polling intervals.
+                // Currently, WorkerMonitor uses RouterConfig.load_monitor_interval_secs globally.
+                Arc::new(PowerOfTwoPolicy::new())
+            }
             PolicyConfig::LeastLoad {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
                 ..
-            } => Arc::new(LeastLoadPolicy::with_params(
-                *kv_pressure_weight,
-                *mean_prefill_tokens,
-                *default_throughput,
-            )),
+            } => {
+                // TODO: Pass load_check_interval_secs to WorkerMonitor for per-policy polling intervals.
+                // Currently, WorkerMonitor uses RouterConfig.load_monitor_interval_secs globally.
+                Arc::new(LeastLoadPolicy::with_params(
+                    *kv_pressure_weight,
+                    *mean_prefill_tokens,
+                    *default_throughput,
+                ))
+            }
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold,
@@ -39,6 +47,8 @@ impl PolicyFactory {
                 block_size,
                 balance_token_usage_threshold,
                 overload_token_usage_threshold,
+                overlap_decay,
+                selection_temperature,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -49,6 +59,8 @@ impl PolicyFactory {
                     block_size: *block_size,
                     balance_token_usage_threshold: *balance_token_usage_threshold,
                     overload_token_usage_threshold: *overload_token_usage_threshold,
+                    overlap_decay: *overlap_decay,
+                    selection_temperature: *selection_temperature,
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
@@ -141,6 +153,8 @@ mod tests {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         });
         assert_eq!(policy.name(), "cache_aware");
 

@@ -134,6 +134,8 @@ impl RouterConfigBuilder {
             block_size: 16,
             balance_token_usage_threshold: 1.0,
             overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
         };
         self
     }
@@ -200,6 +202,11 @@ impl RouterConfigBuilder {
 
     pub fn max_payload_size(mut self, size: usize) -> Self {
         self.config.max_payload_size = size;
+        self
+    }
+
+    pub fn upstream_pool_idle_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.upstream_pool_idle_timeout_secs = secs;
         self
     }
 
@@ -470,6 +477,11 @@ impl RouterConfigBuilder {
     /// Use proxy mode
     pub fn disable_igw(mut self) -> Self {
         self.config.enable_igw = false;
+        self
+    }
+
+    pub fn upstream_http2(mut self, enable: bool) -> Self {
+        self.config.upstream_http2 = enable;
         self
     }
 

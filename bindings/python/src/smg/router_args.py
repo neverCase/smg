@@ -209,6 +209,10 @@ class RouterArgs:
     prefix_token_count: int = 256
     prefix_hash_load_factor: float = 1.25
     prefix_hash_balance_abs_threshold: int = 10
+    upstream_http2: bool = False
+    overlap_decay: float = 0.0
+    selection_temperature: float = 0.0
+    upstream_pool_idle_timeout_secs: int = 3
 
     @staticmethod
     def add_cli_args(
@@ -327,6 +331,27 @@ class RouterArgs:
             help=(
                 "List of worker URLs. Supports IPv4 and IPv6 addresses"
                 " (use brackets for IPv6, e.g., http://[::1]:8000 http://192.168.1.1:8000)"
+            ),
+        )
+        worker_group.add_argument(
+            f"--{prefix}upstream-http2",
+            action="store_true",
+            help=(
+                "Speak HTTP/2 to workers via prior knowledge (h2c on cleartext),"
+                " multiplexing every request to a worker over one connection."
+                " Requires every HTTP worker to serve HTTP/2 without an upgrade"
+                " handshake."
+            ),
+        )
+        worker_group.add_argument(
+            f"--{prefix}upstream-pool-idle-timeout-secs",
+            type=int,
+            default=RouterArgs.upstream_pool_idle_timeout_secs,
+            help=(
+                "Idle timeout in seconds for pooled upstream connections. Must"
+                " stay below the backend HTTP server's keep-alive timeout (vLLM"
+                " and SGLang default to 5). 0 keeps idle connections forever."
+                " Defaults to 3."
             ),
         )
         worker_group.add_argument(
@@ -477,6 +502,28 @@ class RouterArgs:
                 " exceeds it, shed load off that engine regardless of spread. A safety"
                 " valve for critically-saturated engines, best set high (e.g. 0.9)."
                 " Backend must report token_usage. Defaults to 1.0 (disabled)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}overlap-decay",
+            type=float,
+            default=RouterArgs.overlap_decay,
+            help=(
+                "Cache-aware anti-hotspot decay: divide each candidate's overlap"
+                " score by 1 + overlap_decay * x, where x is the worker's"
+                " waiting-prefill backlog (blocks above the candidate minimum) per"
+                " request block. Requires backend load reporting. Defaults to 0.0"
+                " (disabled)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}selection-temperature",
+            type=float,
+            default=RouterArgs.selection_temperature,
+            help=(
+                "Cache-aware softmax temperature over min-max normalized scores for"
+                " event-driven selection. 0.0 is exact argmax; larger values spread"
+                " picks across candidates. Defaults to 0.0."
             ),
         )
         routing_group.add_argument(
@@ -1054,7 +1101,7 @@ class RouterArgs:
             help=(
                 "DP engines per startup ZMQ worker: each ipc:// worker becomes a "
                 "grouped worker whose handshake awaits this many engines on one "
-                "socket set (vLLM only; default: 1)"
+                "socket set (vLLM and TokenSpeed; default: 1)"
             ),
         )
         backend_group.add_argument(

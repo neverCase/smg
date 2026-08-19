@@ -3,7 +3,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::Duration,
 };
@@ -38,6 +38,57 @@ use crate::{
 
 /// Default HTTP client timeout for worker requests (in seconds)
 pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
+
+/// Per-worker HTTP client with an isolated connection pool, materialized on
+/// first use.
+///
+/// A worker whose connection mode never speaks HTTP (ZMQ: local health check,
+/// admin ops rejected up front) would otherwise pay for a connector and idle
+/// pool it can never use, so the fallback client is built only when a caller
+/// actually asks for it.
+pub struct LazyHttpClient {
+    cell: OnceLock<reqwest::Client>,
+}
+
+impl LazyHttpClient {
+    /// Wrap an already-built client (the registration paths hand one in).
+    pub fn ready(client: reqwest::Client) -> Self {
+        let cell = OnceLock::new();
+        let _ = cell.set(client);
+        Self { cell }
+    }
+
+    /// Defer construction until [`Self::client`] is first called.
+    pub fn deferred() -> Self {
+        Self {
+            cell: OnceLock::new(),
+        }
+    }
+
+    /// Whether the client is still unbuilt (test-only observation of laziness).
+    #[cfg(test)]
+    pub(crate) fn cell_is_empty(&self) -> bool {
+        self.cell.get().is_none()
+    }
+
+    /// The client, building the default one on first use.
+    pub fn client(&self) -> &reqwest::Client {
+        self.cell.get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(DEFAULT_WORKER_HTTP_TIMEOUT_SECS))
+                .pool_max_idle_per_host(8)
+                .build()
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to build the default per-worker HTTP client; \
+                         falling back to reqwest defaults (no request timeout)"
+                    );
+                    reqwest::Client::new()
+                })
+        })
+    }
+}
 
 /// Timeout for worker HTTP `flush_cache` requests. Matches the gRPC
 /// client's local flush deadline.
@@ -402,18 +453,28 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Record the outcome of a request based on the HTTP status code.
     ///
-    /// The worker decides whether the status is a CB failure using its
-    /// per-worker `retryable_status_codes` set (default: 408, 429, 5xx).
+    /// Statuses in the per-worker `capacity_status_codes` set (default: 429)
+    /// record nothing at all — neither failure nor success. Any other status
+    /// is a circuit-breaker failure when it appears in `retryable_status_codes`,
+    /// which by default leaves 408, 500, 502, 503 and 504 tripping the breaker.
+    /// 429 is in that set too, but the capacity check returns before it is read.
     /// Callers just pass the status — no need to interpret it.
     ///
     /// For transport/connection errors where no HTTP response is received,
     /// pass the status code returned to the client (e.g., 502 for a send
     /// error, 504 for a timeout).
     fn record_outcome(&self, status_code: u16) {
-        let is_failure = self
-            .resilience()
-            .retryable_status_codes
-            .contains(&status_code);
+        let resilience = self.resilience();
+        // Capacity pushback (429 by default) is a routing signal, not a
+        // worker fault: the request is retried elsewhere, but no
+        // circuit-breaker sample is recorded in either direction — opening
+        // the breaker on backpressure would amplify a load spike into
+        // unavailability, and crediting a success would close a half-open
+        // breaker on a request the worker refused.
+        if resilience.capacity_status_codes.contains(&status_code) {
+            return;
+        }
+        let is_failure = resilience.retryable_status_codes.contains(&status_code);
         self.record_circuit_breaker_outcome(!is_failure);
     }
 
@@ -1041,8 +1102,9 @@ pub struct BasicWorker {
     /// When not `Wildcard`, overrides metadata.models for routing decisions.
     /// Uses `ArcSwap` for lock-free reads on the hot path (`supports_model`).
     pub models_override: Arc<ArcSwap<WorkerModels>>,
-    /// Per-worker HTTP client with isolated connection pool.
-    pub http_client: reqwest::Client,
+    /// Per-worker HTTP client with isolated connection pool, built on first
+    /// use (see [`LazyHttpClient`]).
+    pub http_client: Arc<LazyHttpClient>,
     /// Resolved resilience config (retry + circuit breaker settings).
     pub resilience: ResolvedResilience,
 }
@@ -1057,7 +1119,7 @@ impl Clone for BasicWorker {
             zmq_connect_started: Arc::clone(&self.zmq_connect_started),
             connect_signal_tx: self.connect_signal_tx.clone(),
             models_override: Arc::clone(&self.models_override),
-            http_client: self.http_client.clone(),
+            http_client: Arc::clone(&self.http_client),
             resilience: self.resilience.clone(),
         }
     }
@@ -1098,6 +1160,31 @@ impl BasicWorker {
         if other_cb.config() == existing_cb.config() {
             self.circuit_breaker.store(other_cb);
         }
+
+        self.adopt_backend_client_from(other);
+    }
+
+    /// Adopt the replaced worker's backend-client cell so a same-URL
+    /// replacement (a metadata-only update, say) keeps talking over the
+    /// connection the old worker already established. Decisive for ZMQ: SMG
+    /// binds the sockets and the engine handshakes only at its own startup, so
+    /// a replacement starting from an empty cell would unbind the live sockets,
+    /// rebind, and wait for a HELLO that never arrives.
+    ///
+    /// `zmq_connect_started` is deliberately left cleared rather than copied:
+    /// the shared cell already dedupes a handshake in flight, and a cleared
+    /// guard lets the replacement retry (and signal under its own revision) if
+    /// that handshake fails.
+    fn adopt_backend_client_from(&self, other: &BasicWorker) {
+        // A transport or runtime change means a different wire protocol, and a
+        // replacement that arrived with its own client keeps it.
+        if self.metadata.spec.connection_mode != other.metadata.spec.connection_mode
+            || self.metadata.spec.runtime_type != other.metadata.spec.runtime_type
+            || self.backend_client.load().get().is_some()
+        {
+            return;
+        }
+        self.backend_client.store(other.backend_client.load_full());
     }
 }
 
@@ -1266,7 +1353,7 @@ impl Worker for BasicWorker {
     }
 
     fn http_client(&self) -> &reqwest::Client {
-        &self.http_client
+        self.http_client.client()
     }
 
     fn supports_model(&self, model_id: &str) -> bool {
@@ -1503,7 +1590,7 @@ impl Worker for BasicWorker {
 
         let health_url = format!("{}{}", self.base_url(), self.metadata.health_endpoint);
 
-        let mut req = self.http_client.get(&health_url).timeout(timeout);
+        let mut req = self.http_client.client().get(&health_url).timeout(timeout);
         if let Some(api_key) = &self.metadata.spec.api_key {
             req = req.bearer_auth(api_key);
         }
@@ -2269,6 +2356,56 @@ mod tests {
     }
 
     #[test]
+    fn test_capacity_pushback_never_trips_circuit_breaker() {
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build();
+
+        // A storm of 429 capacity pushback must not open the breaker...
+        for _ in 0..20 {
+            worker.record_outcome(429);
+        }
+        assert!(worker.is_available());
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+
+        // ...while genuine failures still do.
+        for _ in 0..5 {
+            worker.record_outcome(500);
+        }
+        assert!(!worker.is_available());
+    }
+
+    #[test]
+    fn test_capacity_pushback_does_not_close_half_open_breaker() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: 1,
+            timeout_duration: Duration::from_millis(50),
+            window_duration: Duration::from_secs(60),
+        };
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .circuit_breaker_config(config)
+            .health_config(no_health_check())
+            .build();
+
+        worker.record_outcome(500);
+        worker.record_outcome(500);
+        assert!(!worker.is_available());
+        thread::sleep(Duration::from_millis(80));
+        assert!(worker.is_available());
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+
+        // 429 records no sample: the breaker must stay half-open, not close.
+        worker.record_outcome(429);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+
+        worker.record_outcome(200);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    #[test]
     fn test_worker_with_circuit_breaker_config() {
         let config = CircuitBreakerConfig {
             failure_threshold: 2,
@@ -2608,6 +2745,34 @@ mod tests {
         assert!(worker.supports_model("text-embedding-3-small"));
         assert!(!worker.supports_model("non-existent-model"));
         assert!(worker.has_models_discovered());
+    }
+
+    #[test]
+    fn replacement_adopts_the_backend_client_only_on_a_matching_transport() {
+        // The cell object itself is the connection: sharing it is what keeps a
+        // replaced ZMQ worker talking to the engine that already handshook.
+        let build = |mode: ConnectionMode| {
+            BasicWorkerBuilder::new("ipc:///tmp/w.ipc")
+                .connection_mode(mode)
+                .health_config(no_health_check())
+                .build()
+        };
+
+        let old = build(ConnectionMode::Zmq);
+        let new = build(ConnectionMode::Zmq);
+        assert!(new.inherit_shared_state_from(&old));
+        assert!(Arc::ptr_eq(
+            &new.backend_client.load_full(),
+            &old.backend_client.load_full()
+        ));
+
+        // A transport change means a different wire protocol — no adoption.
+        let retyped = build(ConnectionMode::Http);
+        assert!(retyped.inherit_shared_state_from(&old));
+        assert!(!Arc::ptr_eq(
+            &retyped.backend_client.load_full(),
+            &old.backend_client.load_full()
+        ));
     }
 
     /// A ZMQ client whose engine dies must be evicted by the health probe (the

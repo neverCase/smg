@@ -27,6 +27,7 @@ use engine_zmq_client::{
             sampling::SamplingParams as TokenSpeedSamplingParams,
         },
         vllm::{
+            logprobs::TokenLogprob,
             output::{EngineCoreFinishReason, EngineCoreOutput, StopReason},
             request::EngineCoreRequest,
             sampling::EngineCoreSamplingParams,
@@ -54,15 +55,36 @@ use crate::{
 /// binds). Shared with the worker-side socket derivation.
 pub(crate) const ZMQ_LOOPBACK_HOST: &str = "127.0.0.1";
 
-/// The engine protocol a ZMQ backend speaks. Both share the transport and
+/// The engine protocol a ZMQ backend speaks — a closed set: the transport has
+/// an adapter for exactly these two engines. Resolved once at connect time and
+/// exposed by [`ZmqEngineClient::dialect`] so every per-engine dispatch on the
+/// ZMQ lane (request building, multimodal, EOS) matches on the same two
+/// variants with no unreachable arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZmqDialect {
+    /// vLLM EngineCore.
+    Vllm,
+    /// TokenSpeed.
+    TokenSpeed,
+}
+
+/// The connected client for a [`ZmqDialect`]. Both share the transport and
 /// handshake; only the request/output struct shapes and the translation to/from
 /// SMG proto differ.
 #[derive(Clone)]
 enum ZmqBackend {
-    /// vLLM EngineCore.
     Vllm(Arc<EngineCoreClient>),
-    /// TokenSpeed.
     TokenSpeed(Arc<TokenSpeedClient>),
+}
+
+/// Per-connection constants of a [`ZmqEngineClient`], fixed at connect time.
+struct ZmqConnectionMeta {
+    /// Model id advertised for metadata (the engine does not report it on the
+    /// wire; it is configured at worker registration).
+    model_id: String,
+    /// EOS ids attached to every vLLM request (the engine can't stop at EOS
+    /// without them).
+    eos: EosTokenIds,
 }
 
 /// The model's EOS stop set, resolved from its local directory. EngineCore
@@ -85,9 +107,9 @@ impl EosTokenIds {
     /// Resolve from `config.json` + `generation_config.json` in a local model
     /// directory: primary = the model config's first id, extras = every other
     /// listed id. Missing files or fields degrade to fewer ids.
-    pub fn from_model_dir(dir: &Path) -> Self {
-        let model_ids = eos_ids_from_file(&dir.join("config.json"));
-        let gen_ids = eos_ids_from_file(&dir.join("generation_config.json"));
+    pub async fn from_model_dir(dir: &Path) -> Self {
+        let model_ids = eos_ids_from_file(&dir.join("config.json")).await;
+        let gen_ids = eos_ids_from_file(&dir.join("generation_config.json")).await;
         let primary = (model_ids.first().or_else(|| gen_ids.first())).copied();
         let mut extra = Vec::new();
         for id in model_ids.into_iter().chain(gen_ids) {
@@ -106,8 +128,8 @@ impl EosTokenIds {
 /// that exists but holds corrupt JSON is worth a `warn!`: it runs once at
 /// connect time, and losing the EOS ids here silently manifests later as
 /// generation running to `max_tokens`.
-fn eos_ids_from_file(path: &Path) -> Vec<u32> {
-    let Ok(text) = std::fs::read_to_string(path) else {
+async fn eos_ids_from_file(path: &Path) -> Vec<u32> {
+    let Ok(text) = tokio::fs::read_to_string(path).await else {
         return Vec::new();
     };
     match serde_json::from_str::<serde_json::Value>(&text) {
@@ -135,8 +157,9 @@ fn eos_ids_from_value(value: Option<&serde_json::Value>) -> Vec<u32> {
 /// model id is a repo id rather than a local path, so the tokenizer's merged
 /// EOS set is folded into `stop_token_ids` here as the always-available
 /// backstop; without it an uncapped request generates to the full context
-/// window. Not needed for TokenSpeed (its scheduler stops at EOS itself) —
-/// the caller gates on runtime.
+/// window. Not needed for TokenSpeed (its scheduler stops at EOS itself), and
+/// a TokenSpeed backend builds a TokenSpeed request variant — so the variant
+/// match below is the single dispatch point for this policy.
 pub(crate) fn fold_tokenizer_eos_backstop(
     request: &mut ProtoGenerateRequest,
     tokenizer: Option<&Arc<dyn Tokenizer>>,
@@ -332,8 +355,11 @@ pub(crate) async fn connect_for_worker(
     // config); resolve the EOS ids from the local model dir so every request
     // carries them.
     let model_dir = Path::new(&model_id);
-    let eos = if model_dir.is_dir() {
-        EosTokenIds::from_model_dir(model_dir)
+    let is_model_dir = tokio::fs::metadata(model_dir)
+        .await
+        .is_ok_and(|meta| meta.is_dir());
+    let eos = if is_model_dir {
+        EosTokenIds::from_model_dir(model_dir).await
     } else {
         tracing::warn!(
             "ZMQ worker model id '{model_id}' is not a local model directory; connect-time \
@@ -364,12 +390,9 @@ pub(crate) async fn connect_for_worker(
 #[derive(Clone)]
 pub struct ZmqEngineClient {
     backend: ZmqBackend,
-    /// Model id advertised for metadata (the engine does not report it on the
-    /// wire; it is configured at worker registration).
-    model_id: String,
-    /// EOS ids attached to every vLLM request (the engine can't stop at EOS
-    /// without them).
-    eos: EosTokenIds,
+    /// Connection-constant metadata, shared so cloning the client (once per
+    /// request, via `BackendClient`) stays a pointer bump.
+    meta: Arc<ZmqConnectionMeta>,
 }
 
 impl ZmqEngineClient {
@@ -394,51 +417,57 @@ impl ZmqEngineClient {
         runtime: RuntimeType,
         timeout: Duration,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // No silent fallback: any other runtime has no ZMQ engine adapter.
-        // Reject before the handshake — no such engine ever dials in, so the
-        // handshake would just block for the full timeout.
-        if !matches!(
-            runtime,
-            RuntimeType::Vllm | RuntimeType::TokenSpeed | RuntimeType::Unspecified
-        ) {
-            return Err(format!(
-                "ZMQ direct backend has no engine implementation for runtime \
-                 {runtime}; only vllm and tokenspeed are supported"
-            )
-            .into());
-        }
+        // Resolve the dialect before the handshake: no silent fallback for a
+        // runtime with no ZMQ engine adapter, and no such engine ever dials in,
+        // so the handshake would just block for the full timeout.
+        let dialect = match runtime {
+            // vLLM EngineCore is the default ZMQ wire; an unspecified runtime
+            // maps to it for backward compatibility (see `detect_backend`).
+            RuntimeType::Vllm | RuntimeType::Unspecified => ZmqDialect::Vllm,
+            RuntimeType::TokenSpeed => ZmqDialect::TokenSpeed,
+            other => {
+                return Err(format!(
+                    "ZMQ direct backend has no engine implementation for runtime \
+                     {other}; only vllm and tokenspeed are supported"
+                )
+                .into())
+            }
+        };
 
         let transport = connect_handshake(
             handshake_address,
             engine_count,
-            ZMQ_LOOPBACK_HOST,
-            Some(input_address),
-            Some(output_address),
+            input_address,
+            output_address,
             timeout,
         )
         .await?;
-        let backend = match runtime {
-            RuntimeType::TokenSpeed => {
+        let backend = match dialect {
+            ZmqDialect::Vllm => ZmqBackend::Vllm(Arc::new(EngineCoreClient::new(transport))),
+            ZmqDialect::TokenSpeed => {
                 ZmqBackend::TokenSpeed(Arc::new(TokenSpeedClient::new(transport)))
             }
-            // vLLM EngineCore is the default ZMQ wire; an unspecified runtime maps
-            // to it for backward compatibility (see `detect_backend`). All other
-            // runtimes were rejected before the handshake.
-            _ => ZmqBackend::Vllm(Arc::new(EngineCoreClient::new(transport))),
         };
         Ok(Self {
             backend,
-            model_id,
-            eos,
+            meta: Arc::new(ZmqConnectionMeta { model_id, eos }),
         })
     }
 
-    /// The engine runtime behind this connection (the wire protocol chosen at
-    /// connect time).
-    pub fn runtime(&self) -> RuntimeType {
+    /// The wire protocol chosen at connect time.
+    pub fn dialect(&self) -> ZmqDialect {
         match &self.backend {
-            ZmqBackend::Vllm(_) => RuntimeType::Vllm,
-            ZmqBackend::TokenSpeed(_) => RuntimeType::TokenSpeed,
+            ZmqBackend::Vllm(_) => ZmqDialect::Vllm,
+            ZmqBackend::TokenSpeed(_) => ZmqDialect::TokenSpeed,
+        }
+    }
+
+    /// The engine runtime behind this connection, widened to the open
+    /// [`RuntimeType`] for callers that report it alongside gRPC backends.
+    pub fn runtime(&self) -> RuntimeType {
+        match self.dialect() {
+            ZmqDialect::Vllm => RuntimeType::Vllm,
+            ZmqDialect::TokenSpeed => RuntimeType::TokenSpeed,
         }
     }
 
@@ -489,8 +518,9 @@ impl ZmqEngineClient {
                     .ok_or_else(|| tonic::Status::unavailable("no connected ZMQ engine"))?;
                 let mut streams = SelectAll::new();
                 for (index, sub) in fan_out_requests(*req).into_iter().enumerate() {
-                    let request = translate_request(sub, max_model_len, model_dtype, &self.eos)
-                        .map_err(tonic::Status::invalid_argument)?;
+                    let request =
+                        translate_request(sub, max_model_len, model_dtype, &self.meta.eos)
+                            .map_err(tonic::Status::invalid_argument)?;
                     // The engine returns the sampled/prompt token's logprob
                     // plus the requested ranked candidates per position; carry
                     // the counts so the stream can shape both `top_logprobs`
@@ -602,18 +632,18 @@ impl ZmqEngineClient {
             .unwrap_or(0);
         match &self.backend {
             ZmqBackend::Vllm(_) => ModelInfo::Vllm(vllm::GetModelInfoResponse {
-                model_path: self.model_id.clone(),
-                served_model_name: self.model_id.clone(),
-                tokenizer_path: self.model_id.clone(),
+                model_path: self.meta.model_id.clone(),
+                served_model_name: self.meta.model_id.clone(),
+                tokenizer_path: self.meta.model_id.clone(),
                 is_generation: true,
                 max_context_length: u32::try_from(max_context_length).unwrap_or(u32::MAX),
                 ..Default::default()
             }),
             ZmqBackend::TokenSpeed(_) => {
                 ModelInfo::TokenSpeed(Box::new(tokenspeed_proto::GetModelInfoResponse {
-                    model_path: self.model_id.clone(),
-                    served_model_name: self.model_id.clone(),
-                    tokenizer_path: self.model_id.clone(),
+                    model_path: self.meta.model_id.clone(),
+                    served_model_name: self.meta.model_id.clone(),
+                    tokenizer_path: self.meta.model_id.clone(),
                     max_context_length: i32::try_from(max_context_length).unwrap_or(i32::MAX),
                     ..Default::default()
                 }))
@@ -687,6 +717,34 @@ fn ranked_candidate_count(requested: Option<i32>) -> usize {
         Some(n) => n as usize,
         None => 0,
     }
+}
+
+/// Shape one position's wire entries (sampled first, then the engine's ranked
+/// candidates) into `top_logprobs`: the sampled entry leads, then ranked
+/// candidates fill up to `top_k` entries. The engine leaves the sampled token
+/// in its ranked columns, so the ranked entry repeating it is skipped —
+/// otherwise the list would carry it twice and drop the last candidate.
+fn shape_top_logprobs(entries: &[TokenLogprob], top_k: usize) -> vllm::TopLogProbs {
+    let mut top = vllm::TopLogProbs::default();
+    let Some((sampled, ranked)) = entries.split_first() else {
+        return top;
+    };
+    if top_k == 0 {
+        return top;
+    }
+    top.values.push(sampled.logprob);
+    top.token_ids.push(sampled.token_id);
+    for entry in ranked {
+        if top.token_ids.len() >= top_k {
+            break;
+        }
+        if entry.token_id == sampled.token_id {
+            continue;
+        }
+        top.values.push(entry.logprob);
+        top.token_ids.push(entry.token_id);
+    }
+    top
 }
 
 /// Accumulated per-request token counts shared by both stream mappers.
@@ -843,27 +901,17 @@ impl VllmGenerateStream {
         let mut tick_logprobs_val = Vec::new();
         let mut tick_logprobs_idx = Vec::new();
         let mut tick_top_logprobs = Vec::new();
-        if let Some(logprobs) = &output.new_logprobs {
-            let decoded = logprobs.as_direct().ok_or_else(|| {
-                // The protocol layer resolves wire logprobs during decode, so
-                // an unresolved payload here is a protocol bug — fail loudly.
-                tonic::Status::internal("unresolved wire logprobs in engine output")
-            })?;
+        if let Some(decoded) = &output.new_logprobs {
             for position in &decoded.positions {
                 let Some(sampled) = position.entries.first() else {
                     continue;
                 };
                 tick_logprobs_val.push(sampled.logprob);
                 tick_logprobs_idx.push(sampled.token_id);
-                // The entries arrive sampled-first then rank-ordered; take the
+                // The entries arrive sampled-first then rank-ordered; shape the
                 // requested count so one ranked list lands per sampled token.
                 if top_k > 0 {
-                    let mut top = vllm::TopLogProbs::default();
-                    for entry in position.entries.iter().take(top_k) {
-                        top.values.push(entry.logprob);
-                        top.token_ids.push(entry.token_id);
-                    }
-                    tick_top_logprobs.push(top);
+                    tick_top_logprobs.push(shape_top_logprobs(&position.entries, top_k));
                 }
             }
         }
@@ -880,10 +928,7 @@ impl VllmGenerateStream {
         // them incrementally); entry 0 per position is the actual prompt
         // token. The API contract reports the first prompt token with a null
         // logprob, so seed it once before the first scored position.
-        if let Some(prompt_logprobs) = &output.new_prompt_logprobs_tensors {
-            let decoded = prompt_logprobs.as_direct().ok_or_else(|| {
-                tonic::Status::internal("unresolved wire prompt logprobs in engine output")
-            })?;
+        if let Some(decoded) = &output.new_prompt_logprobs_tensors {
             if state.prompt_logprobs.is_empty() && !decoded.positions.is_empty() {
                 if let Some(first) = self.first_prompt_token {
                     state
@@ -904,12 +949,10 @@ impl VllmGenerateStream {
                 });
                 state.prompt_token_ids.push(selected.token_id);
                 if self.prompt_top_logprobs > 0 {
-                    let mut top = vllm::TopLogProbs::default();
-                    for entry in position.entries.iter().take(self.prompt_top_logprobs) {
-                        top.values.push(entry.logprob);
-                        top.token_ids.push(entry.token_id);
-                    }
-                    state.prompt_top_logprobs.push(top);
+                    state.prompt_top_logprobs.push(shape_top_logprobs(
+                        &position.entries,
+                        self.prompt_top_logprobs,
+                    ));
                 }
             }
         }
@@ -948,30 +991,34 @@ impl VllmGenerateStream {
         if self.state.prompt_logprobs.is_empty() {
             return;
         }
-        let input_logprobs = vllm::InputLogProbs {
-            token_logprobs: self.state.prompt_logprobs.clone(),
-            token_ids: self.state.prompt_token_ids.clone(),
-            top_logprobs: self.state.prompt_top_logprobs.clone(),
+        // Built per attachment site rather than up front: with
+        // `prompt_logprobs` requested this runs on every decode tick, and the
+        // common tick (a later chunk) attaches nothing.
+        let state = &self.state;
+        let build = || vllm::InputLogProbs {
+            token_logprobs: state.prompt_logprobs.clone(),
+            token_ids: state.prompt_token_ids.clone(),
+            top_logprobs: state.prompt_top_logprobs.clone(),
         };
         if let Some(vllm::generate_response::Response::Complete(parked)) = self
             .pending
             .as_mut()
             .and_then(|pending| pending.response.as_mut())
         {
-            parked.input_logprobs = Some(input_logprobs.clone());
+            parked.input_logprobs = Some(build());
         }
         match response.response.as_mut() {
             Some(vllm::generate_response::Response::Chunk(chunk))
                 if !self.input_logprobs_emitted && !chunk.token_ids.is_empty() =>
             {
-                chunk.input_logprobs = Some(input_logprobs);
+                chunk.input_logprobs = Some(build());
                 self.input_logprobs_emitted = true;
             }
             // Later chunks never repeat them (the proto carries them in the
             // first chunk only), and neither do token-less prefill chunks.
             Some(vllm::generate_response::Response::Chunk(_)) => {}
             Some(vllm::generate_response::Response::Complete(complete)) => {
-                complete.input_logprobs = Some(input_logprobs);
+                complete.input_logprobs = Some(build());
             }
             None => {}
         }
@@ -1134,18 +1181,21 @@ fn fan_out_requests(req: vllm::GenerateRequest) -> Vec<vllm::GenerateRequest> {
 
 /// Shared n>1 fan-out scaffolding: clone the request into `n` subs and let
 /// `per_sub` apply the engine-specific rid suffix and sampling tweaks. An
-/// `n <= 1` request passes through untouched.
-fn fan_out_n<R: Clone>(req: R, n: u32, mut per_sub: impl FnMut(&mut R, u32)) -> Vec<R> {
+/// `n <= 1` request passes through untouched. The last sub reuses `req`
+/// itself, so a multimodal payload is copied `n - 1` times, not `n`.
+fn fan_out_n<R: Clone>(mut req: R, n: u32, mut per_sub: impl FnMut(&mut R, u32)) -> Vec<R> {
     if n <= 1 {
         return vec![req];
     }
-    (0..n)
-        .map(|i| {
-            let mut sub = req.clone();
-            per_sub(&mut sub, i);
-            sub
-        })
-        .collect()
+    let mut subs = Vec::with_capacity(n as usize);
+    for i in 0..n - 1 {
+        let mut sub = req.clone();
+        per_sub(&mut sub, i);
+        subs.push(sub);
+    }
+    per_sub(&mut req, n - 1);
+    subs.push(req);
+    subs
 }
 
 /// Split an `n > 1` TokenSpeed proto request into `n` single-sample
@@ -1459,7 +1509,7 @@ mod tests {
     use engine_zmq_client::{
         mock_engine::{connect_to_frontend, default_ready_response, EngineInbound},
         protocol::vllm::{
-            logprobs::{Logprobs, MaybeWireLogprobs, PositionLogprobs, TokenLogprob},
+            logprobs::{Logprobs, PositionLogprobs, TokenLogprob},
             output::{EngineCoreOutputs, RequestBatchOutputs},
         },
         EngineId,
@@ -1618,6 +1668,53 @@ mod tests {
         assert_eq!(eos_stop_ids(&req), &[7]);
     }
 
+    /// The variant match is the only gate on the fold: a TokenSpeed request
+    /// (whose scheduler stops at EOS itself) is left untouched.
+    #[test]
+    fn eos_backstop_leaves_tokenspeed_requests_untouched() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let mut req =
+            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
+                sampling_params: Some(tokenspeed_proto::SamplingParams {
+                    stop_token_ids: vec![7],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
+        fold_tokenizer_eos_backstop(&mut req, Some(&tokenizer));
+        let ProtoGenerateRequest::TokenSpeed(req) = req else {
+            panic!("expected TokenSpeed request");
+        };
+        assert_eq!(req.sampling_params.unwrap().stop_token_ids, vec![7]);
+    }
+
+    /// The dialect is resolved before the handshake, so a runtime with no ZMQ
+    /// adapter fails immediately instead of blocking for the connect timeout
+    /// (this test would hang on the generous timeout otherwise).
+    #[tokio::test]
+    async fn connect_rejects_a_runtime_without_a_zmq_adapter_before_the_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let Err(error) = ZmqEngineClient::connect(
+            &ep("hs.sock"),
+            &ep("in.sock"),
+            &ep("out.sock"),
+            1,
+            "m".to_string(),
+            EosTokenIds::default(),
+            RuntimeType::Sglang,
+            ZMQ_CONNECT_TIMEOUT,
+        )
+        .await
+        else {
+            panic!("SGLang has no ZMQ engine adapter");
+        };
+        assert!(
+            error.to_string().contains("no engine implementation"),
+            "{error}"
+        );
+    }
+
     fn batch(
         request_id: &str,
         token: u32,
@@ -1625,16 +1722,14 @@ mod tests {
         finish: Option<EngineCoreFinishReason>,
     ) -> EngineCoreOutputs {
         let finished = finish.map(|_| BTreeSet::from([request_id.to_string()]));
-        let new_logprobs = logprob.map(|lp| {
-            MaybeWireLogprobs::Direct(Logprobs {
-                positions: vec![PositionLogprobs {
-                    entries: vec![TokenLogprob {
-                        token_id: token,
-                        logprob: lp,
-                        rank: 1,
-                    }],
+        let new_logprobs = logprob.map(|lp| Logprobs {
+            positions: vec![PositionLogprobs {
+                entries: vec![TokenLogprob {
+                    token_id: token,
+                    logprob: lp,
+                    rank: 1,
                 }],
-            })
+            }],
         });
         EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
@@ -1771,6 +1866,74 @@ mod tests {
         engine_task.await.unwrap();
     }
 
+    /// The sampled token also ranks first — the common case under greedy or
+    /// low-temperature decoding. The engine repeats it in the ranked columns,
+    /// so the shaped list must carry it once and still return `k` candidates.
+    #[test]
+    fn shape_top_logprobs_dedups_sampled_token_at_rank_one() {
+        let entries = vec![
+            TokenLogprob {
+                token_id: 10,
+                logprob: -0.1,
+                rank: 1,
+            },
+            TokenLogprob {
+                token_id: 10,
+                logprob: -0.1,
+                rank: 1,
+            },
+            TokenLogprob {
+                token_id: 20,
+                logprob: -0.3,
+                rank: 2,
+            },
+        ];
+        assert_eq!(
+            shape_top_logprobs(&entries, 2),
+            vllm::TopLogProbs {
+                values: vec![-0.1, -0.3],
+                token_ids: vec![10, 20],
+            }
+        );
+        assert_eq!(
+            shape_top_logprobs(&entries, 1),
+            vllm::TopLogProbs {
+                values: vec![-0.1],
+                token_ids: vec![10],
+            }
+        );
+    }
+
+    /// A sampled token outside the top-k leads the list and the ranked
+    /// candidates follow in order, truncated to the requested count.
+    #[test]
+    fn shape_top_logprobs_keeps_sampled_token_outside_top_k() {
+        let entries = vec![
+            TokenLogprob {
+                token_id: 10,
+                logprob: -0.5,
+                rank: 5,
+            },
+            TokenLogprob {
+                token_id: 20,
+                logprob: -0.1,
+                rank: 1,
+            },
+            TokenLogprob {
+                token_id: 30,
+                logprob: -0.3,
+                rank: 2,
+            },
+        ];
+        assert_eq!(
+            shape_top_logprobs(&entries, 2),
+            vllm::TopLogProbs {
+                values: vec![-0.5, -0.1],
+                token_ids: vec![10, 20],
+            }
+        );
+    }
+
     /// With `logprobs=k`, each position's ranked candidates are shaped into
     /// `top_logprobs`, taking the sampled entry plus the leading candidates up
     /// to the requested count (matching the gRPC servicer's `islice` behaviour).
@@ -1826,9 +1989,9 @@ mod tests {
             outputs: vec![EngineCoreOutput {
                 request_id: "r1".to_string(),
                 new_token_ids: vec![10],
-                new_logprobs: Some(MaybeWireLogprobs::Direct(Logprobs {
+                new_logprobs: Some(Logprobs {
                     positions: vec![position],
-                })),
+                }),
                 finish_reason: Some(EngineCoreFinishReason::Length),
                 ..Default::default()
             }],
@@ -1940,7 +2103,7 @@ mod tests {
 
         // Prompt position for input token 2 (the engine scores every prompt
         // token but the first), with one ranked candidate behind it.
-        let prompt_tensors = MaybeWireLogprobs::Direct(Logprobs {
+        let prompt_tensors = Logprobs {
             positions: vec![PositionLogprobs {
                 entries: vec![
                     TokenLogprob {
@@ -1955,7 +2118,7 @@ mod tests {
                     },
                 ],
             }],
-        });
+        };
         let prefill = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
             outputs: vec![EngineCoreOutput {
@@ -2509,8 +2672,8 @@ mod tests {
         assert_eq!(sp.all_stop_token_ids, BTreeSet::from([5, 7, 9]));
     }
 
-    #[test]
-    fn eos_token_ids_resolve_from_model_dir() {
+    #[tokio::test]
+    async fn eos_token_ids_resolve_from_model_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("config.json"), r#"{"eos_token_id": 5}"#).unwrap();
         std::fs::write(
@@ -2519,14 +2682,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            EosTokenIds::from_model_dir(dir.path()),
+            EosTokenIds::from_model_dir(dir.path()).await,
             EosTokenIds::new(Some(5), vec![7, 9]),
         );
 
         // Missing files degrade to no ids, not an error.
         let empty = tempfile::tempdir().expect("tempdir");
         assert_eq!(
-            EosTokenIds::from_model_dir(empty.path()),
+            EosTokenIds::from_model_dir(empty.path()).await,
             EosTokenIds::default(),
         );
     }
