@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 use validator::Validate;
 
 use super::{
-    common::{default_true, deserialize_null_as_false, GenerationRequest, InputIds},
+    common::{default_true, deserialize_null_as_false, is_false, GenerationRequest, InputIds},
     sampling_params::SamplingParams,
 };
 use crate::validated::Normalizable;
@@ -88,7 +88,7 @@ pub struct GenerateRequest {
     pub log_metrics: bool,
 
     /// Return model hidden states
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub return_hidden_states: bool,
 
     /// The modalities of the image data [image, multi-images, video]
@@ -203,6 +203,10 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
 }
 
 impl GenerationRequest for GenerateRequest {
+    fn rid(&self) -> Option<&str> {
+        self.rid.as_deref()
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
     }
@@ -327,6 +331,27 @@ mod tests {
 
     fn req() -> GenerateRequest {
         serde_json::from_value(serde_json::json!({"model": "m"})).expect("minimal request")
+    }
+
+    #[test]
+    fn return_hidden_states_false_is_omitted_and_absent_reads_false() {
+        let r = req();
+        let v = serde_json::to_value(&r).expect("serialize");
+        assert!(v.get("return_hidden_states").is_none());
+
+        let back: GenerateRequest = serde_json::from_value(v).expect("roundtrip");
+        assert!(!back.return_hidden_states);
+    }
+
+    #[test]
+    fn return_hidden_states_true_round_trips() {
+        let mut r = req();
+        r.return_hidden_states = true;
+        let v = serde_json::to_value(&r).expect("serialize");
+        assert_eq!(v["return_hidden_states"], true);
+
+        let back: GenerateRequest = serde_json::from_value(v).expect("roundtrip");
+        assert!(back.return_hidden_states);
     }
 
     #[test]

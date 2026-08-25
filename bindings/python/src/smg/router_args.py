@@ -26,6 +26,11 @@ PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 
 
+def _parse_int_csv(value: str) -> list[int]:
+    """Parse a comma-separated integer list (mirrors the CLI value_delimiter)."""
+    return [int(item) for item in value.split(",") if item]
+
+
 @dataclasses.dataclass
 class RouterArgs:
     # Worker configuration
@@ -68,7 +73,8 @@ class RouterArgs:
     least_load_default_throughput: float = 2000.0
     least_load_mean_prefill_tokens: int = 1024
     max_idle_secs: int = 4 * 3600
-    assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
+    # Routing-key assignment; defaults: random (manual policy), delegate (override)
+    assignment_mode: str | None = None
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
@@ -106,13 +112,13 @@ class RouterArgs:
     request_timeout_secs: int = 1800
     # Grace period in seconds to wait for in-flight requests during shutdown
     shutdown_grace_period_secs: int = 180
-    # Max concurrent requests for rate limiting (-1 to disable)
+    # Standing-concurrency cap (-1 to disable); permits span the full response
     max_concurrent_requests: int = -1
     # Queue size for pending requests when max concurrent limit reached
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
     queue_timeout_secs: int = 60
-    # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
+    # Token bucket refill rate (tokens per second). Unset or 0 = no refill
     rate_limit_tokens_per_second: int | None = None
     # CORS allowed origins
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
@@ -214,6 +220,30 @@ class RouterArgs:
     selection_temperature: float = 0.0
     upstream_pool_idle_timeout_secs: int = 3
     least_load_max_waiting_requests: int = 0
+    stream_body_stall_timeout_secs: int = 300
+    # Ordered header names checked for the routing key; first valid wins
+    routing_key_headers: list[str] = dataclasses.field(
+        default_factory=lambda: ["x-smg-routing-key"]
+    )
+    # Token positions at which serving engines retain reusable prefix state
+    cache_boundaries: list[int] = dataclasses.field(default_factory=list)
+    # cache_aware index under-layer: "tree" or "hash"
+    cache_index: str = "tree"
+    # Seconds a cache-affinity placement stays routable
+    cache_ttl_secs: int = 180
+    # Control-plane job queue sizing (worker registration/removal jobs)
+    job_queue_capacity: int = 1000
+    job_queue_concurrency: int = 200
+    # Absolute per-worker overload thresholds; both None disables the feature
+    worker_overload_waiting_requests: int | None = None
+    worker_overload_token_usage: float | None = None
+    # Enable overload protection with the gateway default token ceiling (0.9)
+    worker_overload_protection: bool = False
+    # Restore the conditional load-monitor poll gate (default: poll always)
+    disable_load_monitoring: bool = False
+    # Most bytes the router may buffer for a request it holds only to keep
+    # it retryable; larger eligible requests stream and forfeit router retries
+    max_buffered_request_bytes: int = 1048576
 
     @staticmethod
     def add_cli_args(
@@ -412,9 +442,13 @@ class RouterArgs:
         )
         routing_group.add_argument(
             f"--{prefix}cache-threshold",
+            f"--{prefix}cache-match-threshold",
             type=float,
             default=RouterArgs.cache_threshold,
-            help="Cache threshold (0.0-1.0) for cache-aware routing",
+            help=(
+                "Minimum matched-prefix share (0.0-1.0) before cache-aware routing"
+                " pins a request to a worker already holding that prefix"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}prefix-token-count",
@@ -476,19 +510,21 @@ class RouterArgs:
         )
         routing_group.add_argument(
             f"--{prefix}balance-abs-threshold",
+            f"--{prefix}spill-abs-threshold",
             type=int,
             default=RouterArgs.balance_abs_threshold,
             help=(
-                "Absolute threshold for load difference. Balancing is triggered if"
+                "Spill gate, absolute part. Balancing is triggered if"
                 " `(max_load - min_load) > abs_threshold` and the relative threshold is also met."
             ),
         )
         routing_group.add_argument(
             f"--{prefix}balance-rel-threshold",
+            f"--{prefix}spill-rel-threshold",
             type=float,
             default=RouterArgs.balance_rel_threshold,
             help=(
-                "Relative threshold for load difference. Balancing is triggered if"
+                "Spill gate, relative part. Balancing is triggered if"
                 " `max_load > min_load * rel_threshold` and the absolute threshold is also met."
             ),
         )
@@ -513,6 +549,54 @@ class RouterArgs:
                 " exceeds it, shed load off that engine regardless of spread. A safety"
                 " valve for critically-saturated engines, best set high (e.g. 0.9)."
                 " Backend must report token_usage. Defaults to 1.0 (disabled)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-overload-waiting-requests",
+            type=int,
+            default=RouterArgs.worker_overload_waiting_requests,
+            help=(
+                "Queued-request count AT OR ABOVE which a worker is considered"
+                " overloaded and excluded from routing until the signal recovers;"
+                " when every worker is overloaded, requests are shed immediately"
+                " rather than queued. Unset disables overload protection. This"
+                " signal is the queued (waiting) request count, summed across DP"
+                " ranks. Must be >= 1: the comparison is inclusive, so 0 would veto"
+                " every worker unconditionally."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-overload-token-usage",
+            type=float,
+            default=RouterArgs.worker_overload_token_usage,
+            help=(
+                "KV-cache token usage AT OR ABOVE which a worker is considered"
+                " overloaded and excluded from routing until the signal recovers;"
+                " when every worker is overloaded, requests are shed immediately"
+                " rather than queued. Unset disables overload protection. This"
+                " signal is mean KV-cache token usage across DP ranks, the same one"
+                " --balance-token-usage-threshold reads, applied as an absolute"
+                " per-worker CEILING rather than a fleet-relative spread. Backend"
+                " must report token_usage. Must be in (0.0, 1.0]: the comparison is"
+                " inclusive, so 0.0 would veto every worker unconditionally."
+                " Distinct from --overload-token-usage-threshold, which only"
+                " de-ranks the hottest backend within cache-aware affinity; this"
+                " flag removes the worker from routing entirely."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-overload-protection",
+            action="store_true",
+            help=(
+                "Enable worker overload protection with the gateway default"
+                " thresholds. This flag alone applies"
+                " --worker-overload-token-usage 0.9 and leaves"
+                " --worker-overload-waiting-requests unset: KV token usage means"
+                " the same thing on every engine, while a sensible"
+                " waiting-requests ceiling is workload-dependent, so it has no"
+                " universal default. Explicit thresholds override the default,"
+                " and either threshold set on its own enables protection without"
+                " this flag."
             ),
         )
         routing_group.add_argument(
@@ -565,19 +649,56 @@ class RouterArgs:
             help="KV cache block size for event-driven cache-aware routing (default: 16)",
         )
         routing_group.add_argument(
+            f"--{prefix}cache-boundaries",
+            type=_parse_int_csv,
+            default=[],
+            help=(
+                "Comma-separated token positions at which serving engines retain"
+                " reusable prefix state; cache-affinity policies hash request"
+                " heads at the deepest applicable boundary."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}cache-index",
+            type=str,
+            choices=["tree", "hash"],
+            default=RouterArgs.cache_index,
+            help=(
+                "Index under-layer for cache_aware: 'tree' (radix prefix trees)"
+                " or 'hash' (TTL'd exact-match placement map keyed on request"
+                " heads at --cache-boundaries; token-bearing requests only —"
+                " untokenized requests stay load-balanced). Defaults to 'tree'."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}cache-ttl-secs",
+            type=int,
+            default=RouterArgs.cache_ttl_secs,
+            help=(
+                "Seconds a cache-affinity placement stays routable; should"
+                " approximate serving-engine cache retention. Defaults to 180."
+            ),
+        )
+        routing_group.add_argument(
             f"--{prefix}max-idle-secs",
+            f"--{prefix}sticky-key-idle-secs",
             type=int,
             default=RouterArgs.max_idle_secs,
-            help="Maximum idle time in seconds before eviction (for manual policy)",
+            help=(
+                "How long an unused sticky routing key stays pinned: keys idle"
+                " beyond this many seconds are evicted from the sticky map"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}assignment-mode",
             type=str,
             default=RouterArgs.assignment_mode,
-            choices=["random", "min_load", "min_group"],
+            choices=["random", "min_load", "min_group", "delegate"],
             help=(
-                "Mode for assigning new routing keys in manual policy: random (default),"
-                " min_load (worker with fewest requests), min_group (worker with fewest routing keys)"
+                "Mode for assigning new routing keys: random, min_load (fewest"
+                " requests), min_group (fewest routing keys), delegate (route via"
+                " the underlying policy, then pin). Defaults to random for the"
+                " manual policy and delegate for the routing-key override"
             ),
         )
         routing_group.add_argument(
@@ -587,14 +708,55 @@ class RouterArgs:
             help="Maximum payload size in bytes",
         )
         routing_group.add_argument(
+            f"--{prefix}max-buffered-request-bytes",
+            type=int,
+            default=RouterArgs.max_buffered_request_bytes,
+            help=(
+                "Most bytes the router may hold for a request it buffers only"
+                " to keep it retryable. Requests the router must parse buffer"
+                " regardless (bounded by max-payload-size); other eligible"
+                " requests buffer up to this many bytes when router retries"
+                " are enabled and otherwise stream to the worker verbatim,"
+                " forfeiting router-level retries. 0 never buffers for"
+                " retries"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}stream-body-stall-timeout-secs",
+            type=int,
+            default=RouterArgs.stream_body_stall_timeout_secs,
+            help=(
+                "Abort a streamed request body once the upstream sender has"
+                " waited on the client for this many seconds (408). The clock"
+                " pauses while the worker applies backpressure, so a slow"
+                " worker read never trips it. Applies only to streamed"
+                " request bodies. 0 disables"
+            ),
+        )
+        routing_group.add_argument(
             f"--{prefix}dp-aware",
             action="store_true",
             help="Enable data parallelism aware schedule",
         )
         routing_group.add_argument(
             f"--{prefix}routing-key-override",
+            f"--{prefix}sticky-sessions",
             action="store_true",
-            help="Honor X-SMG-Routing-Key for sticky routing on any policy",
+            help=(
+                "Sticky sessions: route every request of a conversation to the"
+                " same worker, on any policy (keys derived from the request-id"
+                " lineage, falling back to the routing-key headers)"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}routing-key-headers",
+            type=str,
+            nargs="*",
+            action="extend",
+            help=(
+                "Ordered header names checked for the routing key; the first"
+                " header present with a valid value wins"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}dp-minimum-tokens-scheduler",
@@ -662,6 +824,22 @@ class RouterArgs:
             default=RouterArgs.worker_startup_check_interval,
             help="Interval in seconds between checks for worker startup",
         )
+        parser.add_argument(
+            f"--{prefix}job-queue-capacity",
+            type=int,
+            default=RouterArgs.job_queue_capacity,
+            help=(
+                "Max pending control-plane jobs (worker add/remove, tokenizer, MCP, WASM)."
+                " Size to fleet scale so a service-discovery reconcile pass can enqueue"
+                " every worker without blocking (default: 1000)"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}job-queue-concurrency",
+            type=int,
+            default=RouterArgs.job_queue_concurrency,
+            help="Max control-plane jobs dispatched concurrently (default: 200)",
+        )
 
         # Load monitoring
         parser.add_argument(
@@ -669,6 +847,17 @@ class RouterArgs:
             type=int,
             default=RouterArgs.load_monitor_interval,
             help="Interval in seconds between load monitor checks for PowerOfTwo routing (default: 10)",
+        )
+        parser.add_argument(
+            f"--{prefix}disable-load-monitoring",
+            action="store_true",
+            help=(
+                "Only poll worker loads when a load-aware routing policy,"
+                " --engine-metrics, or worker overload protection needs the"
+                " data. By default every worker group is polled from"
+                " registration onward; this restores the old conditional gate"
+                " (a load-aware policy is always fed regardless)."
+            ),
         )
 
         # Multimodal tensor transport
@@ -876,8 +1065,9 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_concurrent_requests,
             help=(
-                "Maximum number of concurrent requests allowed (for rate limiting)."
-                " Set to -1 to disable rate limiting."
+                "Maximum standing concurrent requests; each admission permit"
+                " is held for the full response, including streaming bodies."
+                " Set to -1 to disable."
             ),
         )
         rate_limit_group.add_argument(
@@ -900,8 +1090,9 @@ class RouterArgs:
             type=int,
             default=RouterArgs.rate_limit_tokens_per_second,
             help=(
-                "Token bucket refill rate (tokens per second)."
-                " If not set, defaults to max_concurrent_requests"
+                "Token bucket refill rate (tokens per second). Unset or 0 ="
+                " no refill: --max-concurrent-requests bounds standing"
+                " concurrency alone."
             ),
         )
 
@@ -1014,9 +1205,14 @@ class RouterArgs:
         )
         health_group.add_argument(
             f"--{prefix}remove-unhealthy-workers",
+            f"--{prefix}worker-auto-recovery",
             action="store_true",
             default=RouterArgs.remove_unhealthy_workers,
-            help="Remove workers from the registry when they are marked unhealthy",
+            help=(
+                "Let workers recover after prolonged failure: unhealthy workers"
+                " are removed so service discovery re-registers and re-probes"
+                " them once their engine returns"
+            ),
         )
         # Tokenizer configuration
         tokenizer_group.add_argument(

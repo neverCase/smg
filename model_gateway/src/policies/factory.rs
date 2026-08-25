@@ -51,6 +51,9 @@ impl PolicyFactory {
                 overload_token_usage_threshold,
                 overlap_decay,
                 selection_temperature,
+                cache_index,
+                cache_ttl_secs,
+                cache_boundaries,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -63,6 +66,9 @@ impl PolicyFactory {
                     overload_token_usage_threshold: *overload_token_usage_threshold,
                     overlap_decay: *overlap_decay,
                     selection_temperature: *selection_temperature,
+                    cache_index: *cache_index,
+                    cache_ttl_secs: *cache_ttl_secs,
+                    cache_boundaries: cache_boundaries.clone(),
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
@@ -95,11 +101,13 @@ impl PolicyFactory {
                 prefix_token_count,
                 load_factor,
                 balance_abs_threshold,
+                cache_boundaries,
             } => {
                 let config = PrefixHashConfig {
                     prefix_token_count: *prefix_token_count,
                     load_factor: *load_factor,
                     balance_abs_threshold: *balance_abs_threshold,
+                    cache_boundaries: cache_boundaries.clone(),
                 };
                 Arc::new(PrefixHashPolicy::new(config))
             }
@@ -157,6 +165,9 @@ mod tests {
             overload_token_usage_threshold: 1.0,
             overlap_decay: 0.0,
             selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         });
         assert_eq!(policy.name(), "cache_aware");
 
@@ -181,6 +192,7 @@ mod tests {
             prefix_token_count: 100,
             load_factor: 0.8,
             balance_abs_threshold: 10,
+            cache_boundaries: vec![2048, 8192],
         });
         assert_eq!(policy.name(), "prefix_hash");
     }

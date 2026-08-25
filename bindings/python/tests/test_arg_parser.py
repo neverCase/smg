@@ -539,6 +539,107 @@ class TestParseRouterArgs:
         assert router_args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
         assert router_args.policy == "round_robin"
 
+    def test_parse_routing_key_headers(self):
+        """Ordered list flag; unset keeps the x-smg-routing-key default."""
+        router_args = parse_router_args(
+            ["--routing-key-headers", "x-routing-key", "x-smg-routing-key"]
+        )
+        assert router_args.routing_key_headers == ["x-routing-key", "x-smg-routing-key"]
+
+        defaults = parse_router_args([])
+        assert defaults.routing_key_headers == ["x-smg-routing-key"]
+
+    def test_parse_cache_index_args(self):
+        """Comma-separated boundaries plus the index/TTL knobs."""
+        router_args = parse_router_args(
+            [
+                "--cache-boundaries",
+                "2048,8192,32768",
+                "--cache-index",
+                "hash",
+                "--cache-ttl-secs",
+                "120",
+            ]
+        )
+        assert router_args.cache_boundaries == [2048, 8192, 32768]
+        assert router_args.cache_index == "hash"
+        assert router_args.cache_ttl_secs == 120
+
+        defaults = parse_router_args([])
+        assert defaults.cache_boundaries == []
+        assert defaults.cache_index == "tree"
+        assert defaults.cache_ttl_secs == 180
+
+    def test_parse_worker_overload_args(self):
+        """Both overload flags round-trip, and both default to unset.
+
+        The argparse names are built from an f-string prefix, so a typo or a
+        dest/field mismatch would leave the field at its default and silently
+        disable the feature from Python -- `from_cli_args` skips keys it cannot
+        find.
+        """
+        router_args = parse_router_args(
+            [
+                "--worker-overload-waiting-requests",
+                "64",
+                "--worker-overload-token-usage",
+                "0.9",
+            ]
+        )
+        assert router_args.worker_overload_waiting_requests == 64
+        assert router_args.worker_overload_token_usage == pytest.approx(0.9)
+
+        defaults = parse_router_args([])
+        assert defaults.worker_overload_waiting_requests is None
+        assert defaults.worker_overload_token_usage is None
+
+    def test_prefixed_worker_overload_args(self):
+        """The --router-prefixed aliases reach the same fields."""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(
+            [
+                "--router-worker-overload-waiting-requests",
+                "8",
+                "--router-worker-overload-token-usage",
+                "0.75",
+            ]
+        )
+
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+        assert router_args.worker_overload_waiting_requests == 8
+        assert router_args.worker_overload_token_usage == pytest.approx(0.75)
+
+    def test_parse_overload_protection_and_monitoring_flags(self):
+        """The enable/opt-out flags round-trip, and both default to False.
+
+        Same failure mode as the threshold flags: a dest/field mismatch would
+        silently disable the feature from Python.
+        """
+        router_args = parse_router_args(
+            ["--worker-overload-protection", "--disable-load-monitoring"]
+        )
+        assert router_args.worker_overload_protection is True
+        assert router_args.disable_load_monitoring is True
+
+        defaults = parse_router_args([])
+        assert defaults.worker_overload_protection is False
+        assert defaults.disable_load_monitoring is False
+
+    def test_prefixed_overload_protection_and_monitoring_flags(self):
+        """The --router-prefixed aliases reach the same fields."""
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(
+            ["--router-worker-overload-protection", "--router-disable-load-monitoring"]
+        )
+
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+        assert router_args.worker_overload_protection is True
+        assert router_args.disable_load_monitoring is True
+
     def test_parse_pd_args(self):
         """Test parsing PD disaggregated mode arguments."""
         args = [
@@ -1072,6 +1173,71 @@ class TestPrefixHashArgs:
         assert router_args.prefix_hash_load_factor == 2.0
 
 
+class TestCacheBoundariesArgs:
+    """Boundary-list parsing beyond the basic parse/default coverage."""
+
+    def test_router_prefix_flag(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(["--router-cache-boundaries", "4096"])
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+        assert router_args.cache_boundaries == [4096]
+
+    def test_non_numeric_rejected(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--cache-boundaries", "2048,big"])
+
+
+class TestFlagAliases:
+    """Intent-revealing alias flags land on the same dests as the canonical names."""
+
+    def test_alias_flags_land_on_canonical_dests(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        namespace = parser.parse_args(
+            [
+                "--sticky-sessions",
+                "--worker-auto-recovery",
+                "--cache-match-threshold",
+                "0.6",
+                "--spill-abs-threshold",
+                "8",
+                "--spill-rel-threshold",
+                "1.2",
+                "--sticky-key-idle-secs",
+                "300",
+            ]
+        )
+        router_args = RouterArgs.from_cli_args(namespace)
+        assert router_args.routing_key_override is True
+        assert router_args.remove_unhealthy_workers is True
+        assert router_args.cache_threshold == 0.6
+        assert router_args.balance_abs_threshold == 8
+        assert router_args.balance_rel_threshold == 1.2
+        assert router_args.max_idle_secs == 300
+
+    def test_alias_flags_match_canonical_parse(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        canonical = RouterArgs.from_cli_args(
+            parser.parse_args(["--routing-key-override", "--cache-threshold", "0.6"])
+        )
+        aliased = RouterArgs.from_cli_args(
+            parser.parse_args(["--sticky-sessions", "--cache-match-threshold", "0.6"])
+        )
+        assert canonical == aliased
+
+    def test_alias_flags_honor_router_prefix(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(["--router-sticky-sessions", "--router-worker-auto-recovery"])
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+        assert router_args.routing_key_override is True
+        assert router_args.remove_unhealthy_workers is True
+
+
 class TestRouterArgsFieldOrder:
     """RouterArgs generates a positional __init__, so field order is a public
     contract: a mid-list insertion silently rebinds every later positional
@@ -1223,6 +1389,18 @@ class TestRouterArgsFieldOrder:
         "selection_temperature",
         "upstream_pool_idle_timeout_secs",
         "least_load_max_waiting_requests",
+        "stream_body_stall_timeout_secs",
+        "routing_key_headers",
+        "cache_boundaries",
+        "cache_index",
+        "cache_ttl_secs",
+        "job_queue_capacity",
+        "job_queue_concurrency",
+        "worker_overload_waiting_requests",
+        "worker_overload_token_usage",
+        "worker_overload_protection",
+        "disable_load_monitoring",
+        "max_buffered_request_bytes",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1245,6 +1423,16 @@ class TestRouterArgsFieldOrder:
             "selection_temperature",
             "upstream_pool_idle_timeout_secs",
             "least_load_max_waiting_requests",
+            "stream_body_stall_timeout_secs",
+            "routing_key_headers",
+            "cache_boundaries",
+            "cache_index",
+            "cache_ttl_secs",
+            "worker_overload_waiting_requests",
+            "worker_overload_token_usage",
+            "worker_overload_protection",
+            "disable_load_monitoring",
+            "max_buffered_request_bytes",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

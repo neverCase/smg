@@ -231,6 +231,18 @@ pub(crate) fn init_metrics() {
         "smg_http_rate_limit_total",
         "Rate limiting decisions by result (allowed/rejected)"
     );
+    describe_gauge!(
+        "smg_admission_queue_depth",
+        "Requests currently parked in the admission queue"
+    );
+    describe_counter!(
+        "smg_admission_queue_rejected_total",
+        "Requests rejected at admission by reason (full/timeout)"
+    );
+    describe_gauge!(
+        "smg_admission_inflight",
+        "Requests currently holding an admission token"
+    );
 
     // Layer 2: Router metrics
     describe_counter!(
@@ -252,6 +264,14 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_router_upstream_responses_total",
         "Upstream backend HTTP responses by router_type, status_code, error_code"
+    );
+    describe_counter!(
+        "smg_router_request_buffers_released_early_bytes_total",
+        "Serialized size of request buffers freed at dispatch instead of response completion (retries disabled)"
+    );
+    describe_counter!(
+        "smg_router_request_body_path_total",
+        "Per-request body-path decisions by path (streamed/buffered) and dominant reason"
     );
 
     // Layer 2: Router inference metrics (gRPC only)
@@ -334,6 +354,15 @@ pub(crate) fn init_metrics() {
          (panic, join_error, intern_failed)"
     );
     describe_gauge!(
+        "smg_workers_overloaded",
+        "Workers currently flagged overloaded and excluded from routing, by model"
+    );
+    describe_counter!(
+        "smg_worker_overload_shed_total",
+        "Requests shed because every worker for the model is overloaded, by stage \
+         (selection, dispatch)"
+    );
+    describe_gauge!(
         "smg_manual_policy_cache_entries",
         "Number of routing entries in manual policy cache"
     );
@@ -348,6 +377,10 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_cache_tree_tenants",
         "Cache-aware tree tenant count by model and tree (string/token)"
+    );
+    describe_gauge!(
+        "smg_cache_placement_entries",
+        "Cache-aware hash-index placement entries by model (keys with a live holder)"
     );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
@@ -730,6 +763,10 @@ pub mod metrics_labels {
     pub const RATE_LIMIT_ALLOWED: &str = "allowed";
     pub const RATE_LIMIT_REJECTED: &str = "rejected";
 
+    // Admission rejection reasons
+    pub const ADMISSION_REJECTED_FULL: &str = "full";
+    pub const ADMISSION_REJECTED_TIMEOUT: &str = "timeout";
+
     // Circuit breaker states
     pub const CB_CLOSED: &str = "closed";
     pub const CB_OPEN: &str = "open";
@@ -826,6 +863,35 @@ impl Metrics {
             "result" => result
         )
         .increment(1);
+    }
+
+    /// Track a request entering the admission queue.
+    pub fn record_admission_queue_entered() {
+        gauge!("smg_admission_queue_depth").increment(1.0);
+    }
+
+    /// Track a request leaving the admission queue (admitted, rejected, or cancelled).
+    pub fn record_admission_queue_exited() {
+        gauge!("smg_admission_queue_depth").decrement(1.0);
+    }
+
+    /// Record a request rejected at admission.
+    pub fn record_admission_rejected(reason: &'static str) {
+        counter!(
+            "smg_admission_queue_rejected_total",
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Track acquisition of an admission token.
+    pub fn record_admission_inflight_acquired() {
+        gauge!("smg_admission_inflight").increment(1.0);
+    }
+
+    /// Track release of an admission token.
+    pub fn record_admission_inflight_released() {
+        gauge!("smg_admission_inflight").decrement(1.0);
     }
 
     /// Record one multimodal tensor sent over `path` ("inline"|"shm"|"remote") for `runtime`.
@@ -938,6 +1004,22 @@ impl Metrics {
             "router_type" => router_type
         )
         .increment(1);
+    }
+
+    /// Record one per-request body-path decision with its dominant reason.
+    pub fn record_request_body_path(path: &'static str, reason: &'static str) {
+        counter!(
+            "smg_router_request_body_path_total",
+            "path" => path,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Record request buffers freed at dispatch (retries disabled), sized by
+    /// the serialized upstream body.
+    pub fn record_request_buffers_released_early(bytes: usize) {
+        counter!("smg_router_request_buffers_released_early_bytes_total").increment(bytes as u64);
     }
 
     /// Record upstream backend response.
@@ -1287,6 +1369,23 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Set the count of workers a model currently has vetoed by the absolute
+    /// overload guard. Written only when a worker's flag transitions.
+    pub fn set_workers_overloaded(model_id: &str, count: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_workers_overloaded", "model" => model).set(count as f64);
+    }
+
+    /// Record a request shed because every worker for the model is overloaded.
+    /// `stage` is "selection" or "dispatch".
+    pub fn record_worker_overload_shed(stage: &'static str) {
+        counter!(
+            "smg_worker_overload_shed_total",
+            "stage" => stage
+        )
+        .increment(1);
+    }
+
     /// Record manual policy execution branch for routing decisions
     pub fn record_worker_manual_policy_branch(branch: &'static str) {
         counter!(
@@ -1299,6 +1398,15 @@ impl Metrics {
     /// Set manual policy cache entries count
     pub fn set_manual_policy_cache_entries(count: usize) {
         gauge!("smg_manual_policy_cache_entries").set(count as f64);
+    }
+
+    /// Record which source supplied the sticky routing key for a keyed request
+    pub fn record_routing_key_source(source: &'static str) {
+        counter!(
+            "smg_routing_key_source_total",
+            "source" => source
+        )
+        .increment(1);
     }
 
     /// Set cache-aware string-tree cached characters for a model
@@ -1317,6 +1425,12 @@ impl Metrics {
     pub fn set_cache_tree_tenants(model_id: &str, tree: &'static str, count: usize) {
         let model = intern_model_label(model_id);
         gauge!("smg_cache_tree_tenants", "model" => model, "tree" => tree).set(count as f64);
+    }
+
+    /// Set cache-aware hash-index placement entry count for a model
+    pub fn set_cache_placement_entries(model_id: &str, count: usize) {
+        let model = intern_model_label(model_id);
+        gauge!("smg_cache_placement_entries", "model" => model).set(count as f64);
     }
 
     /// Record consistent hashing policy execution branch for routing decisions

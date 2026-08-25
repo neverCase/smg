@@ -4,6 +4,7 @@ use std::{
 };
 
 use dashmap::DashMap;
+use http::{header::HeaderName, HeaderMap};
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
@@ -14,14 +15,19 @@ use tracing::{debug, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
+    get_healthy_worker_indices,
+    manual::{ExecutionBranch, PinState},
     BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig,
-    ManualPolicy, PolicyFactory, SelectWorkerInfo,
+    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
 };
 use crate::{
-    config::types::{PolicyConfig, RoutingKeyOverrideConfig},
+    config::types::{ManualAssignmentMode, PolicyConfig, RoutingKeyOverrideConfig},
     mesh::adapters::TreeSyncAdapter,
+    observability::metrics::Metrics,
     policies::cache_aware::LoadReceiver,
-    routers::common::header_utils::extract_routing_key,
+    routers::common::header_utils::{
+        extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
+    },
     worker::{KvEventMonitor, Worker},
 };
 
@@ -69,10 +75,43 @@ pub struct PolicyRegistry {
     // DP-rank policy: Supports the selection of dp-rank outside the engine.
     dp_rank_policy: Arc<OnceLock<Arc<dyn DPRankLoadPolicy>>>,
 
-    /// Shared sticky selector for the `X-SMG-Routing-Key` override. `Some` when the
+    /// Shared sticky selector for the routing-key override. `Some` when the
     /// override is enabled; consulted (instead of the configured policy) for keyed
     /// requests via [`PolicyRegistry::select_worker`].
     routing_key_sticky: Option<Arc<ManualPolicy>>,
+
+    /// Ordered routing-key header names, parsed once from
+    /// `routing_key_override.headers`; the first header present with a valid
+    /// value wins.
+    routing_key_headers: Arc<Vec<HeaderName>>,
+}
+
+/// A sticky key with this many of its own requests already in flight on its
+/// pinned worker (router-local, counted per replica) is bypassed and the
+/// request reassigned. Guards one conversation stacking onto its pin; total
+/// worker load is not a respill trigger.
+const STICKY_INFLIGHT_CAP: usize = 2;
+
+/// `conv_t2_r1` -> `conv`: strip one trailing `_r<n>` retry suffix, then one
+/// trailing `_t<n>` turn suffix. A bare retry suffix is stripped too: a retry
+/// shares identity with its original regardless of turn structure.
+fn strip_lineage_suffixes(rid: &str) -> &str {
+    strip_suffix_tag(strip_suffix_tag(rid, 'r'), 't')
+}
+
+fn strip_suffix_tag(s: &str, tag: char) -> &str {
+    let Some((head, tail)) = s.rsplit_once('_') else {
+        return s;
+    };
+    let digits = match tail.strip_prefix(tag) {
+        Some(d) => d,
+        None => return s,
+    };
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        head
+    } else {
+        s
+    }
 }
 
 impl PolicyRegistry {
@@ -95,7 +134,19 @@ impl PolicyRegistry {
                 assignment_mode: routing_key_override.assignment_mode,
             }))
         });
-
+        // ConfigValidator rejects invalid names at startup; skipping here
+        // covers direct construction.
+        let routing_key_headers = routing_key_override
+            .headers
+            .iter()
+            .filter_map(|name| match HeaderName::try_from(name.as_str()) {
+                Ok(parsed) => Some(parsed),
+                Err(_) => {
+                    warn!("Ignoring invalid routing-key header name: {name:?}");
+                    None
+                }
+            })
+            .collect();
         Self {
             model_policies: Arc::new(DashMap::new()),
             model_worker_counts: Arc::new(DashMap::new()),
@@ -109,13 +160,76 @@ impl PolicyRegistry {
             mesh_tree_sync: Arc::new(RwLock::new(None)),
             dp_rank_policy: Arc::new(OnceLock::new()),
             routing_key_sticky,
+            routing_key_headers: Arc::new(routing_key_headers),
         }
     }
 
-    /// Select a worker, applying the `X-SMG-Routing-Key` sticky override when it is
-    /// enabled, the request carries the header, and the configured policy does not
-    /// already honor the key (`manual` / `consistent_hashing`). Otherwise delegates
-    /// to `policy`. `policy.name()` stays the real policy (for metrics).
+    /// Derive the session key from a request id: trailing `_r<n>` retry and
+    /// `_t<n>` turn suffixes are stripped so every turn of a conversation
+    /// shares one key. `None` when the override is disabled, there is no rid,
+    /// or the key exceeds the routing-key byte cap; a rid that is nothing but
+    /// suffix keys as itself.
+    pub fn derive_rid_key<'a>(&self, rid: Option<&'a str>) -> Option<&'a str> {
+        self.routing_key_sticky.as_ref()?;
+        let rid = rid?;
+        let stripped = strip_lineage_suffixes(rid);
+        let key = if stripped.is_empty() { rid } else { stripped };
+        (!key.is_empty() && key.len() <= ROUTING_KEY_HINT_MAX_BYTES).then_some(key)
+    }
+
+    /// Resolve the routing key from the configured header names: the first
+    /// header present with a valid value (non-empty UTF-8 within the byte
+    /// cap) wins.
+    pub fn resolve_routing_key<'a>(&self, headers: Option<&'a HeaderMap>) -> Option<&'a str> {
+        self.routing_key_headers
+            .iter()
+            .find_map(|name| extract_routing_key_hint_named(headers, name))
+    }
+
+    /// A key that is nothing but suffix keys as itself, like the rid path.
+    fn strip_header_key(raw: &str) -> &str {
+        let stripped = strip_lineage_suffixes(raw);
+        if stripped.is_empty() {
+            raw
+        } else {
+            stripped
+        }
+    }
+
+    /// The header-derived sticky key: the resolved routing key,
+    /// lineage-stripped when the override is enabled (matching selection),
+    /// raw otherwise.
+    pub fn sticky_header_key<'a>(&self, headers: Option<&'a HeaderMap>) -> Option<&'a str> {
+        let raw = self.resolve_routing_key(headers)?;
+        Some(if self.routing_key_sticky.is_some() {
+            Self::strip_header_key(raw)
+        } else {
+            raw
+        })
+    }
+
+    /// Resolve the effective sticky key: the rid-derived key wins, the
+    /// configured routing-key headers are the fallback when no rid is
+    /// present. Header keys get the same lineage stripping as rid keys, so a
+    /// proxy forwarding `conv_t2` as a header pins the entry `conv`.
+    fn effective_sticky_key<'a>(
+        &self,
+        info: &SelectWorkerInfo<'a>,
+    ) -> Option<(&'a str, &'static str)> {
+        if let Some(key) = info.rid_key {
+            return Some((key, "rid"));
+        }
+        let raw = info
+            .routing_key
+            .or_else(|| self.resolve_routing_key(info.headers))?;
+        Some((Self::strip_header_key(raw), "header"))
+    }
+
+    /// Select a worker, applying the sticky routing-key override when it is
+    /// enabled, the request carries a key from the configured source, and the
+    /// configured policy does not already honor the key (`manual` /
+    /// `consistent_hashing`). Otherwise delegates to `policy`. `policy.name()`
+    /// stays the real policy (for metrics).
     pub fn select_worker(
         &self,
         policy: &Arc<dyn LoadBalancingPolicy>,
@@ -123,16 +237,103 @@ impl PolicyRegistry {
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
         if let Some(sticky) = self.routing_key_sticky.as_ref() {
-            if Self::routing_key_override_applies(policy.name())
-                && extract_routing_key(info.headers).is_some()
-            {
-                return sticky.select_worker(workers, info);
+            if Self::routing_key_override_applies(policy.name()) {
+                if let Some((key, source)) = self.effective_sticky_key(info) {
+                    return Self::select_sticky(sticky, policy, workers, info, key, source);
+                }
             }
         }
         policy.select_worker(workers, info)
     }
 
-    /// Policies that already honor `X-SMG-Routing-Key` keep their own handling; all
+    /// Keyed selection: honor an existing pin under the in-flight cap;
+    /// otherwise assign — via the underlying policy in `delegate` mode, via
+    /// the sticky map's own assignment mode otherwise — and pin the result.
+    fn select_sticky(
+        sticky: &Arc<ManualPolicy>,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        key: &str,
+        source: &'static str,
+    ) -> Option<usize> {
+        Metrics::record_routing_key_source(source);
+
+        // Keyed-load guards track the un-namespaced key on each worker.
+        let load_key = key;
+
+        // PD legs namespace so prefill and decode stick independently.
+        let namespaced;
+        let key = if info.leg == WorkerLeg::Single {
+            key
+        } else {
+            namespaced = format!("{}{}", info.leg.routing_id_prefix(), key);
+            &namespaced
+        };
+
+        let over_cap =
+            |idx: usize| workers[idx].routing_key_inflight(load_key) >= STICKY_INFLIGHT_CAP;
+        let finish = |result: Option<usize>, branch: ExecutionBranch| {
+            Metrics::record_worker_manual_policy_branch(branch.as_str());
+            Metrics::set_manual_policy_cache_entries(sticky.map_len());
+            debug!(
+                source,
+                key,
+                branch = branch.as_str(),
+                worker = result.map_or("none", |idx| workers[idx].url()),
+                model_id = result.map_or("none", |idx| workers[idx].model_id()),
+                "Sticky routing decision"
+            );
+            result
+        };
+
+        let healthy = get_healthy_worker_indices(workers);
+        if healthy.is_empty() {
+            return finish(None, ExecutionBranch::NoHealthyWorkers);
+        }
+        let delegate = sticky.assignment_mode() == ManualAssignmentMode::Delegate;
+
+        let pin = sticky.peek_pin(workers, key, &healthy);
+        if let PinState::Pinned(idx) = pin {
+            if !over_cap(idx) {
+                return finish(Some(idx), ExecutionBranch::OccupiedHit);
+            }
+            // Over the cap: reassign, but re-pin only on a strict improvement.
+            // Re-picking the pinned worker (a prefix-affine policy often will)
+            // or another saturated worker keeps the pin, so fleet-wide
+            // pressure cannot random-walk it off the prefix owner.
+            let new_idx = if delegate {
+                match policy.select_worker(workers, info) {
+                    Some(idx) => idx,
+                    None => return finish(None, ExecutionBranch::CapRespill),
+                }
+            } else {
+                sticky.assign_index(workers, &healthy)
+            };
+            if new_idx != idx && !over_cap(new_idx) {
+                sticky.pin_front(key, workers[new_idx].url());
+            }
+            return finish(Some(new_idx), ExecutionBranch::CapRespill);
+        }
+
+        if delegate {
+            let branch = match pin {
+                PinState::Stale => ExecutionBranch::OccupiedMiss,
+                _ => ExecutionBranch::Vacant,
+            };
+            let idx = match policy.select_worker(workers, info) {
+                Some(idx) => idx,
+                None => return finish(None, branch),
+            };
+            sticky.pin_front(key, workers[idx].url());
+            return finish(Some(idx), branch);
+        }
+
+        let (idx, branch) = sticky.assign_pin(workers, key, &healthy);
+        finish(Some(idx), branch)
+    }
+
+    /// Policies that already honor the routing key keep their own handling; all
     /// others (cache_aware, least_load, prefix_hash, ...) get the sticky override.
     fn routing_key_override_applies(name: &str) -> bool {
         !matches!(name, "manual" | "consistent_hashing")
@@ -510,6 +711,32 @@ impl PolicyRegistry {
             .unwrap_or_else(|| PolicyFactory::create_from_config(&PolicyConfig::ConsistentHashing))
     }
 
+    /// Whether any registered policy (default or per-model) routes on
+    /// request text this request cannot supply. Content-blind dispatch must
+    /// stay buffered when one does: the model inside the unread body could
+    /// select that policy. A routing hint lifts the requirement — with a
+    /// valid `x-smg-routing-tokens` the buffered path never extracts text
+    /// either (the hint wins over body-derived routing), and a valid
+    /// routing-key header under the sticky override supersedes the policy
+    /// before it reads text. Hints are validated by the same extractors
+    /// selection uses, so malformed or over-cap values lift nothing.
+    pub fn any_policy_needs_request_text(&self, headers: Option<&HeaderMap>) -> bool {
+        if parse_routing_tokens_hint(headers).is_some() {
+            return false;
+        }
+        let keyed_override =
+            self.routing_key_sticky.is_some() && self.resolve_routing_key(headers).is_some();
+        let needs_text = |policy: &Arc<dyn LoadBalancingPolicy>| {
+            policy.needs_request_text()
+                && !(keyed_override && Self::routing_key_override_applies(policy.name()))
+        };
+        needs_text(&self.default_policy)
+            || self
+                .model_policies
+                .iter()
+                .any(|entry| needs_text(entry.value()))
+    }
+
     /// Get all load-aware policies that need periodic load updates (lock-free).
     ///
     /// Membership is policy-reported via
@@ -707,11 +934,12 @@ impl std::fmt::Debug for PolicyRegistry {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::HealthCheckConfig;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::{
         policies::{CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
-        worker::{BasicWorkerBuilder, Worker, WorkerType},
+        worker::{BasicWorkerBuilder, Worker, WorkerLoadGuard, WorkerType},
     };
 
     fn no_health_check() -> HealthCheckConfig {
@@ -737,8 +965,8 @@ mod tests {
         }))
     }
 
-    fn headers_with_key(key: &str) -> http::HeaderMap {
-        let mut h = http::HeaderMap::new();
+    fn headers_with_key(key: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
         h.insert("x-smg-routing-key", key.parse().unwrap());
         h
     }
@@ -803,6 +1031,77 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    fn cache_aware_config() -> PolicyConfig {
+        PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 0,
+            max_tree_size: 4096,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+            overlap_decay: 0.0,
+            selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
+        }
+    }
+
+    fn headers_with_tokens(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-smg-routing-tokens", value.parse().unwrap());
+        h
+    }
+
+    fn enabled_override() -> RoutingKeyOverrideConfig {
+        RoutingKeyOverrideConfig {
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn request_text_scan_is_false_for_text_free_policies() {
+        let reg = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        assert!(!reg.any_policy_needs_request_text(None));
+        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_key("k"))));
+    }
+
+    #[test]
+    fn tokens_hint_lifts_text_requirement_only_when_valid() {
+        let reg = PolicyRegistry::new(cache_aware_config());
+        assert!(reg.any_policy_needs_request_text(None));
+        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_tokens("1,2,3"))));
+        // Malformed and over-cap hints are ignored, exactly like selection.
+        assert!(reg.any_policy_needs_request_text(Some(&headers_with_tokens("1,,3"))));
+        let over_cap = vec!["7"; 513].join(",");
+        assert!(reg.any_policy_needs_request_text(Some(&headers_with_tokens(&over_cap))));
+    }
+
+    #[test]
+    fn key_hint_lifts_text_requirement_only_under_enabled_override() {
+        let without = PolicyRegistry::new(cache_aware_config());
+        assert!(without.any_policy_needs_request_text(Some(&headers_with_key("session-A"))));
+
+        let with = PolicyRegistry::with_override(cache_aware_config(), enabled_override());
+        assert!(with.any_policy_needs_request_text(None));
+        assert!(!with.any_policy_needs_request_text(Some(&headers_with_key("session-A"))));
+        let over_cap = "k".repeat(129);
+        assert!(with.any_policy_needs_request_text(Some(&headers_with_key(&over_cap))));
+    }
+
+    #[test]
+    fn per_model_text_policy_scanned_with_the_same_hint_rules() {
+        let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
+        assert!(!reg.any_policy_needs_request_text(None));
+        reg.on_worker_added("llama-3", Some("cache_aware"));
+        assert!(reg.any_policy_needs_request_text(None));
+        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_tokens("1,2,3"))));
+        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_key("session-A"))));
+    }
+
     #[test]
     fn override_disabled_ignores_key() {
         let reg = PolicyRegistry::new(PolicyConfig::RoundRobin); // override off
@@ -820,6 +1119,607 @@ mod tests {
         let a = reg.select_worker(&policy, &workers, &info).unwrap();
         let b = reg.select_worker(&policy, &workers, &info).unwrap();
         assert_ne!(a, b);
+    }
+
+    fn override_with_headers(names: &[&str]) -> RoutingKeyOverrideConfig {
+        RoutingKeyOverrideConfig {
+            enabled: true,
+            headers: names.iter().map(|n| n.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn headers_with(name: &str, key: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(HeaderName::try_from(name).unwrap(), key.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn resolve_routing_key_first_present_and_valid_wins() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            override_with_headers(&["x-routing-key", "x-smg-routing-key"]),
+        );
+
+        let mut both = headers_with("x-routing-key", "primary");
+        both.insert("x-smg-routing-key", "legacy".parse().unwrap());
+        assert_eq!(reg.resolve_routing_key(Some(&both)), Some("primary"));
+
+        let legacy_only = headers_with_key("legacy");
+        assert_eq!(reg.resolve_routing_key(Some(&legacy_only)), Some("legacy"));
+
+        // An invalid value under the first name falls through to the next.
+        let mut over_cap_first = headers_with("x-routing-key", &"k".repeat(129));
+        over_cap_first.insert("x-smg-routing-key", "legacy".parse().unwrap());
+        assert_eq!(
+            reg.resolve_routing_key(Some(&over_cap_first)),
+            Some("legacy")
+        );
+
+        assert_eq!(reg.resolve_routing_key(None), None);
+    }
+
+    #[test]
+    fn default_headers_ignore_unconfigured_names() {
+        let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
+        assert_eq!(
+            reg.resolve_routing_key(Some(&headers_with("x-routing-key", "primary"))),
+            None
+        );
+        assert_eq!(
+            reg.resolve_routing_key(Some(&headers_with_key("legacy"))),
+            Some("legacy")
+        );
+    }
+
+    #[test]
+    fn invalid_configured_header_names_are_skipped() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            override_with_headers(&["not a header", "x-routing-key"]),
+        );
+        assert_eq!(
+            reg.resolve_routing_key(Some(&headers_with("x-routing-key", "primary"))),
+            Some("primary")
+        );
+    }
+
+    #[test]
+    fn header_keys_share_rid_lineage_stripping() {
+        let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
+        assert_eq!(
+            reg.sticky_header_key(Some(&headers_with_key("conv_t2"))),
+            Some("conv")
+        );
+        assert_eq!(
+            reg.sticky_header_key(Some(&headers_with_key("conv_t2_r1"))),
+            Some("conv")
+        );
+        // A key that is nothing but suffix keys as itself.
+        assert_eq!(
+            reg.sticky_header_key(Some(&headers_with_key("_t1"))),
+            Some("_t1")
+        );
+
+        // Override disabled: raw key, no stripping.
+        let disabled = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        assert_eq!(
+            disabled.sticky_header_key(Some(&headers_with_key("conv_t2"))),
+            Some("conv_t2")
+        );
+    }
+
+    #[test]
+    fn header_turns_pin_the_same_sticky_entry() {
+        let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+            worker("http://w3", WorkerType::Regular),
+        ];
+        let t1 = headers_with_key("conv_t1");
+        let info_t1 = SelectWorkerInfo {
+            headers: Some(&t1),
+            ..Default::default()
+        };
+        let first = reg.select_worker(&policy, &workers, &info_t1).unwrap();
+        let t2 = headers_with_key("conv_t2");
+        let info_t2 = SelectWorkerInfo {
+            headers: Some(&t2),
+            ..Default::default()
+        };
+        for _ in 0..5 {
+            assert_eq!(reg.select_worker(&policy, &workers, &info_t2), Some(first));
+        }
+    }
+
+    #[test]
+    fn alternate_header_routes_stickily() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            override_with_headers(&["x-routing-key", "x-smg-routing-key"]),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+            worker("http://w3", WorkerType::Regular),
+        ];
+        let headers = headers_with("x-routing-key", "session-A");
+        let info = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+        let first = reg.select_worker(&policy, &workers, &info).unwrap();
+        for _ in 0..5 {
+            assert_eq!(reg.select_worker(&policy, &workers, &info), Some(first));
+        }
+    }
+
+    #[test]
+    fn alternate_header_lifts_text_gate() {
+        let reg = PolicyRegistry::with_override(
+            cache_aware_config(),
+            override_with_headers(&["x-routing-key", "x-smg-routing-key"]),
+        );
+        assert!(
+            !reg.any_policy_needs_request_text(Some(&headers_with("x-routing-key", "session-A")))
+        );
+        // A name outside the configured list lifts nothing.
+        assert!(reg.any_policy_needs_request_text(Some(&headers_with("x-other-key", "session-A"))));
+    }
+
+    fn rid_override(assignment_mode: ManualAssignmentMode) -> RoutingKeyOverrideConfig {
+        RoutingKeyOverrideConfig {
+            enabled: true,
+            assignment_mode,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn derive_rid_key_strips_turn_and_retry_suffixes() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        assert_eq!(reg.derive_rid_key(Some("conv123_t1")), Some("conv123"));
+        assert_eq!(reg.derive_rid_key(Some("conv123_t12")), Some("conv123"));
+        assert_eq!(reg.derive_rid_key(Some("conv123_t2_r1")), Some("conv123"));
+        assert_eq!(reg.derive_rid_key(Some("conv123_r1")), Some("conv123"));
+        assert_eq!(reg.derive_rid_key(Some("conv_t1_t2")), Some("conv_t1"));
+        assert_eq!(
+            reg.derive_rid_key(Some("under_scored_id")),
+            Some("under_scored_id")
+        );
+        assert_eq!(reg.derive_rid_key(Some("no-suffix")), Some("no-suffix"));
+        assert_eq!(reg.derive_rid_key(Some("conv_tx1")), Some("conv_tx1"));
+        assert_eq!(reg.derive_rid_key(Some("conv_t")), Some("conv_t"));
+        // A rid that is nothing but suffix keys as itself.
+        assert_eq!(reg.derive_rid_key(Some("_t1")), Some("_t1"));
+        assert_eq!(reg.derive_rid_key(None), None);
+        let over_cap = format!("{}_t1", "k".repeat(200));
+        assert_eq!(reg.derive_rid_key(Some(&over_cap)), None);
+
+        // Override disabled: rid never yields a key.
+        let disabled = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        assert_eq!(disabled.derive_rid_key(Some("conv123_t1")), None);
+    }
+
+    #[test]
+    fn rid_key_wins_over_header_and_header_is_fallback() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+
+        // Unique per-request header keys must not fragment the rid pin.
+        let poison_a = headers_with_key("req-aaa");
+        let poison_b = headers_with_key("req-bbb");
+        let first = reg
+            .select_worker(
+                &policy,
+                &workers,
+                &SelectWorkerInfo {
+                    headers: Some(&poison_a),
+                    rid_key: Some("conv42"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        for headers in [&poison_b, &poison_a] {
+            assert_eq!(
+                reg.select_worker(
+                    &policy,
+                    &workers,
+                    &SelectWorkerInfo {
+                        headers: Some(headers),
+                        rid_key: Some("conv42"),
+                        ..Default::default()
+                    },
+                ),
+                Some(first)
+            );
+        }
+
+        // No rid: the header key gets its own stable pin (fallback works).
+        let session = headers_with_key("session-H");
+        let header_info = SelectWorkerInfo {
+            headers: Some(&session),
+            ..Default::default()
+        };
+        let pinned = reg.select_worker(&policy, &workers, &header_info).unwrap();
+        assert_eq!(
+            reg.select_worker(&policy, &workers, &header_info),
+            Some(pinned)
+        );
+    }
+
+    #[test]
+    fn delegate_assignment_routes_via_underlying_policy_then_pins() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 0,
+                max_tree_size: 10000,
+                block_size: 16,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
+            },
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        policy
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .unwrap()
+            .init_workers(&workers);
+
+        let turn1_text = "conversation opening with a long shared instruction block";
+        let seeded = reg
+            .select_worker(
+                &policy,
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some(turn1_text),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // First keyed request delegates to the policy: the tree match must
+        // send it to the seeded worker, not a random pick.
+        let key = reg.derive_rid_key(Some("conv42_t1")).unwrap();
+        let keyed_turn1 = SelectWorkerInfo {
+            request_text: Some(turn1_text),
+            rid_key: Some(key),
+            ..Default::default()
+        };
+        assert_eq!(
+            reg.select_worker(&policy, &workers, &keyed_turn1),
+            Some(seeded)
+        );
+
+        // The follow-up shares no routable text; only the pin can send it
+        // back. The policy alone would pick the other worker (its tie-break
+        // counts prior selections), so equality proves the pin decided.
+        let keyed_turn2 = SelectWorkerInfo {
+            request_text: Some("unrelated follow-up tail"),
+            rid_key: reg.derive_rid_key(Some("conv42_t2")),
+            ..Default::default()
+        };
+        assert_eq!(
+            reg.select_worker(&policy, &workers, &keyed_turn2),
+            Some(seeded)
+        );
+    }
+
+    #[test]
+    #[traced_test]
+    fn sticky_selection_emits_decision_line_per_request() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo {
+            rid_key: Some("conv1"),
+            ..Default::default()
+        };
+        reg.select_worker(&policy, &workers, &info).unwrap();
+        assert!(logs_contain("Sticky routing decision"));
+        assert!(logs_contain("vacant"));
+        reg.select_worker(&policy, &workers, &info).unwrap();
+        assert!(logs_contain("occupied_hit"));
+    }
+
+    /// An overloaded pin must respill through the existing reassignment path.
+    ///
+    /// Every router hands `select_worker` a slice already filtered by
+    /// `is_available()`, so a vetoed worker is simply absent from the
+    /// candidates — the pin resolves to nothing and takes the same
+    /// `occupied_miss` respill a stale pin takes. The test mirrors that call
+    /// shape rather than passing a raw pool no router builds.
+    #[test]
+    #[traced_test]
+    fn overloaded_sticky_pin_respills_through_the_stale_path() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let fleet = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let available = |fleet: &[Arc<dyn Worker>]| -> Vec<Arc<dyn Worker>> {
+            fleet.iter().filter(|w| w.is_available()).cloned().collect()
+        };
+        let info = SelectWorkerInfo {
+            rid_key: Some("convOverload"),
+            ..Default::default()
+        };
+
+        let workers = available(&fleet);
+        let pinned_url = {
+            let idx = reg.select_worker(&policy, &workers, &info).unwrap();
+            assert_eq!(
+                reg.select_worker(&policy, &workers, &info),
+                Some(idx),
+                "the pin holds while the worker is eligible"
+            );
+            workers[idx].url().to_string()
+        };
+
+        fleet
+            .iter()
+            .find(|w| w.url() == pinned_url)
+            .unwrap()
+            .set_overloaded(true);
+        let workers = available(&fleet);
+        assert_eq!(workers.len(), 1, "the veto removes the pinned worker");
+        let respilled = reg.select_worker(&policy, &workers, &info).unwrap();
+        assert_ne!(
+            workers[respilled].url(),
+            pinned_url,
+            "an overloaded pin must be abandoned"
+        );
+        assert!(logs_contain("occupied_miss"));
+
+        // Recovery re-admits the worker as a candidate; the pin now follows the
+        // respill target, so only eligibility is asserted here.
+        fleet
+            .iter()
+            .find(|w| w.url() == pinned_url)
+            .unwrap()
+            .set_overloaded(false);
+        let workers = available(&fleet);
+        assert!(reg.select_worker(&policy, &workers, &info).is_some());
+    }
+
+    /// Every worker vetoed leaves the sticky selector with nothing to pin.
+    #[test]
+    #[traced_test]
+    fn all_overloaded_leaves_sticky_selection_empty() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        for w in &workers {
+            w.set_overloaded(true);
+        }
+        let info = SelectWorkerInfo {
+            rid_key: Some("convShed"),
+            ..Default::default()
+        };
+
+        assert_eq!(reg.select_worker(&policy, &workers, &info), None);
+        assert!(logs_contain("no_healthy_workers"));
+    }
+
+    #[test]
+    fn cap_respill_reassigns_and_pin_follows_strict_improvement() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo {
+            rid_key: Some("convA"),
+            ..Default::default()
+        };
+
+        let pinned = reg.select_worker(&policy, &workers, &info).unwrap();
+        assert_eq!(reg.select_worker(&policy, &workers, &info), Some(pinned));
+
+        // At the cap (2 of this key in flight on its pin) the key reassigns
+        // to the idle worker and the pin follows it, even after the original
+        // drains.
+        let guards = [
+            WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convA")),
+            WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convA")),
+        ];
+        let respilled = reg.select_worker(&policy, &workers, &info).unwrap();
+        assert_ne!(respilled, pinned);
+        drop(guards);
+        assert_eq!(reg.select_worker(&policy, &workers, &info), Some(respilled));
+    }
+
+    #[test]
+    fn cap_respill_keeps_pin_when_no_strictly_better_pick() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo {
+            rid_key: Some("convB"),
+            ..Default::default()
+        };
+
+        let pinned = reg.select_worker(&policy, &workers, &info).unwrap();
+        // Saturate BOTH workers with this key: the reassignment cannot
+        // strictly improve (every pick is at the key cap), so the request
+        // dispatches wherever the policy says but the pin must survive.
+        let mut guards = Vec::new();
+        for w in &workers {
+            guards.push(WorkerLoadGuard::with_key(w.clone(), Some("convB")));
+            guards.push(WorkerLoadGuard::with_key(w.clone(), Some("convB")));
+        }
+        for _ in 0..4 {
+            reg.select_worker(&policy, &workers, &info).unwrap();
+        }
+        drop(guards);
+        assert_eq!(
+            reg.select_worker(&policy, &workers, &info),
+            Some(pinned),
+            "pin must not move to an equally saturated worker"
+        );
+    }
+
+    #[test]
+    fn cap_respill_under_legacy_assignment() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::MinLoad),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo {
+            rid_key: Some("convC"),
+            ..Default::default()
+        };
+
+        let pinned = reg.select_worker(&policy, &workers, &info).unwrap();
+        let guards = [
+            WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convC")),
+            WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convC")),
+        ];
+        let respilled = reg.select_worker(&policy, &workers, &info).unwrap();
+        assert_ne!(respilled, pinned);
+        drop(guards);
+        assert_eq!(reg.select_worker(&policy, &workers, &info), Some(respilled));
+    }
+
+    #[test]
+    #[traced_test]
+    fn busy_worker_does_not_respill_idle_key() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo {
+            rid_key: Some("convD"),
+            ..Default::default()
+        };
+
+        let pinned = reg.select_worker(&policy, &workers, &info).unwrap();
+        // Unrelated traffic on the pin, total load far past the cap: the
+        // returning key has nothing in flight and must keep its pin.
+        let _unrelated = [
+            WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convZ")),
+            WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convZ")),
+            WorkerLoadGuard::new(workers[pinned].clone(), None),
+            WorkerLoadGuard::new(workers[pinned].clone(), None),
+        ];
+        assert_eq!(reg.select_worker(&policy, &workers, &info), Some(pinned));
+        assert!(logs_contain("occupied_hit"));
+        assert!(!logs_contain("cap_respill"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn two_inflight_same_key_respill_the_third() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers = vec![
+            worker("http://w1", WorkerType::Regular),
+            worker("http://w2", WorkerType::Regular),
+        ];
+        let info = SelectWorkerInfo {
+            rid_key: Some("convE"),
+            ..Default::default()
+        };
+
+        let pinned = reg.select_worker(&policy, &workers, &info).unwrap();
+        let _g1 = WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convE"));
+        let _g2 = WorkerLoadGuard::with_key(workers[pinned].clone(), Some("convE"));
+        assert_ne!(reg.select_worker(&policy, &workers, &info), Some(pinned));
+        assert!(logs_contain("cap_respill"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn cap_lifts_when_key_inflight_drains() {
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        // Single worker: the respill has nowhere to go, so the branch flips
+        // purely on the key's in-flight count.
+        let workers = vec![worker("http://w1", WorkerType::Regular)];
+        let info = SelectWorkerInfo {
+            rid_key: Some("convF"),
+            ..Default::default()
+        };
+
+        assert_eq!(reg.select_worker(&policy, &workers, &info), Some(0));
+        let guards = [
+            WorkerLoadGuard::with_key(workers[0].clone(), Some("convF")),
+            WorkerLoadGuard::with_key(workers[0].clone(), Some("convF")),
+        ];
+        assert_eq!(reg.select_worker(&policy, &workers, &info), Some(0));
+        assert!(logs_contain("cap_respill"));
+        drop(guards);
+        assert_eq!(reg.select_worker(&policy, &workers, &info), Some(0));
+        assert!(logs_contain("occupied_hit"));
     }
 
     #[test]
@@ -897,6 +1797,9 @@ mod tests {
                 overload_token_usage_threshold,
                 overlap_decay,
                 selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
             }
         }
 
@@ -943,6 +1846,9 @@ mod tests {
             overload_token_usage_threshold: 0.8,
             overlap_decay: 0.0,
             selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         });
 
         // Hinted policy is a fresh per-model instance, not the shared default.
@@ -1012,6 +1918,9 @@ mod tests {
             overload_token_usage_threshold: 1.0,
             overlap_decay: 0.0,
             selection_temperature: 0.0,
+            cache_index: Default::default(),
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         }));
 
         for round in 0..64 {

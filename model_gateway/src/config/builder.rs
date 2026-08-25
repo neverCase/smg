@@ -4,10 +4,10 @@ use openai_protocol::worker::TransportMode;
 use smg_mcp::McpConfig;
 
 use super::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
-    RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry,
-    TokenizerCacheConfig, TraceConfig,
+    CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
+    HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig,
+    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
 
@@ -107,6 +107,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn cache_boundaries(mut self, boundaries: Vec<usize>) -> Self {
+        self.config.cache_boundaries = boundaries;
+        self
+    }
+
     pub fn random_policy(mut self) -> Self {
         self.config.policy = PolicyConfig::Random;
         self
@@ -136,6 +141,9 @@ impl RouterConfigBuilder {
             overload_token_usage_threshold: 1.0,
             overlap_decay: 0.0,
             selection_temperature: 0.0,
+            cache_index: CacheIndexKind::Tree,
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         };
         self
     }
@@ -205,6 +213,16 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn max_buffered_request_bytes(mut self, bytes: u64) -> Self {
+        self.config.max_buffered_request_bytes = bytes;
+        self
+    }
+
+    pub fn stream_body_stall_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.stream_body_stall_timeout_secs = secs;
+        self
+    }
+
     pub fn upstream_pool_idle_timeout_secs(mut self, secs: u64) -> Self {
         self.config.upstream_pool_idle_timeout_secs = secs;
         self
@@ -230,8 +248,38 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn job_queue_capacity(mut self, capacity: usize) -> Self {
+        self.config.job_queue_capacity = capacity;
+        self
+    }
+
+    pub fn job_queue_concurrency(mut self, concurrency: usize) -> Self {
+        self.config.job_queue_concurrency = concurrency;
+        self
+    }
+
     pub fn load_monitor_interval_secs(mut self, interval: u64) -> Self {
         self.config.load_monitor_interval_secs = interval;
+        self
+    }
+
+    pub fn disable_load_monitoring(mut self, disabled: bool) -> Self {
+        self.config.disable_load_monitoring = disabled;
+        self
+    }
+
+    pub fn worker_overload_protection(mut self, enabled: bool) -> Self {
+        self.config.worker_overload_protection = enabled;
+        self
+    }
+
+    pub fn worker_overload_waiting_requests(mut self, threshold: Option<usize>) -> Self {
+        self.config.worker_overload_waiting_requests = threshold;
+        self
+    }
+
+    pub fn worker_overload_token_usage(mut self, threshold: Option<f64>) -> Self {
+        self.config.worker_overload_token_usage = threshold;
         self
     }
 

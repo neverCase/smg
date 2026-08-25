@@ -31,15 +31,26 @@
     When the system is imbalanced, routes to the least busy worker regardless
     of cache affinity.
 
+    Hash Index Under-Layer (cache_index = hash)
+    -------------------------------------------
+    Replaces all three tree modes with a TTL'd exact-match placement map
+    keyed on request heads at the cache_boundaries token positions; the
+    radix trees are neither consulted nor populated. Selection probes
+    boundaries deepest-first for a live holder and records the dispatched
+    worker at every applicable boundary.
+
     Configuration Parameters:
     ------------------------
     cache_threshold:         Min prefix match ratio for highest-match routing (0.0-1.0)
     balance_abs_threshold:   Absolute load diff threshold for imbalance detection
     balance_rel_threshold:   Relative load ratio threshold for imbalance detection
-    eviction_interval_secs:  Interval between LRU eviction cycles
+    eviction_interval_secs:  Interval between LRU eviction / TTL sweep cycles
     max_tree_size:           Max total size (chars/tokens) of each model's approximate tree,
                              shared across all workers; enforced by eviction
     block_size:              Backend KV cache block size for event-driven routing
+    cache_index:             Under-layer: tree (radix trees) or hash (placement map)
+    cache_ttl_secs:          Seconds a hash-index placement stays routable
+    cache_boundaries:        Ascending token positions for hash-index keying
 */
 
 use std::{
@@ -48,6 +59,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 use dashmap::DashMap;
@@ -64,6 +76,7 @@ use super::{
     SelectWorkerInfo,
 };
 use crate::{
+    config::CacheIndexKind,
     mesh::adapters::tree_sync::{RepairEntry, TreeDelta, TreeRepairPage, TreeSyncAdapter},
     observability::metrics::Metrics,
     worker::{KvEventMonitor, Worker},
@@ -133,6 +146,32 @@ pub struct CacheAwarePolicy {
     /// a still-in-flight delta with no local resolution; peers that
     /// repair against us will simply see the gap the next tick.
     mesh_tree_sync: RwLock<Option<Arc<TreeSyncAdapter>>>,
+    /// Hash-mode placement index (`cache_index = hash`): model →
+    /// (boundary, head hash) → live holders. Empty in tree mode.
+    /// Inner maps are Arc'd and model entries are never removed, so a
+    /// cloned inner handle stays canonical and walking it never holds
+    /// an outer-shard guard.
+    placement_index: Arc<DashMap<String, Arc<PlacementMap>>>,
+}
+
+/// Hash-mode per-model placement map: (boundary position, xxh3 of the token
+/// head up to that boundary) → workers recently routed that exact head.
+type PlacementMap = DashMap<(usize, u64), Vec<PlacementHolder>>;
+
+/// One worker's most recent dispatch of a head; live while `last_touch`
+/// is within `cache_ttl_secs`.
+#[derive(Debug, Clone)]
+struct PlacementHolder {
+    worker_url: String,
+    last_touch: Instant,
+}
+
+/// Max workers remembered per (boundary, head) key; recording a fourth
+/// evicts the stalest.
+const PLACEMENT_HOLDER_CAP: usize = 3;
+
+fn hash_token_head(head: &[u32]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(bytemuck::cast_slice(head))
 }
 
 /// Per-model inner container for [`CacheAwarePolicy::hash_index`].
@@ -166,13 +205,27 @@ impl CacheAwarePolicy {
         Self::with_config(CacheAwareConfig::default())
     }
 
-    pub fn with_config(config: CacheAwareConfig) -> Self {
+    pub fn with_config(mut config: CacheAwareConfig) -> Self {
+        // Deepest-first probing assumes sorted, deduped, non-zero boundaries.
+        config.cache_boundaries.retain(|&p| p > 0);
+        config.cache_boundaries.sort_unstable();
+        config.cache_boundaries.dedup();
+
         let string_trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
         let token_trees = Arc::new(DashMap::<String, Arc<TokenTree>>::new());
         let hash_index = Arc::new(DashMap::<String, PerModelHashIndex>::new());
+        let placement_index = Arc::new(DashMap::<String, Arc<PlacementMap>>::new());
 
         // Start background eviction thread if configured
-        let eviction_task = if config.eviction_interval_secs > 0 {
+        let eviction_task = if config.cache_index == CacheIndexKind::Hash {
+            (config.eviction_interval_secs > 0).then(|| {
+                let placement_clone = Arc::clone(&placement_index);
+                let ttl = Duration::from_secs(config.cache_ttl_secs);
+                PeriodicTask::spawn(config.eviction_interval_secs, "PlacementSweep", move || {
+                    Self::sweep_placement_index(&placement_clone, ttl, Instant::now());
+                })
+            })
+        } else if config.eviction_interval_secs > 0 {
             let string_trees_clone = Arc::clone(&string_trees);
             let token_trees_clone = Arc::clone(&token_trees);
             let hash_index_clone = Arc::clone(&hash_index);
@@ -273,6 +326,7 @@ impl CacheAwarePolicy {
             hash_index,
             populate_hash_index: AtomicBool::new(false),
             mesh_tree_sync: RwLock::new(None),
+            placement_index,
         }
     }
 
@@ -480,6 +534,10 @@ impl CacheAwarePolicy {
     /// Initialize the trees with worker URLs (used only during initial setup)
     /// Initializes both string trees (HTTP) and token trees (gRPC) for each model.
     pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
+        // Hash mode keeps no tree state.
+        if self.config.cache_index == CacheIndexKind::Hash {
+            return;
+        }
         // Group workers by model
         let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
         for worker in workers {
@@ -512,6 +570,9 @@ impl CacheAwarePolicy {
 
     /// Add a single worker to the trees (incremental update)
     pub fn add_worker(&self, worker: &dyn Worker) {
+        if self.config.cache_index == CacheIndexKind::Hash {
+            return;
+        }
         let tree_key = normalize_model_key(worker.model_id()).to_string();
         // Add to string tree (HTTP)
         let string_tree = self
@@ -529,6 +590,9 @@ impl CacheAwarePolicy {
 
     /// Add a worker by URL and model (for backward compatibility)
     pub fn add_worker_by_url(&self, url: &str, model_id: &str) {
+        if self.config.cache_index == CacheIndexKind::Hash {
+            return;
+        }
         let model_id_string = model_id.to_string();
         // Add to string tree (HTTP)
         let string_tree = self
@@ -559,6 +623,17 @@ impl CacheAwarePolicy {
         }
         for tree_ref in self.token_trees.iter() {
             tree_ref.value().remove_tenant_all(&tenant);
+        }
+        let placement_maps: Vec<Arc<PlacementMap>> = self
+            .placement_index
+            .iter()
+            .map(|model| Arc::clone(model.value()))
+            .collect();
+        for placements in placement_maps {
+            placements.retain(|_, holders| {
+                holders.retain(|h| h.worker_url != url);
+                !holders.is_empty()
+            });
         }
     }
 
@@ -615,13 +690,6 @@ impl CacheAwarePolicy {
         min_load_idx: Option<usize>,
         model_id: &str,
     ) -> Option<usize> {
-        // Log load balancing trigger (only compute worker loads if debug enabled)
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let worker_loads: Vec<(&str, usize)> =
-                workers.iter().map(|w| (w.url(), w.load())).collect();
-            debug!("Load balancing triggered | workers: {:?}", worker_loads);
-        }
-
         // Shortest queue when imbalanced. The min-load index is gathered upstream
         // in select_worker with the (load, processed_requests, idx) tie-break
         // from #1714 (spreads load when decode outpaces prefill).
@@ -696,6 +764,12 @@ impl CacheAwarePolicy {
         // Increment processed counter
         workers[min_load_idx].increment_processed();
 
+        debug!(
+            branch = "kv_pressure_min_load",
+            worker = worker_url,
+            model_id,
+            "Cache-aware selection"
+        );
         Some(min_load_idx)
     }
 }
@@ -929,10 +1003,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let request_tokens = info.tokens;
 
         // Single O(workers) gather: read each worker once via routing_state()
-        // (status + load + processed under one ArcSwap guard), replacing the
-        // former separate passes whose per-worker guard traffic dominated routing
-        // CPU at scale. Collects healthy indices, the load sum (for the
-        // per-request pressure gate), and the min-load index.
+        // (status + load + processed + overload veto under one ArcSwap guard),
+        // replacing the former separate passes whose per-worker guard traffic
+        // dominated routing CPU at scale. Collects eligible indices, the load
+        // sum (for the per-request pressure gate), and the min-load index.
         let mut healthy_indices: Vec<usize> = Vec::with_capacity(workers.len());
         let mut load_sum = 0usize;
         // Min-load worker, (load, processed_requests, idx) tie-break (#1714);
@@ -941,7 +1015,9 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let mut min_load_idx: Option<usize> = None;
         for (idx, worker) in workers.iter().enumerate() {
             let state = worker.routing_state();
-            if state.healthy && state.can_execute {
+            // The overload veto costs nothing here: `state` is the word this
+            // pass already loaded for health, circuit breaker and load.
+            if state.eligible() {
                 healthy_indices.push(idx);
                 load_sum += state.load;
                 let key = (state.load, state.processed, idx);
@@ -963,6 +1039,19 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
+
+        // Hash mode: TTL'd exact-match placement index; the radix trees are
+        // neither consulted nor populated.
+        if self.config.cache_index == CacheIndexKind::Hash {
+            return self.select_worker_hash(
+                workers,
+                info,
+                &healthy_indices,
+                min_load_idx,
+                avg_load,
+                model_id,
+            );
+        }
 
         // Abandon cache affinity fleet-wide only under backend KV pressure;
         // request-count pressure is applied per request to the selected
@@ -1381,6 +1470,279 @@ impl CacheAwarePolicy {
         candidates.last().map(|c| c.idx)
     }
 
+    /// One decision line per tree-routed request. `selected_url == None`
+    /// means the caller fell back to `fallback_url` (first healthy).
+    fn log_tree_decision(
+        &self,
+        selected_url: Option<&str>,
+        fallback_url: Option<&str>,
+        matched_units: usize,
+        input_units: usize,
+        matched_tenants: &[TenantId],
+        model_id: &str,
+    ) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let matched_ratio = if input_units == 0 {
+            0.0
+        } else {
+            matched_units as f32 / input_units as f32
+        };
+        let branch = match selected_url {
+            None => "first_healthy_fallback",
+            Some(_) if matched_ratio <= self.config.cache_threshold => "min_load_fallback",
+            Some(url) => {
+                if matched_tenants.iter().any(|tenant| tenant.as_ref() == url) {
+                    "tree_match"
+                } else {
+                    "spill"
+                }
+            }
+        };
+        debug!(
+            index = "tree",
+            branch,
+            worker = selected_url.or(fallback_url).unwrap_or("none"),
+            model_id,
+            matched_ratio = f64::from(matched_ratio),
+            threshold = f64::from(self.config.cache_threshold),
+            "Cache-aware selection"
+        );
+    }
+
+    /// One decision line per hash-mode selection. `level` is the matched
+    /// boundary (0 for the fallback branches).
+    fn log_hash_decision(branch: &'static str, level: usize, worker: &str, model_id: &str) {
+        debug!(
+            index = "hash",
+            branch, level, worker, model_id, "Cache-aware selection"
+        );
+    }
+
+    /// Hash-mode selection: probe the placement index deepest-boundary-first
+    /// for a live holder of this request's head, then record the dispatch at
+    /// every applicable boundary.
+    fn select_worker_hash(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        healthy_indices: &[usize],
+        min_load_idx: Option<usize>,
+        avg_load: f64,
+        model_id: &str,
+    ) -> Option<usize> {
+        let now = Instant::now();
+
+        // Hash mode keys on token ids; untokenized requests stay load-balanced.
+        let Some(tokens) = info.tokens.filter(|t| !t.is_empty()) else {
+            return self.hash_min_load(
+                workers,
+                min_load_idx,
+                model_id,
+                "min_load_fallback",
+                &[],
+                &[],
+                now,
+            );
+        };
+
+        let applicable_end = self
+            .config
+            .cache_boundaries
+            .partition_point(|&p| p <= tokens.len());
+        let applicable = &self.config.cache_boundaries[..applicable_end];
+
+        // Head-only traffic must stay load-balanced.
+        if applicable.is_empty() {
+            return self.hash_min_load(
+                workers,
+                min_load_idx,
+                model_id,
+                "short_request",
+                tokens,
+                applicable,
+                now,
+            );
+        }
+
+        if self.is_kv_imbalanced(workers, healthy_indices) {
+            return self.hash_min_load(
+                workers,
+                min_load_idx,
+                model_id,
+                "kv_pressure_min_load",
+                tokens,
+                applicable,
+                now,
+            );
+        }
+
+        let url_to_idx = Self::healthy_url_index(workers, healthy_indices);
+        for &boundary in applicable.iter().rev() {
+            let key = (boundary, hash_token_head(&tokens[..boundary]));
+            let Some(holder_idx) =
+                self.live_holder_min_load(workers, &url_to_idx, model_id, key, now)
+            else {
+                continue;
+            };
+            let selected =
+                self.gate_selected_candidate(workers, holder_idx, avg_load, min_load_idx)?;
+            let branch = if selected == holder_idx {
+                "hash_hit"
+            } else {
+                "hash_spill"
+            };
+            self.record_placement(model_id, tokens, applicable, workers[selected].url(), now);
+            Self::log_hash_decision(branch, boundary, workers[selected].url(), model_id);
+            workers[selected].increment_processed();
+            return Some(selected);
+        }
+
+        self.hash_min_load(
+            workers,
+            min_load_idx,
+            model_id,
+            "min_load_fallback",
+            tokens,
+            applicable,
+            now,
+        )
+    }
+
+    /// Min-load dispatch for the hash-path fallback branches; records the
+    /// placement when boundaries apply.
+    #[expect(clippy::too_many_arguments, reason = "hot-path plumbing, not state")]
+    fn hash_min_load(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        min_load_idx: Option<usize>,
+        model_id: &str,
+        branch: &'static str,
+        tokens: &[u32],
+        applicable: &[usize],
+        now: Instant,
+    ) -> Option<usize> {
+        let idx = min_load_idx?;
+        if !applicable.is_empty() {
+            self.record_placement(model_id, tokens, applicable, workers[idx].url(), now);
+        }
+        Self::log_hash_decision(branch, 0, workers[idx].url(), model_id);
+        workers[idx].increment_processed();
+        Some(idx)
+    }
+
+    /// URL → healthy worker index; duplicate URLs resolve to the index
+    /// min-load selection would pick.
+    fn healthy_url_index<'a>(
+        workers: &'a [Arc<dyn Worker>],
+        healthy_indices: &[usize],
+    ) -> HashMap<&'a str, usize> {
+        let mut url_to_idx: HashMap<&str, usize> = HashMap::with_capacity(healthy_indices.len());
+        for &idx in healthy_indices {
+            url_to_idx
+                .entry(workers[idx].url())
+                .and_modify(|cur| {
+                    if (workers[idx].load(), idx) < (workers[*cur].load(), *cur) {
+                        *cur = idx;
+                    }
+                })
+                .or_insert(idx);
+        }
+        url_to_idx
+    }
+
+    /// Least-loaded live holder of `key` among healthy workers, or `None`.
+    /// Expired holders are pruned in place (lazy expiry on read). Guarded
+    /// work is O(holder cap): resolution goes through `url_to_idx`.
+    fn live_holder_min_load(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        url_to_idx: &HashMap<&str, usize>,
+        model_id: &str,
+        key: (usize, u64),
+        now: Instant,
+    ) -> Option<usize> {
+        let ttl = Duration::from_secs(self.config.cache_ttl_secs);
+        let model = Arc::clone(self.placement_index.get(model_id)?.value());
+        let mut holders = model.get_mut(&key)?;
+        holders.retain(|h| now.duration_since(h.last_touch) <= ttl);
+        holders
+            .iter()
+            .filter_map(|h| url_to_idx.get(h.worker_url.as_str()).copied())
+            .min_by_key(|&idx| (workers[idx].load(), idx))
+    }
+
+    /// Record/touch `worker_url` at every applicable boundary of this
+    /// request; above the holder cap the stalest holder is evicted.
+    fn record_placement(
+        &self,
+        model_id: &str,
+        tokens: &[u32],
+        boundaries: &[usize],
+        worker_url: &str,
+        now: Instant,
+    ) {
+        let ttl = Duration::from_secs(self.config.cache_ttl_secs);
+        let model = if let Some(entry) = self.placement_index.get(model_id) {
+            Arc::clone(entry.value())
+        } else {
+            Arc::clone(
+                self.placement_index
+                    .entry(model_id.to_string())
+                    .or_default()
+                    .value(),
+            )
+        };
+        for &boundary in boundaries {
+            let key = (boundary, hash_token_head(&tokens[..boundary]));
+            let mut holders = model.entry(key).or_default();
+            holders.retain(|h| now.duration_since(h.last_touch) <= ttl);
+            if let Some(holder) = holders.iter_mut().find(|h| h.worker_url == worker_url) {
+                holder.last_touch = now;
+                continue;
+            }
+            if holders.len() >= PLACEMENT_HOLDER_CAP {
+                if let Some(stalest) = holders
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, h)| h.last_touch)
+                    .map(|(i, _)| i)
+                {
+                    holders.swap_remove(stalest);
+                }
+            }
+            holders.push(PlacementHolder {
+                worker_url: worker_url.to_string(),
+                last_touch: now,
+            });
+        }
+    }
+
+    /// Drop expired holders and empty keys; refresh the per-model entry
+    /// gauge. Returns total live entries across models.
+    fn sweep_placement_index(
+        index: &DashMap<String, Arc<PlacementMap>>,
+        ttl: Duration,
+        now: Instant,
+    ) -> usize {
+        let models: Vec<(String, Arc<PlacementMap>)> = index
+            .iter()
+            .map(|model| (model.key().clone(), Arc::clone(model.value())))
+            .collect();
+        let mut total = 0usize;
+        for (model_id, placements) in models {
+            placements.retain(|_, holders| {
+                holders.retain(|h| now.duration_since(h.last_touch) <= ttl);
+                !holders.is_empty()
+            });
+            let entries = placements.len();
+            total += entries;
+            Metrics::set_cache_placement_entries(&model_id, entries);
+        }
+        total
+    }
+
     /// Select worker using token-based tree (gRPC path)
     fn select_worker_with_tokens(
         &self,
@@ -1409,6 +1771,9 @@ impl CacheAwarePolicy {
             //   * matched worker gone/unhealthy: select nothing and DON'T insert
             //     (closure returns None), falling back to first-healthy below.
             let mut selected_idx: Option<usize> = None;
+            // Hinted token prefixes (x-smg-routing-tokens) insert as-is: the
+            // tree page-aligns internally, so a truncated prefix still trains
+            // affinity.
             let result = tree.match_and_insert_with(tokens, |result| {
                 let match_rate = if result.input_token_count == 0 {
                     0.0
@@ -1439,6 +1804,15 @@ impl CacheAwarePolicy {
                 // like the old `if let Some(idx)` guard around insert_tokens).
                 selected_idx.map(|idx| workers[idx].url())
             });
+
+            self.log_tree_decision(
+                selected_idx.map(|idx| workers[idx].url()),
+                healthy_indices.first().map(|&idx| workers[idx].url()),
+                result.matched_token_count,
+                result.input_token_count,
+                &result.matched_tenants,
+                model_id,
+            );
 
             if let Some(idx) = selected_idx {
                 // Record hash(full_tokens)→matched_prefix tokens.
@@ -1485,13 +1859,14 @@ impl CacheAwarePolicy {
             // Stale entries will be cleaned up by LRU eviction
             healthy_indices.first().copied()
         } else {
+            let idx = healthy_indices[rand::rng().random_range(0..healthy_indices.len())];
             debug!(
-                "Warning: No token tree found for model '{}', using random worker selection",
-                model_id
+                branch = "no_tree_random",
+                worker = workers[idx].url(),
+                model_id,
+                "Cache-aware selection"
             );
-            let mut rng = rand::rng();
-            let random_idx = rng.random_range(0..healthy_indices.len());
-            Some(healthy_indices[random_idx])
+            Some(idx)
         }
     }
 
@@ -1547,6 +1922,15 @@ impl CacheAwarePolicy {
                 selected_idx.map(|idx| workers[idx].url())
             });
 
+            self.log_tree_decision(
+                selected_idx.map(|idx| workers[idx].url()),
+                healthy_indices.first().map(|&idx| workers[idx].url()),
+                result.matched_char_count,
+                result.input_char_count,
+                &result.matched_tenants,
+                model_id,
+            );
+
             if let Some(idx) = selected_idx {
                 // Record hash(full_text)→matched_prefix for mesh tenant delta
                 // resolution. The hash key matches what sync_tree_operation sends
@@ -1583,13 +1967,14 @@ impl CacheAwarePolicy {
             // Stale entries will be cleaned up by LRU eviction
             healthy_indices.first().copied()
         } else {
+            let idx = healthy_indices[rand::rng().random_range(0..healthy_indices.len())];
             debug!(
-                "Warning: No string tree found for model '{}', using random worker selection",
-                model_id
+                branch = "no_tree_random",
+                worker = workers[idx].url(),
+                model_id,
+                "Cache-aware selection"
             );
-            let mut rng = rand::rng();
-            let random_idx = rng.random_range(0..healthy_indices.len());
-            Some(healthy_indices[random_idx])
+            Some(idx)
         }
     }
 }
@@ -1604,6 +1989,7 @@ impl Default for CacheAwarePolicy {
 mod tests {
     use kv_index::{compute_content_hash, SequenceHash, StoredBlock, WorkerBlockMap};
     use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerStatus};
+    use tracing_test::traced_test;
 
     use super::*;
 
@@ -1689,6 +2075,59 @@ mod tests {
         assert_eq!(idx1, idx3);
     }
 
+    /// `RoutingState::overloaded` has exactly one production reader — the fused
+    /// gather below `select_worker`. Without this test nothing would fail if
+    /// `state.eligible()` were reverted to health + circuit breaker, or if
+    /// `BasicWorker::routing_state` stopped populating the field.
+    #[test]
+    fn overloaded_worker_is_vetoed_by_the_fused_gather() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(WorkerType::Regular)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+
+        let info = SelectWorkerInfo {
+            request_text: Some("a stable prefix that pins one worker"),
+            ..Default::default()
+        };
+        let owner = policy.select_worker(&workers, &info).unwrap();
+        assert_eq!(
+            policy.select_worker(&workers, &info),
+            Some(owner),
+            "cache affinity holds while the worker is eligible"
+        );
+
+        workers[owner].set_overloaded(true);
+        assert_ne!(
+            policy.select_worker(&workers, &info),
+            Some(owner),
+            "affinity must not outrank the absolute veto"
+        );
+
+        // Every worker vetoed leaves nothing to select.
+        for worker in &workers {
+            worker.set_overloaded(true);
+        }
+        assert_eq!(policy.select_worker(&workers, &info), None);
+
+        for worker in &workers {
+            worker.set_overloaded(false);
+        }
+        assert!(policy.select_worker(&workers, &info).is_some());
+    }
+
     #[test]
     fn test_cache_aware_with_imbalanced_load() {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
@@ -1702,6 +2141,7 @@ mod tests {
             overload_token_usage_threshold: 1.0,
             overlap_decay: 0.0,
             selection_temperature: 0.0,
+            ..Default::default()
         });
 
         let worker1 = BasicWorkerBuilder::new("http://w1:8000")
@@ -2004,6 +2444,39 @@ mod tests {
                 .any(|tenant| tenant.as_ref() == "http://w2:8000"),
             "spill target must become a tenant of the hot prefix"
         );
+    }
+
+    #[test]
+    #[traced_test]
+    fn token_tree_selection_emits_decision_line() {
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let tokens: Vec<u32> = (0..32).collect();
+        seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
+
+        policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(logs_contain("Cache-aware selection"));
+        assert!(logs_contain("tree_match"));
+
+        let novel: Vec<u32> = (1000..1064).collect();
+        policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&novel),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(logs_contain("min_load_fallback"));
     }
 
     #[test]
@@ -3429,5 +3902,410 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx, idx2); // token tree cache affinity preserved
+    }
+
+    // ---- hash placement index (cache_index = hash) ----
+
+    fn hash_config(boundaries: &[usize]) -> CacheAwareConfig {
+        CacheAwareConfig {
+            eviction_interval_secs: 0,
+            cache_index: CacheIndexKind::Hash,
+            cache_boundaries: boundaries.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn route_tokens(
+        policy: &CacheAwarePolicy,
+        workers: &[Arc<dyn Worker>],
+        tokens: &[u32],
+    ) -> usize {
+        policy
+            .select_worker(
+                workers,
+                &SelectWorkerInfo {
+                    tokens: Some(tokens),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn hash_mode_never_touches_trees() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        assert!(policy.string_trees.is_empty());
+        assert!(policy.token_trees.is_empty());
+
+        let tokens: Vec<u32> = (0..32).collect();
+        route_tokens(&policy, &workers, &tokens);
+        policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("a text prompt long enough to insert"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(policy.string_trees.is_empty());
+        assert!(policy.token_trees.is_empty());
+        assert!(!policy.placement_index.is_empty());
+    }
+
+    #[test]
+    fn hash_mode_repeat_head_sticks_to_holder() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+
+        let tokens: Vec<u32> = (0..32).collect();
+        let first = route_tokens(&policy, &workers, &tokens);
+        // Mild load on the holder must not break affinity (under the gate).
+        workers[first].increment_load();
+        workers[first].increment_load();
+        for _ in 0..5 {
+            assert_eq!(route_tokens(&policy, &workers, &tokens), first);
+        }
+
+        // A different head load-balances away from the loaded holder.
+        let other: Vec<u32> = (1000..1032).collect();
+        assert_ne!(route_tokens(&policy, &workers, &other), first);
+    }
+
+    #[test]
+    fn hash_mode_probes_deepest_boundary_first() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16, 32]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let model = normalize_model_key(workers[0].model_id());
+        let tokens: Vec<u32> = (0..40).collect();
+        let now = Instant::now();
+
+        // w2 holds the 16-token head, w1 the deeper 32-token head.
+        policy.record_placement(model, &tokens, &[16], "http://w2:8000", now);
+        policy.record_placement(model, &tokens, &[32], "http://w1:8000", now);
+        // Even with the shallow holder strictly less loaded, the deeper
+        // boundary must win.
+        workers[0].increment_load();
+
+        assert_eq!(route_tokens(&policy, &workers, &tokens), 0);
+    }
+
+    #[test]
+    fn hash_mode_records_at_every_applicable_boundary() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16, 32, 64]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let model = normalize_model_key(workers[0].model_id());
+
+        let tokens: Vec<u32> = (0..40).collect();
+        let selected = route_tokens(&policy, &workers, &tokens);
+
+        let placements = policy.placement_index.get(model).unwrap();
+        // 64 exceeds the request length: only the two applicable levels.
+        assert_eq!(placements.len(), 2);
+        for boundary in [16usize, 32] {
+            let key = (boundary, hash_token_head(&tokens[..boundary]));
+            let holders = placements.get(&key).unwrap();
+            assert_eq!(holders.len(), 1);
+            assert_eq!(holders[0].worker_url, workers[selected].url());
+        }
+    }
+
+    #[test]
+    fn hash_mode_short_request_stays_min_load() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        for _ in 0..3 {
+            workers[0].increment_load();
+        }
+
+        let tokens: Vec<u32> = (0..8).collect();
+        for _ in 0..5 {
+            assert_eq!(route_tokens(&policy, &workers, &tokens), 1);
+        }
+        assert!(policy.placement_index.is_empty());
+    }
+
+    #[test]
+    fn hash_mode_untokenized_text_stays_min_load() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        for _ in 0..3 {
+            workers[0].increment_load();
+        }
+
+        let info = SelectWorkerInfo {
+            request_text: Some("system prompt plus a user question"),
+            ..Default::default()
+        };
+        for _ in 0..5 {
+            assert_eq!(policy.select_worker(&workers, &info), Some(1));
+        }
+        assert!(policy.placement_index.is_empty());
+        assert!(policy.string_trees.is_empty());
+    }
+
+    #[test]
+    fn hash_mode_ttl_expires_holders_on_read() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let model = normalize_model_key(workers[0].model_id());
+        let tokens: Vec<u32> = (0..16).collect();
+        let t0 = Instant::now();
+        let key = (16usize, hash_token_head(&tokens[..16]));
+
+        policy.record_placement(model, &tokens, &[16], "http://w1:8000", t0);
+
+        let url_to_idx = CacheAwarePolicy::healthy_url_index(&workers, &[0, 1]);
+        // Just inside the 180s default TTL: live.
+        let live_at = t0 + Duration::from_secs(179);
+        assert_eq!(
+            policy.live_holder_min_load(&workers, &url_to_idx, model, key, live_at),
+            Some(0)
+        );
+        // Just past it: expired and pruned.
+        let expired_at = t0 + Duration::from_secs(181);
+        assert_eq!(
+            policy.live_holder_min_load(&workers, &url_to_idx, model, key, expired_at),
+            None
+        );
+        assert!(policy
+            .placement_index
+            .get(model)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn hash_mode_expired_holder_falls_back_to_min_load() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_ttl_secs: 1,
+            ..hash_config(&[16])
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+
+        let tokens: Vec<u32> = (0..16).collect();
+        let first = route_tokens(&policy, &workers, &tokens);
+        assert_eq!(route_tokens(&policy, &workers, &tokens), first);
+
+        // Let the placement lapse, then load the former holder: a live
+        // placement would still win, an expired one must load-balance away.
+        std::thread::sleep(Duration::from_millis(1300));
+        for _ in 0..3 {
+            workers[first].increment_load();
+        }
+        assert_ne!(route_tokens(&policy, &workers, &tokens), first);
+    }
+
+    #[test]
+    fn hash_mode_holder_cap_evicts_stalest() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let tokens: Vec<u32> = (0..16).collect();
+        let t0 = Instant::now();
+        let key = (16usize, hash_token_head(&tokens[..16]));
+
+        for (i, url) in [
+            "http://w1:8000",
+            "http://w2:8000",
+            "http://w3:8000",
+            "http://w4:8000",
+        ]
+        .iter()
+        .enumerate()
+        {
+            policy.record_placement("m", &tokens, &[16], url, t0 + Duration::from_secs(i as u64));
+        }
+
+        let placements = policy.placement_index.get("m").unwrap();
+        let holders = placements.get(&key).unwrap();
+        assert_eq!(holders.len(), PLACEMENT_HOLDER_CAP);
+        assert!(!holders.iter().any(|h| h.worker_url == "http://w1:8000"));
+    }
+
+    #[test]
+    fn hash_mode_gate_spills_and_replicates_placement() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let model = normalize_model_key(workers[0].model_id());
+        let tokens: Vec<u32> = (0..16).collect();
+        let key = (16usize, hash_token_head(&tokens[..16]));
+
+        policy.record_placement(model, &tokens, &[16], "http://w1:8000", Instant::now());
+        // Past both gate margins (rel 1.1 of avg 50, abs avg+32): spill.
+        for _ in 0..100 {
+            workers[0].increment_load();
+        }
+
+        assert_eq!(route_tokens(&policy, &workers, &tokens), 1);
+        // The spill target becomes an additional holder of this head.
+        let placements = policy.placement_index.get(model).unwrap();
+        let holders = placements.get(&key).unwrap();
+        assert!(holders.iter().any(|h| h.worker_url == "http://w2:8000"));
+    }
+
+    #[test]
+    fn hash_mode_kv_pressure_abandons_affinity() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            balance_token_usage_threshold: 0.3,
+            overload_token_usage_threshold: 0.95,
+            ..hash_config(&[16])
+        });
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let model = normalize_model_key(workers[0].model_id());
+        let tokens: Vec<u32> = (0..16).collect();
+
+        policy.record_placement(model, &tokens, &[16], "http://w1:8000", Instant::now());
+        workers[0].increment_load();
+        let _tx = inject_kv(&policy, &workers, &[0.9, 0.1]);
+
+        // KV spread 0.8 > 0.3: shortest queue wins over the placement.
+        assert_eq!(route_tokens(&policy, &workers, &tokens), 1);
+    }
+
+    #[test]
+    fn hash_mode_co_hashes_short_and_long_requests() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[2048]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+        // 3k- and 17k-token requests sharing the 2048-token head must land
+        // on the same worker via the shared boundary key.
+        let short: Vec<u32> = (0..3000).collect();
+        let mut long: Vec<u32> = (0..2048).collect();
+        long.extend(9_000_000..9_014_952);
+        assert_eq!(long.len(), 17_000);
+
+        let first = route_tokens(&policy, &workers, &short);
+        assert_eq!(route_tokens(&policy, &workers, &long), first);
+    }
+
+    #[test]
+    fn hash_mode_removed_worker_is_purged_from_placements() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let tokens: Vec<u32> = (0..16).collect();
+        let now = Instant::now();
+        policy.record_placement("m", &tokens, &[16], "http://w1:8000", now);
+        policy.record_placement("m", &tokens, &[16], "http://w2:8000", now);
+
+        policy.remove_worker_by_url("http://w1:8000");
+
+        let placements = policy.placement_index.get("m").unwrap();
+        let holders = placements
+            .get(&(16usize, hash_token_head(&tokens[..16])))
+            .unwrap();
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0].worker_url, "http://w2:8000");
+    }
+
+    #[test]
+    fn sweep_placement_index_drops_expired_and_empty_keys() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let fresh: Vec<u32> = (0..16).collect();
+        let stale: Vec<u32> = (500..516).collect();
+        let t0 = Instant::now();
+        policy.record_placement("m", &stale, &[16], "http://w1:8000", t0);
+        policy.record_placement(
+            "m",
+            &fresh,
+            &[16],
+            "http://w1:8000",
+            t0 + Duration::from_secs(120),
+        );
+
+        let live = CacheAwarePolicy::sweep_placement_index(
+            &policy.placement_index,
+            Duration::from_secs(180),
+            t0 + Duration::from_secs(200),
+        );
+        assert_eq!(live, 1);
+        let placements = policy.placement_index.get("m").unwrap();
+        assert_eq!(placements.len(), 1);
+        assert!(placements
+            .get(&(16usize, hash_token_head(&fresh[..16])))
+            .is_some());
+    }
+
+    #[test]
+    fn live_holder_resolution_skips_dead_holders_and_unknown_keys() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let tokens: Vec<u32> = (0..16).collect();
+        let now = Instant::now();
+        let key = (16usize, hash_token_head(&tokens[..16]));
+        policy.record_placement("m", &tokens, &[16], "http://w1:8000", now);
+        policy.record_placement("m", &tokens, &[16], "http://w2:8000", now);
+
+        // w1 unhealthy: its holder entry must not resolve.
+        let url_to_idx = CacheAwarePolicy::healthy_url_index(&workers, &[1]);
+        assert_eq!(
+            policy.live_holder_min_load(&workers, &url_to_idx, "m", key, now),
+            Some(1)
+        );
+        // No healthy workers: no candidate.
+        let empty = CacheAwarePolicy::healthy_url_index(&workers, &[]);
+        assert_eq!(
+            policy.live_holder_min_load(&workers, &empty, "m", key, now),
+            None
+        );
+        // Unknown key: no candidate.
+        assert_eq!(
+            policy.live_holder_min_load(&workers, &url_to_idx, "m", (32, 7), now),
+            None
+        );
+    }
+
+    #[test]
+    fn healthy_url_index_duplicate_urls_resolve_to_least_loaded() {
+        let workers = make_workers(&["http://w1:8000", "http://w1:8000", "http://w2:8000"]);
+        workers[0].increment_load();
+
+        let url_to_idx = CacheAwarePolicy::healthy_url_index(&workers, &[0, 1, 2]);
+        assert_eq!(url_to_idx.len(), 2);
+        assert_eq!(url_to_idx["http://w1:8000"], 1);
+        assert_eq!(url_to_idx["http://w2:8000"], 2);
+
+        // Equal loads: the lower index wins, matching min-load tie-break.
+        let tied = make_workers(&["http://w1:8000", "http://w1:8000"]);
+        assert_eq!(
+            CacheAwarePolicy::healthy_url_index(&tied, &[0, 1])["http://w1:8000"],
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_record_and_sweep_keeps_live_placements() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+        let now = Instant::now();
+        let ttl = Duration::from_secs(180);
+
+        std::thread::scope(|s| {
+            for t in 0..8u32 {
+                let policy = &policy;
+                s.spawn(move || {
+                    for i in 0..50u32 {
+                        let base = t * 1000 + i * 16;
+                        let tokens: Vec<u32> = (base..base + 16).collect();
+                        policy.record_placement("m", &tokens, &[16], "http://w1:8000", now);
+                        CacheAwarePolicy::sweep_placement_index(&policy.placement_index, ttl, now);
+                    }
+                });
+            }
+        });
+
+        let placements = policy.placement_index.get("m").unwrap();
+        assert_eq!(placements.len(), 400);
+        for entry in placements.iter() {
+            assert_eq!(entry.value().len(), 1);
+            assert_eq!(entry.value()[0].worker_url, "http://w1:8000");
+        }
+    }
+
+    #[test]
+    fn with_config_normalizes_boundaries() {
+        let policy = CacheAwarePolicy::with_config(hash_config(&[64, 16, 16, 0]));
+        assert_eq!(policy.config.cache_boundaries, vec![16, 64]);
     }
 }

@@ -7,7 +7,10 @@ use std::{fmt::Debug, sync::Arc};
 
 use openai_protocol::worker::WorkerLoadResponse;
 
-use crate::worker::{HashRing, Worker};
+use crate::{
+    config::CacheIndexKind,
+    worker::{HashRing, Worker},
+};
 
 mod bucket;
 mod cache_aware;
@@ -159,6 +162,16 @@ pub struct CacheAwareConfig {
     /// score spread matters): small values mostly follow the best candidate,
     /// large values approach uniform.
     pub selection_temperature: f32,
+    /// Index under-layer: `Tree` (default, radix prefix trees) or `Hash`
+    /// (TTL'd exact-match placement map over `cache_boundaries` heads; the
+    /// radix trees are neither consulted nor populated).
+    pub cache_index: CacheIndexKind,
+    /// Seconds a hash-index placement stays routable; should approximate
+    /// serving-engine cache retention.
+    pub cache_ttl_secs: u64,
+    /// Ascending token positions at which serving engines retain reusable
+    /// prefix state; the hash index keys request heads at these boundaries.
+    pub cache_boundaries: Vec<usize>,
 }
 
 impl Default for CacheAwareConfig {
@@ -178,6 +191,9 @@ impl Default for CacheAwareConfig {
             // to pre-knob selection until explicitly tuned.
             overlap_decay: 0.0,
             selection_temperature: 0.0,
+            cache_index: CacheIndexKind::Tree,
+            cache_ttl_secs: 180,
+            cache_boundaries: Vec::new(),
         }
     }
 }
@@ -199,12 +215,17 @@ impl Default for BucketConfig {
     }
 }
 
-/// Helper function to filter healthy workers and return their indices
+/// Helper function to filter routable workers and return their indices.
+///
+/// [`Worker::is_available`] folds the absolute overload veto into the health +
+/// circuit-breaker test it already performed, under the same guards and with
+/// the same short-circuit order — the veto is one more test on a word already
+/// in hand, never a second walk.
 pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usize> {
     workers
         .iter()
         .enumerate()
-        .filter(|(_, w)| w.is_healthy() && w.circuit_breaker_can_execute())
+        .filter(|(_, w)| w.is_available())
         .map(|(idx, _)| idx)
         .collect()
 }
@@ -251,12 +272,22 @@ pub struct SelectWorkerInfo<'a> {
     pub request_text: Option<&'a str>,
     /// Tokenized request for prefix-hash routing
     /// Used by PrefixHashPolicy for token-based prefix hashing
+    /// The HTTP router substitutes a valid `x-smg-routing-tokens` hint here:
+    /// the hint wins over body-derived tokens/text for selection.
     pub tokens: Option<&'a [u32]>,
     /// HTTP headers for header-based routing policies
     /// Policies can extract routing information from headers like:
     /// - X-SMG-Target-Worker: Direct routing to a specific worker by index
     /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
     pub headers: Option<&'a http::HeaderMap>,
+    /// Validated `x-smg-routing-key` hint (non-empty UTF-8, <= 128 bytes);
+    /// consistent_hashing and prefix_hash prefer it over their other keying
+    /// input.
+    pub routing_key: Option<&'a str>,
+    /// Session key derived from the request body's `rid` (routers with typed
+    /// body access populate it); consumed by the routing-key override when
+    /// its key source includes rid.
+    pub rid_key: Option<&'a str>,
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
@@ -350,6 +381,35 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// The overload veto rides the same eligibility filter every walking policy
+    /// uses, so flagging a worker removes it everywhere at once — and clearing
+    /// the flag re-admits it.
+    #[test]
+    fn get_healthy_worker_indices_honors_the_overload_veto() {
+        let workers: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|i| {
+                Arc::new(
+                    BasicWorkerBuilder::new(format!("http://w{i}:8000"))
+                        .worker_type(WorkerType::Regular)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+
+        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+
+        // A busy worker is still eligible: load alone is not the veto.
+        let _guard = crate::worker::WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
+        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+
+        workers[1].set_overloaded(true);
+        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 2]);
+
+        workers[1].set_overloaded(false);
+        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
     }
 
     #[test]
