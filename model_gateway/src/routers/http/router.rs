@@ -1930,18 +1930,34 @@ impl Router {
                 );
             }
         };
-        let rerank_results = match serde_json::from_slice::<Vec<RerankResult>>(&body_bytes) {
-            Ok(results) => results,
-            Err(e) => {
-                error!("Failed to build rerank response: {e}");
-                return error::internal_error(
-                    "rerank_response_build_failed",
-                    "Failed to build rerank response",
-                );
-            }
-        };
         let model = canonical_model.map_or(req.model, ToOwned::to_owned);
-        let mut rerank_response = RerankResponse::new(rerank_results, model, req.rid);
+
+        // Try parsing as a full standard response (Jina v1 / vLLM format) first,
+        // then fall back to legacy raw array of results.
+        let mut rerank_response =
+            if let Ok(mut full_resp) = serde_json::from_slice::<RerankResponse>(&body_bytes) {
+                // Backend returned a complete response object; override model if needed
+                if full_resp.model.is_empty() {
+                    full_resp.model = model;
+                }
+                if full_resp.id.is_none() {
+                    full_resp.id = req.rid.clone();
+                }
+                full_resp
+            } else {
+                // Legacy format: backend returns a raw array of results
+                let rerank_results = match serde_json::from_slice::<Vec<RerankResult>>(&body_bytes) {
+                    Ok(results) => results,
+                    Err(e) => {
+                        error!("Failed to build rerank response: {e}");
+                        return error::internal_error(
+                            "rerank_response_build_failed",
+                            "Failed to build rerank response",
+                        );
+                    }
+                };
+                RerankResponse::new(rerank_results, model, req.rid.clone())
+            };
         // Sorting is handled by Python worker (serving_rerank.py)
         if let Some(top_k) = req.top_k {
             rerank_response.apply_top_k(top_k);
