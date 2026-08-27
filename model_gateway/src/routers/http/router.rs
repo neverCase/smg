@@ -43,7 +43,11 @@ use tracing::{error, warn};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    middleware::{scheduler::PreemptionGuard, TenantRequestMeta},
+    middleware::{
+        scheduler::PreemptionGuard,
+        HttpRequestStartedAt,
+        TenantRequestMeta
+    },
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
@@ -56,7 +60,7 @@ use crate::{
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
-                REASON_WORKER_MUTATES_BODY,
+                REASON_WORKER_MUTATES_BODY,REASON_CHAT_OBSERVABILITY,
             },
             header_utils, overload,
             realtime::{
@@ -73,12 +77,18 @@ use crate::{
         http::{
             request_body::{serialize_request_body, RequestBodyError},
             request_stream::{CappedBodyStream, StreamProgress},
+            chat_metrics::{ChatMetricsContext, RoutedChatMetricsContext},
+            sse_observer::ChatStreamTtftObserver,
         },
         router_manager::RouterManager,
         BodyPolicy, RouterTrait,
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{AttachedBody, ConnectionMode, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType},
+    service_discovery::{
+        POD_NAME_LABEL,
+        POD_UID_LABEL,
+    }
 };
 
 /// Max body size for a WebRTC `/v1/realtime/calls` SDP offer (10 MiB).
@@ -367,7 +377,26 @@ impl Router {
         route: &'static str,
         model_id: &str,
     ) -> Response {
+        self.route_typed_request_with_ttft_start(
+            headers,
+            typed_req,
+            route,
+            model_id,
+            None,
+        )
+            .await
+    }
+
+    pub async fn route_typed_request_with_ttft_start<T: GenerationRequest + serde::Serialize>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: T,
+        route: &'static str,
+        model_id: &str,
+        request_started_at: Option<Instant>,
+    ) -> Response {
         let start = Instant::now();
+        let ttft_started_at = request_started_at.unwrap_or(start);
         let is_stream = typed_req.is_stream();
         // Pre-tokenized requests route on the token tree; the decimal-string
         // rendering is only materialized when there are no tokens. A valid
@@ -394,6 +423,14 @@ impl Router {
         let model = model_id;
         let endpoint = route_to_endpoint(route);
 
+        let chat_metrics =
+            (route == "/v1/chat/completions").then(|| {
+                ChatMetricsContext {
+                    started_at: ttft_started_at,
+                    model: model.to_string(),
+                }
+            });
+
         // Record request start (Layer 2)
         Metrics::record_router_request(
             metrics_labels::ROUTER_HTTP,
@@ -409,6 +446,7 @@ impl Router {
         let retry_config = per_model_retry_config
             .as_ref()
             .unwrap_or(&self.retry_config);
+        let max_attempts = retry_config.max_retries.max(1);
 
         // The lease owns the parsed request and its routing derivatives for
         // the dispatch phase; its release point encodes the retry policy.
@@ -433,6 +471,8 @@ impl Router {
                     model_id,
                     canonical_model.as_deref(),
                     is_stream,
+                    chat_metrics.as_ref(),
+                    true,
                 )
                 .await;
             Metrics::record_router_upstream_response(
@@ -447,31 +487,44 @@ impl Router {
             }
             res
         } else {
+            let retry_lease = &lease;
+            let retry_canonical_model = canonical_model.as_deref();
+            let retry_chat_metrics = chat_metrics.as_ref();
+
             RetryExecutor::execute_response_with_retry(
                 retry_config,
                 // operation per attempt; the lease keeps the request alive
                 // for replay until the retry window closes (first
                 // non-retryable response).
-                |_: u32| async {
-                    let res = self
-                        .route_typed_request_once(
-                            headers,
-                            &lease,
-                            route,
-                            model_id,
-                            canonical_model.as_deref(),
-                            is_stream,
-                        )
-                        .await;
+                |attempt: u32| {
+                    let lease = retry_lease;
+                    let canonical_model = retry_canonical_model;
+                    let chat_metrics = retry_chat_metrics;
+                    let is_last_attempt = attempt.saturating_add(1) >= max_attempts;
 
-                    // Need to be outside `route_typed_request_once` because that function has multiple return paths
-                    Metrics::record_router_upstream_response(
-                        metrics_labels::ROUTER_HTTP,
-                        res.status().as_u16(),
-                        extract_error_code_from_response(&res),
-                    );
+                    async move {
+                        let res = self
+                            .route_typed_request_once(
+                                headers,
+                                lease,
+                                route,
+                                model_id,
+                                canonical_model,
+                                is_stream,
+                                chat_metrics,
+                                is_last_attempt,
+                            )
+                            .await;
 
-                    res
+                        // Need to be outside `route_typed_request_once` because that function has multiple return paths
+                        Metrics::record_router_upstream_response(
+                            metrics_labels::ROUTER_HTTP,
+                            res.status().as_u16(),
+                            extract_error_code_from_response(&res),
+                        );
+
+                        res
+                    }
                 },
                 // should_retry predicate
                 |res, _attempt| is_retryable_response(res),
@@ -524,7 +577,10 @@ impl Router {
         model_id: &str,
         canonical_model: Option<&str>,
         is_stream: bool,
+        chat_metrics: Option<&ChatMetricsContext>,
+        is_last_attempt: bool,
     ) -> Response {
+
         let worker = match lease.with_view(|view| {
             self.select_worker_for_model(model_id, view.text, view.tokens, headers, view.rid_key)
         }) {
@@ -560,6 +616,25 @@ impl Router {
             }
         };
 
+        let routed_metrics = chat_metrics.map(|ctx| {
+            let labels = &worker.metadata().spec.labels;
+
+            RoutedChatMetricsContext {
+                started_at: ctx.started_at,
+                model: ctx.model.clone(),
+
+                worker: labels
+                    .get(POD_NAME_LABEL)
+                    .cloned()
+                    .unwrap_or_else(|| worker.url().to_string()),
+
+                worker_uid: labels
+                    .get(POD_UID_LABEL)
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string()),
+            }
+        });
+
         // Dispatch-time re-check of the one chosen worker: O(1), and the only
         // thing that closes the window between selection and dispatch in which
         // a load report can flip the veto.
@@ -592,6 +667,14 @@ impl Router {
                 // the lease frees the parsed request and its routing
                 // derivatives now when retries are disabled.
                 lease.release_dispatch();
+                if let Some(ctx) = routed_metrics.as_ref() {
+                    Metrics::record_http_chat_worker_dispatch(
+                        &ctx.model,
+                        &ctx.worker,
+                        &ctx.worker_uid,
+                        is_stream,
+                    );
+                }
                 self.send_serialized_request(
                     headers,
                     body,
@@ -599,6 +682,8 @@ impl Router {
                     worker.as_ref(),
                     is_stream,
                     load_guard,
+                    routed_metrics.as_ref(),
+                    is_last_attempt,
                 )
                 .await
             }
@@ -1664,6 +1749,8 @@ impl Router {
         worker: &dyn Worker,
         is_stream: bool,
         load_guard: WorkerLoadGuard,
+        routed_metrics: Option<&RoutedChatMetricsContext>,
+        is_last_attempt: bool,
     ) -> Response {
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
@@ -1695,7 +1782,21 @@ impl Router {
             }
         };
 
-        self.forward_worker_response(res, is_stream, worker.url(), load_guard)
+        let upstream_status = StatusCode::from_u16(res.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+        // 非 retryable 响应会直接返回给客户端；最后一次 attempt 无论
+        // 状态是什么，也会作为最终响应返回给客户端。
+        let should_observe_ttft =
+            is_last_attempt || !is_retryable_status(upstream_status);
+
+        let routed_metrics = if should_observe_ttft {
+            routed_metrics
+        } else {
+            None
+        };
+
+        self.forward_worker_response(res, is_stream, worker.url(), load_guard, routed_metrics)
             .await
     }
 
@@ -1708,11 +1809,14 @@ impl Router {
         is_stream: bool,
         worker_url: &str,
         load_guard: WorkerLoadGuard,
+        routed_metrics: Option<&RoutedChatMetricsContext>,
     ) -> Response {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         if is_stream {
+            let routed_metrics = routed_metrics.cloned();
+
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             header_utils::insert_routed_worker_id(&mut response_headers, worker_url);
@@ -1731,25 +1835,47 @@ impl Router {
             )]
             tokio::spawn(async move {
                 let mut stream = stream;
+                let mut ttft_observer =
+                    routed_metrics.map(ChatStreamTtftObserver::new);
+
                 loop {
                     tokio::select! {
                         chunk = stream.next() => match chunk {
                             Some(Ok(bytes)) => {
+                                if let Some(observer) = ttft_observer.as_mut() {
+                                    observer.observe_chunk(&bytes);
+                                }
                                 if tx.send(Ok(bytes)).await.is_err() {
+                                    if let Some(observer) = ttft_observer.as_mut() {
+                                        observer.finish_disconnected();
+                                    }
                                     break;
                                 }
                             }
                             Some(Err(e)) => {
+                                if let Some(observer) = ttft_observer.as_mut() {
+                                    observer.finish_stream_error();
+                                }
                                 let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                                 break;
                             }
-                            None => break,
+                             None => {
+                                if let Some(observer) = ttft_observer.as_mut() {
+                                    observer.finish_eof();
+                                }
+                                break;
+                            }
                         },
                         // Client gone with no chunk in flight (long prefill,
                         // stalled upstream): break so the reqwest stream drops,
                         // closing the upstream connection and letting the
                         // engine abort generation.
-                        () = tx.closed() => break,
+                        () = tx.closed() => {
+                            if let Some(observer) = ttft_observer.as_mut() {
+                                observer.finish_disconnected();
+                            }
+                            break;
+                        }
                     }
                 }
             });
@@ -1886,7 +2012,7 @@ impl Router {
             .get(CONTENT_TYPE)
             .and_then(|ct| ct.to_str().ok())
             .is_some_and(|ct| ct.starts_with("text/event-stream"));
-        self.forward_worker_response(res, is_stream, worker.url(), load_guard)
+        self.forward_worker_response(res, is_stream, worker.url(), load_guard, None)
             .await
     }
 
@@ -2382,6 +2508,15 @@ impl Router {
         route: &'static str,
         wasm_request_hooks: bool,
     ) -> Result<Response, Request<Body>> {
+        if route == "/v1/chat/completions" {
+            Metrics::record_request_body_path(
+                BODY_PATH_BUFFERED,
+                REASON_CHAT_OBSERVABILITY,
+            );
+
+            return Err(req);
+        }
+        let start = Instant::now();
         let stream_reason = match self.request_body_path(req.headers(), wasm_request_hooks) {
             BodyPath::Buffer(reason) => {
                 Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
@@ -2417,9 +2552,8 @@ impl Router {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_MODEL_AMBIGUOUS);
             return Err(req);
         }
-        Metrics::record_request_body_path(BODY_PATH_STREAMED, stream_reason);
 
-        let start = Instant::now();
+        Metrics::record_request_body_path(BODY_PATH_STREAMED, stream_reason);
         let endpoint = route_to_endpoint(route);
         Metrics::record_router_request(
             metrics_labels::ROUTER_HTTP,
@@ -2616,12 +2750,21 @@ impl RouterTrait for Router {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
-            .await
+        let request_started_at = tenant_meta
+            .extension::<HttpRequestStartedAt>()
+            .map(HttpRequestStartedAt::instant);
+        self.route_typed_request_with_ttft_start(
+            headers,
+            body,
+            "/v1/chat/completions",
+            model_id,
+            request_started_at,
+        )
+        .await
     }
 
     async fn route_messages(

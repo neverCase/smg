@@ -231,9 +231,17 @@ async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     mut headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    request_started_at: Option<Extension<middleware::HttpRequestStartedAt>>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(mut body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
+    let tenant_meta = match request_started_at {
+        Some(Extension(started_at)) => {
+            tenant_meta.with_extension(started_at)
+        }
+        None => tenant_meta,
+    };
+    
     let model = body.model.clone();
     if let Err(resp) = check_remote_auth(&state, &headers, &model).await {
         return resp;

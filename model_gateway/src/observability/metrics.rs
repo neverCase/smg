@@ -519,6 +519,21 @@ pub(crate) fn init_metrics() {
         "SHM tensor write attempts that failed and fell back to inline, by runtime"
     );
 
+    describe_histogram!(
+        "smg_http_chat_ttft_seconds",
+        "HTTP chat completion time from router entry to first upstream output token by model and worker"
+    );
+
+    describe_counter!(
+        "smg_http_chat_ttft_missing_total",
+        "HTTP streaming chat completions without an observable first output token"
+    );
+
+    describe_counter!(
+        "smg_http_chat_worker_dispatches_total",
+        "HTTP chat request dispatches to workers, including retry attempts"
+    );
+
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
 
@@ -1897,6 +1912,64 @@ impl Metrics {
                 }
             }
         }
+    }
+
+    pub fn record_http_chat_ttft(
+        model_id: &str,
+        worker: &str,
+        worker_uid: &str,
+        duration: Duration,
+    ) {
+        let model = intern_model_label(model_id);
+        let worker_label = intern_string(worker);
+        let worker_uid_label = intern_string(worker_uid);
+
+        histogram!(
+            "smg_http_chat_ttft_seconds",
+            "model" => model,
+            "worker" => worker_label,
+            "worker_uid" => worker_uid_label,
+            "streaming" => STREAMING_TRUE,
+        ).record(duration.as_secs_f64());
+    }
+
+    pub fn record_http_chat_ttft_missing(
+        model_id: &str,
+        worker: &str,
+        worker_uid: &str,
+        reason: &'static str,
+    ) {
+        let model = intern_model_label(model_id);
+        let worker_label = intern_string(worker);
+        let worker_uid_label = intern_string(worker_uid);
+
+        counter!(
+            "smg_http_chat_ttft_missing_total",
+            "model" => model,
+            "worker" => worker_label,
+            "worker_uid" => worker_uid_label,
+            "streaming" => STREAMING_TRUE,
+            "reason" => reason,
+        ).increment(1);
+    }
+
+    pub fn record_http_chat_worker_dispatch(
+        model_id: &str,
+        worker: &str,
+        worker_uid: &str,
+        streaming: bool,
+    ) {
+        let model = intern_model_label(model_id);
+        let worker = intern_string(worker);
+        let worker_uid = intern_string(worker_uid);
+
+        counter!(
+            "smg_http_chat_worker_dispatches_total",
+            "model" => model,
+            "worker" => worker,
+            "worker_uid" => worker_uid,
+            "streaming" => bool_to_static_str(streaming),
+        ).increment(1);
     }
 }
 

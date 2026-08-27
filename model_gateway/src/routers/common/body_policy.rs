@@ -77,6 +77,9 @@ pub(crate) fn decide_body_path(inputs: &BodyPathInputs) -> BodyPath {
     BodyPath::Stream(REASON_PURE_FORWARD)
 }
 
+pub(crate) const REASON_CHAT_OBSERVABILITY: &str =
+    "chat_observability";
+
 #[cfg(test)]
 mod tests {
     use super::*;

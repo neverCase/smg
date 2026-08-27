@@ -28,6 +28,15 @@ use crate::{
     routers::error::extract_error_code_from_response,
 };
 
+#[derive(Debug, Clone)]
+pub(crate) struct HttpRequestStartedAt(Instant);
+
+impl HttpRequestStartedAt {
+    pub(crate) fn instant(&self) -> Instant {
+        self.0
+    }
+}
+
 /// Tower Layer for HTTP metrics collection (SMG Layer 1 metrics)
 #[derive(Clone)]
 pub struct HttpMetricsLayer {
@@ -72,10 +81,13 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request) -> Self::Future {
+    fn call(&mut self, mut req: Request) -> Self::Future {
         let method = method_to_static_str(req.method().as_str());
         let path = matched_path_label(req.extensions()).to_owned();
         let start = Instant::now();
+
+        req.extensions_mut()
+            .insert(HttpRequestStartedAt(start));
 
         let mut inner = self.inner.clone();
         let in_flight_request_tracker = self.in_flight_request_tracker.clone();

@@ -23,6 +23,7 @@ pub use logging::{
     StreamFailureLogger,
 };
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
+pub(crate) use metrics::HttpRequestStartedAt;
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
 pub use remote_auth::{create_remote_auth_client, RemoteAuthClient};
 pub use storage_context::storage_context_middleware;
