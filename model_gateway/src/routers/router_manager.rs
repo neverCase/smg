@@ -410,16 +410,16 @@ impl RouterManager {
             .filter(|c| allow_all || allowed.contains(&c.id))
             .collect();
 
-        if cards.is_empty() {
-            (
-                StatusCode::NOT_FOUND,
-                "No models available for this token",
-            )
-                .into_response()
-        } else {
+        // if cards.is_empty() {
+        //     (
+        //         StatusCode::NOT_FOUND,
+        //         "No models available for this token",
+        //     )
+        //         .into_response()
+        // } else {
             let resp = ListModelsResponse::from_model_cards(cards);
             (StatusCode::OK, Json(resp)).into_response()
-        }
+        // }
     }
 
     // Return all health model cards
