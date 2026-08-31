@@ -2757,9 +2757,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.18"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "839c0e8a181239723652be9062bb56ca5bf5f64011f73b623f6f4fc59086a228"
+checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3868,7 +3868,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "llm-multimodal"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3882,7 +3882,6 @@ dependencies = [
  "http",
  "image",
  "libloading",
- "llm-tokenizer",
  "ndarray",
  "npyz",
  "once_cell",
@@ -4877,7 +4876,7 @@ dependencies = [
 
 [[package]]
 name = "openai-protocol"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "axum",
  "bitflags 2.13.1",
@@ -7384,7 +7383,7 @@ dependencies = [
 
 [[package]]
 name = "smg"
-version = "1.10.0"
+version = "1.10.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -7535,7 +7534,7 @@ dependencies = [
 
 [[package]]
 name = "smg-golang"
-version = "1.10.0"
+version = "1.10.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -7557,7 +7556,7 @@ dependencies = [
 
 [[package]]
 name = "smg-grpc-client"
-version = "1.11.0"
+version = "1.12.0"
 dependencies = [
  "futures",
  "hyper-util",
@@ -7660,7 +7659,7 @@ dependencies = [
 
 [[package]]
 name = "smg-python"
-version = "1.10.0"
+version = "1.10.1"
 dependencies = [
  "once_cell",
  "pyo3",

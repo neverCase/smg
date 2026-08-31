@@ -11,6 +11,7 @@ use openai_protocol::{
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
+use super::discover_dp::DpInfo;
 use crate::{
     routers::grpc::zmq_client::zmq_handshake_address,
     worker::{
@@ -63,10 +64,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             labels.insert(key.clone(), value.clone());
         }
 
-        // Extract KV transfer config (dedicated metadata fields, not labels)
-        let kv_connector = labels.remove("kv_connector");
-        let kv_role = labels.remove("kv_role");
-        let kv_engine_id = labels.remove("kv_engine_id").filter(|s| !s.is_empty());
+        let (kv_connector, kv_role, kv_engine_id) = take_kv_transfer_metadata(config, &mut labels);
 
         let model_id = resolve_model_id(config, &labels);
         // ZMQ EngineCore does not report a served model name over the wire, so a
@@ -225,15 +223,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         let health_endpoint = &app_context.router_config.health_check.endpoint;
 
         let dp_ranks: Vec<Option<(usize, usize)>> = if app_context.router_config.dp_aware {
-            let dp_info = context
-                .data
-                .dp_info
-                .as_ref()
-                .ok_or_else(|| WorkflowError::ContextValueNotFound("dp_info".to_string()))?;
-            validate_zmq_dp(*connection_mode, dp_info.dp_size, &config.url)?;
-            (0..dp_info.dp_size)
-                .map(|r| Some((r, dp_info.dp_size)))
-                .collect()
+            dp_rank_expansion(context.data.dp_info.as_ref(), *connection_mode, &config.url)?
         } else {
             vec![None] // single worker, no DP
         };
@@ -310,6 +300,29 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         false
     }
+}
+
+fn take_kv_transfer_metadata(
+    config: &WorkerSpec,
+    labels: &mut HashMap<String, String>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let connector_label = labels.remove("kv_connector");
+    let role = labels.remove("kv_role");
+    let engine_id_label = labels.remove("kv_engine_id");
+    (
+        config
+            .kv_connector
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or(connector_label),
+        role,
+        config
+            .kv_engine_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or(engine_id_label)
+            .filter(|s| !s.is_empty()),
+    )
 }
 
 /// Resolve the canonical model ID before aliases are applied.
@@ -706,6 +719,28 @@ fn validate_zmq_worker_type(
 /// on the worker spec: one worker, one socket set, N engines dialing in), so
 /// reject the expansion loudly and point at the grouped form. gRPC/HTTP
 /// expansion and single-engine ZMQ are fine.
+/// Ranks to register for a dp-aware worker. A width above one expands into
+/// one dp-annotated worker per rank. A width-1 advertisement (older
+/// servicers emit it as a capability signal) and a missing one both
+/// register a plain worker: there is no placement to choose, and pinning
+/// rank 0 anyway still alters engine-side scheduling. discover_dp already
+/// logged the degradation for the missing-label case.
+fn dp_rank_expansion(
+    dp_info: Option<&DpInfo>,
+    connection_mode: ConnectionMode,
+    url: &str,
+) -> Result<Vec<Option<(usize, usize)>>, WorkflowError> {
+    match dp_info {
+        Some(dp_info) if dp_info.dp_size > 1 => {
+            validate_zmq_dp(connection_mode, dp_info.dp_size, url)?;
+            Ok((0..dp_info.dp_size)
+                .map(|r| Some((r, dp_info.dp_size)))
+                .collect())
+        }
+        Some(_) | None => Ok(vec![None]),
+    }
+}
+
 fn validate_zmq_dp(
     connection_mode: ConnectionMode,
     dp_size: usize,
@@ -726,6 +761,66 @@ fn validate_zmq_dp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedicated_kv_metadata_wins_and_legacy_labels_are_removed() {
+        let mut spec = WorkerSpec::new("http://worker:8080");
+        spec.kv_connector = Some("NixlConnector".to_string());
+        spec.kv_engine_id = Some("engine-direct".to_string());
+        let mut labels = HashMap::from([
+            ("kv_connector".to_string(), "legacy".to_string()),
+            ("kv_role".to_string(), "kv_consumer".to_string()),
+            ("kv_engine_id".to_string(), "engine-legacy".to_string()),
+        ]);
+
+        let metadata = take_kv_transfer_metadata(&spec, &mut labels);
+        assert_eq!(
+            metadata,
+            (
+                Some("NixlConnector".to_string()),
+                Some("kv_consumer".to_string()),
+                Some("engine-direct".to_string()),
+            )
+        );
+        assert!(labels.is_empty());
+
+        spec.kv_connector = Some(String::new());
+        spec.kv_engine_id = Some(String::new());
+        labels.insert("kv_connector".to_string(), "legacy".to_string());
+        labels.insert("kv_engine_id".to_string(), "engine-legacy".to_string());
+        let metadata = take_kv_transfer_metadata(&spec, &mut labels);
+        assert_eq!(
+            (metadata.0.as_deref(), metadata.2.as_deref()),
+            (Some("legacy"), Some("engine-legacy"))
+        );
+    }
+
+    #[test]
+    fn dp_expansion_pins_only_multi_rank_widths() {
+        let multi = DpInfo {
+            dp_size: 3,
+            model_id: "m".to_string(),
+        };
+        assert_eq!(
+            dp_rank_expansion(Some(&multi), ConnectionMode::Grpc, "grpc://w:1").unwrap(),
+            vec![Some((0, 3)), Some((1, 3)), Some((2, 3))]
+        );
+
+        // Width 1 is a capability-only advertisement: no placement exists,
+        // and a rank-0 pin would still alter engine scheduling.
+        let single = DpInfo {
+            dp_size: 1,
+            model_id: "m".to_string(),
+        };
+        assert_eq!(
+            dp_rank_expansion(Some(&single), ConnectionMode::Grpc, "grpc://w:1").unwrap(),
+            vec![None]
+        );
+        assert_eq!(
+            dp_rank_expansion(None, ConnectionMode::Grpc, "grpc://w:1").unwrap(),
+            vec![None]
+        );
+    }
 
     #[test]
     fn normalize_url_preserves_existing_schemes() {
