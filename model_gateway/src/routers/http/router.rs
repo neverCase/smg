@@ -77,7 +77,7 @@ use crate::{
         http::{
             request_body::{serialize_request_body, RequestBodyError},
             request_stream::{CappedBodyStream, StreamProgress},
-            chat_metrics::{ChatMetricsContext, RoutedChatMetricsContext},
+            chat_metrics::{ChatMetricsContext, ChatTokenUsage, RoutedChatMetricsContext},
             sse_observer::ChatStreamTtftObserver,
         },
         router_manager::RouterManager,
@@ -1905,6 +1905,28 @@ impl Router {
             .await
             {
                 Ok(body) => {
+                    if let (Some(context), Some(usage)) =
+                        (routed_metrics, ChatTokenUsage::from_json_slice(&body))
+                    {
+                        Metrics::record_http_chat_tokens(
+                            &context.model,
+                            &context.worker,
+                            &context.worker_uid,
+                            false,
+                            usage.input_tokens,
+                            usage.output_tokens,
+                        );
+
+                        warn!(
+                            model = %context.model,
+                            worker = %context.worker,
+                            worker_uid = %context.worker_uid,
+                            input_tokens = ?usage.input_tokens,
+                            output_tokens = ?usage.output_tokens,
+                            "TPM_DIAG tokens_recorded"
+                        );
+                    }
+
                     let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;

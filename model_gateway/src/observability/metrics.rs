@@ -534,6 +534,21 @@ pub(crate) fn init_metrics() {
         "HTTP chat request dispatches to workers, including retry attempts"
     );
 
+    describe_counter!(
+        "smg_http_chat_tokens_total",
+        "HTTP chat tokens reported by observed worker response usage by model, worker and token type"
+    );
+
+    describe_histogram!(
+        "smg_http_chat_tpot_seconds",
+        "HTTP streaming chat time per output token from first output token to final usage by model and worker"
+    );
+
+    describe_counter!(
+        "smg_http_chat_tpot_missing_total",
+        "HTTP streaming chat completions without an observable TPOT by model, worker and reason"
+    );
+
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
 
@@ -1930,7 +1945,8 @@ impl Metrics {
             "worker" => worker_label,
             "worker_uid" => worker_uid_label,
             "streaming" => STREAMING_TRUE,
-        ).record(duration.as_secs_f64());
+        )
+        .record(duration.as_secs_f64());
     }
 
     pub fn record_http_chat_ttft_missing(
@@ -1950,7 +1966,8 @@ impl Metrics {
             "worker_uid" => worker_uid_label,
             "streaming" => STREAMING_TRUE,
             "reason" => reason,
-        ).increment(1);
+        )
+        .increment(1);
     }
 
     pub fn record_http_chat_worker_dispatch(
@@ -1969,7 +1986,87 @@ impl Metrics {
             "worker" => worker,
             "worker_uid" => worker_uid,
             "streaming" => bool_to_static_str(streaming),
-        ).increment(1);
+        )
+        .increment(1);
+    }
+
+    pub fn record_http_chat_tokens(
+        model_id: &str,
+        worker: &str,
+        worker_uid: &str,
+        streaming: bool,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    ) {
+        let model = intern_model_label(model_id);
+        let worker_label = intern_string(worker);
+        let worker_uid_label = intern_string(worker_uid);
+        let streaming_label = bool_to_static_str(streaming);
+
+        if let Some(input_tokens) = input_tokens {
+            counter!(
+                "smg_http_chat_tokens_total",
+                "model" => Arc::clone(&model),
+                "worker" => Arc::clone(&worker_label),
+                "worker_uid" => Arc::clone(&worker_uid_label),
+                "streaming" => streaming_label,
+                "token_type" => metrics_labels::TOKEN_INPUT,
+            )
+            .increment(input_tokens);
+        }
+
+        if let Some(output_tokens) = output_tokens {
+            counter!(
+                "smg_http_chat_tokens_total",
+                "model" => model,
+                "worker" => worker_label,
+                "worker_uid" => worker_uid_label,
+                "streaming" => streaming_label,
+                "token_type" => metrics_labels::TOKEN_OUTPUT,
+            )
+            .increment(output_tokens);
+        }
+    }
+
+    pub fn record_http_chat_tpot(
+        model_id: &str,
+        worker: &str,
+        worker_uid: &str,
+        duration: Duration,
+    ) {
+        let model = intern_model_label(model_id);
+        let worker_label = intern_string(worker);
+        let worker_uid_label = intern_string(worker_uid);
+
+        histogram!(
+            "smg_http_chat_tpot_seconds",
+            "model" => model,
+            "worker" => worker_label,
+            "worker_uid" => worker_uid_label,
+            "streaming" => STREAMING_TRUE,
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    pub fn record_http_chat_tpot_missing(
+        model_id: &str,
+        worker: &str,
+        worker_uid: &str,
+        reason: &'static str,
+    ) {
+        let model = intern_model_label(model_id);
+        let worker_label = intern_string(worker);
+        let worker_uid_label = intern_string(worker_uid);
+
+        counter!(
+            "smg_http_chat_tpot_missing_total",
+            "model" => model,
+            "worker" => worker_label,
+            "worker_uid" => worker_uid_label,
+            "streaming" => STREAMING_TRUE,
+            "reason" => reason,
+        )
+        .increment(1);
     }
 }
 
@@ -2035,6 +2132,48 @@ mod tests {
             line.ends_with(&format!(" {value}")),
             "{name} expected value {value}: {line}"
         );
+    }
+
+    #[test]
+    fn record_http_chat_tokens_emits_input_and_output_counters() {
+        let rendered = render_with_recorder(|| {
+            Metrics::record_http_chat_tokens(
+                "test-model",
+                "worker-0",
+                "uid-0",
+                true,
+                Some(11),
+                Some(7),
+            );
+        });
+
+        for (token_type, value) in [("input", "11"), ("output", "7")] {
+            let line = rendered
+                .lines()
+                .find(|line| {
+                    line.starts_with("smg_http_chat_tokens_total{")
+                        && line.contains(&format!(r#"token_type="{token_type}""#))
+                })
+                .unwrap_or_else(|| {
+                    panic!("HTTP chat {token_type} token counter missing; rendered:\n{rendered}")
+                });
+
+            for label in [
+                r#"model="test-model""#,
+                r#"worker="worker-0""#,
+                r#"worker_uid="uid-0""#,
+                r#"streaming="true""#,
+            ] {
+                assert!(
+                    line.contains(label),
+                    "token counter missing {label}: {line}"
+                );
+            }
+            assert!(
+                line.ends_with(&format!(" {value}")),
+                "unexpected counter: {line}"
+            );
+        }
     }
 
     #[test]
