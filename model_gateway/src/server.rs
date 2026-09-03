@@ -130,7 +130,7 @@ async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
-    WorkerManager::get_engine_metrics(&state.context.worker_registry, &state.context.client)
+    WorkerManager::get_engine_metrics(&state.context.worker_registry)
         .await
         .into_response()
 }
@@ -851,7 +851,6 @@ async fn stop_profile(
 async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
     WorkerManager::get_all_worker_loads(
         &state.context.worker_registry,
-        &state.context.client,
         state
             .context
             .worker_monitor
