@@ -1,10 +1,42 @@
-use std::time::Instant;
+use std::{
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
 use serde_json::Value;
+
+/// Request-scoped handoff for the authoritative SSE time-to-first-token value.
+///
+/// The router-side SSE observer and the server-side audit body stream run in
+/// different tasks, so the value needs shared ownership and a one-shot write.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ChatStreamTtftRecorder {
+    value: Arc<OnceLock<Duration>>,
+}
+
+impl ChatStreamTtftRecorder {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn record(&self, ttft: Duration) {
+        let _ = self.value.set(ttft);
+    }
+
+    pub(crate) fn get(&self) -> Option<Duration> {
+        self.value.get().copied()
+    }
+
+    pub(crate) fn get_ms(&self) -> Option<u64> {
+        self.get()
+            .map(|ttft| u64::try_from(ttft.as_millis()).unwrap_or(u64::MAX))
+    }
+}
 
 pub(crate) struct ChatMetricsContext {
     pub started_at: Instant,
     pub model: String,
+    pub ttft_recorder: Option<ChatStreamTtftRecorder>,
 }
 
 #[derive(Clone)]
@@ -13,6 +45,7 @@ pub(crate) struct RoutedChatMetricsContext {
     pub model: String,
     pub worker: String,
     pub worker_uid: String,
+    pub ttft_recorder: Option<ChatStreamTtftRecorder>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

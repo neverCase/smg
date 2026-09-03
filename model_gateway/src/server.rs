@@ -58,6 +58,7 @@ use crate::{
     },
     routers::{
         common::realtime::ws::RealtimeQueryParams,
+        http::chat_metrics::ChatStreamTtftRecorder,
         conversations,
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         parse, responses as response_handlers,
@@ -258,6 +259,23 @@ async fn v1_chat_completions(
             .unwrap_or_default();
         sink.prepare_chat("/v1/chat/completions", &headers, &body, raw_request)
     });
+
+    let ttft_recorder = if body.stream && pending.is_some() {
+        Some(ChatStreamTtftRecorder::new())
+    } else {
+        None
+    };
+    let pending = pending.map(|mut pending| {
+        if let Some(recorder) = ttft_recorder.as_ref() {
+            pending.set_ttft_recorder(recorder.clone());
+        }
+        pending
+    });
+    let tenant_meta = if let Some(recorder) = ttft_recorder {
+        tenant_meta.with_extension(recorder)
+    } else {
+        tenant_meta
+    };
 
     if body.stream {
         // 只有当明确为 Some(true) 时才匹配成功

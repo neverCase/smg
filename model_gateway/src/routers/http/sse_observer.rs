@@ -71,6 +71,10 @@ impl ChatStreamTtftObserver {
             ttft,
         );
 
+        if let Some(recorder) = self.context.ttft_recorder.as_ref() {
+            recorder.record(ttft);
+        }
+
         warn!(
             model = %self.context.model,
             worker = %self.context.worker,
@@ -499,6 +503,8 @@ fn has_non_empty_object(value: Option<&Value>) -> bool {
 mod tests {
     use std::time::Instant;
 
+    use crate::routers::http::chat_metrics::ChatStreamTtftRecorder;
+
     use super::*;
 
     fn observer() -> ChatStreamTtftObserver {
@@ -507,7 +513,28 @@ mod tests {
             model: "test-model".to_string(),
             worker: "worker-0".to_string(),
             worker_uid: "uid-0".to_string(),
+            ttft_recorder: None,
         })
+    }
+
+    #[test]
+    fn records_ttft_in_shared_recorder() {
+        let recorder = ChatStreamTtftRecorder::new();
+        let mut observer = ChatStreamTtftObserver::new(RoutedChatMetricsContext {
+            started_at: Instant::now(),
+            model: "test-model".to_string(),
+            worker: "worker-0".to_string(),
+            worker_uid: "uid-0".to_string(),
+            ttft_recorder: Some(recorder.clone()),
+        });
+
+        observer.observe_chunk(
+            br#"data: {"choices":[{"delta":{"content":"a"}}]}
+
+"#,
+        );
+
+        assert!(recorder.get().is_some());
     }
 
     #[test]

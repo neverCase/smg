@@ -77,7 +77,10 @@ use crate::{
         http::{
             request_body::{serialize_request_body, RequestBodyError},
             request_stream::{CappedBodyStream, StreamProgress},
-            chat_metrics::{ChatMetricsContext, ChatTokenUsage, RoutedChatMetricsContext},
+            chat_metrics::{
+                ChatMetricsContext, ChatStreamTtftRecorder, ChatTokenUsage,
+                RoutedChatMetricsContext,
+            },
             sse_observer::ChatStreamTtftObserver,
         },
         router_manager::RouterManager,
@@ -400,6 +403,28 @@ impl Router {
         model_id: &str,
         request_started_at: Option<Instant>,
     ) -> Response {
+        self.route_typed_request_with_ttft_start_and_recorder(
+            headers,
+            typed_req,
+            route,
+            model_id,
+            request_started_at,
+            None,
+        )
+        .await
+    }
+
+    async fn route_typed_request_with_ttft_start_and_recorder<
+        T: GenerationRequest + serde::Serialize,
+    >(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: T,
+        route: &'static str,
+        model_id: &str,
+        request_started_at: Option<Instant>,
+        ttft_recorder: Option<ChatStreamTtftRecorder>,
+    ) -> Response {
         let start = Instant::now();
         let ttft_started_at = request_started_at.unwrap_or(start);
         let is_stream = typed_req.is_stream();
@@ -433,6 +458,7 @@ impl Router {
                 ChatMetricsContext {
                     started_at: ttft_started_at,
                     model: model.to_string(),
+                    ttft_recorder: ttft_recorder.clone(),
                 }
             });
 
@@ -618,6 +644,7 @@ impl Router {
             RoutedChatMetricsContext {
                 started_at: ctx.started_at,
                 model: ctx.model.clone(),
+                ttft_recorder: ctx.ttft_recorder.clone(),
 
                 worker: labels
                     .get(POD_NAME_LABEL)
@@ -2777,12 +2804,16 @@ impl RouterTrait for Router {
         let request_started_at = tenant_meta
             .extension::<HttpRequestStartedAt>()
             .map(HttpRequestStartedAt::instant);
-        self.route_typed_request_with_ttft_start(
+        let ttft_recorder = tenant_meta
+            .extension::<ChatStreamTtftRecorder>()
+            .cloned();
+        self.route_typed_request_with_ttft_start_and_recorder(
             headers,
             body,
             "/v1/chat/completions",
             model_id,
             request_started_at,
+            ttft_recorder,
         )
         .await
     }

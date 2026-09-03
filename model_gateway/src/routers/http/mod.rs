@@ -5,7 +5,7 @@ pub mod pd_types;
 pub(crate) mod request_body;
 pub(crate) mod request_stream;
 pub mod router;
-mod chat_metrics;
+pub(crate) mod chat_metrics;
 mod sse_observer;
 use serde_json::Value;
 

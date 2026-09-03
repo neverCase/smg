@@ -43,6 +43,8 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use crate::routers::http::chat_metrics::ChatStreamTtftRecorder;
+
 /// Configuration for [`AuditSink`].
 #[derive(Debug, Clone)]
 pub struct AuditConfig {
@@ -158,7 +160,11 @@ pub struct AuditLog {
     pub status_code: u16,
     pub request_start_ms: u64,
     pub response_end_ms: u64,
+    /// First response byte/chunk, or the authoritative token TTFT when one is
+    /// available (the token value intentionally takes precedence).
     pub time_to_first_byte_ms: Option<u64>,
+    /// First valid output token as identified by the SSE observer.
+    pub time_to_first_token_ms: Option<u64>,
     /// Set when the upstream / client terminated the stream prematurely.
     pub error: Option<String>,
 }
@@ -299,7 +305,8 @@ impl AuditSink {
             raw_request,
             start_ms: now_ms(),
             raw_response: BytesMut::new(),
-            ttft_ms: None,
+            first_byte_ms: None,
+            ttft_recorder: None,
             status_code: 0,
         })
     }
@@ -339,7 +346,8 @@ impl AuditSink {
             raw_request,
             start_ms: now_ms(),
             raw_response: BytesMut::new(),
-            ttft_ms: None,
+            first_byte_ms: None,
+            ttft_recorder: None,
             status_code: 0,
         })
     }
@@ -379,7 +387,8 @@ impl AuditSink {
             raw_request,
             start_ms: now_ms(),
             raw_response: BytesMut::new(),
-            ttft_ms: None,
+            first_byte_ms: None,
+            ttft_recorder: None,
             status_code: 0,
         })
     }
@@ -427,7 +436,10 @@ pub struct PendingAudit {
     raw_response: BytesMut,
     /// Time-to-first-byte in milliseconds, measured from [`Self::start_ms`].
     /// Recorded on the first call to [`PendingAudit::record_first_byte`].
-    ttft_ms: Option<u64>,
+    first_byte_ms: Option<u64>,
+    /// Request-scoped handoff containing the authoritative SSE TTFT, when this
+    /// request is a sampled streaming chat request.
+    ttft_recorder: Option<ChatStreamTtftRecorder>,
     /// HTTP status code of the upstream response. `0` until set by
     /// [`PendingAudit::set_status_code`].
     status_code: u16,
@@ -444,13 +456,27 @@ impl PendingAudit {
         self.status_code = code;
     }
 
-    /// Record TTFT (time-to-first-byte / time-to-first-token) on the very
-    /// first invocation. Subsequent calls are no-ops, so it is safe to call
-    /// from every chunk arrival.
+    /// Attach the request-scoped SSE TTFT handoff used by the streaming chat
+    /// observer. The recorder is shared with the router-side task.
+    pub(crate) fn set_ttft_recorder(&mut self, recorder: ChatStreamTtftRecorder) {
+        self.ttft_recorder = Some(recorder);
+    }
+
+    /// Record the first response byte/chunk. This remains a fallback when the
+    /// SSE observer never sees a valid output token.
     pub fn record_first_byte(&mut self) {
-        if self.ttft_ms.is_none() {
-            self.ttft_ms = Some(now_ms().saturating_sub(self.start_ms));
+        if self.first_byte_ms.is_none() {
+            self.first_byte_ms = Some(now_ms().saturating_sub(self.start_ms));
         }
+    }
+
+    fn resolved_timing(&self) -> (Option<u64>, Option<u64>) {
+        let time_to_first_token_ms = self
+            .ttft_recorder
+            .as_ref()
+            .and_then(ChatStreamTtftRecorder::get_ms);
+        let time_to_first_byte_ms = time_to_first_token_ms.or(self.first_byte_ms);
+        (time_to_first_byte_ms, time_to_first_token_ms)
     }
 
     /// Append a response chunk to the accumulating buffer. Cheap: a `BytesMut`
@@ -468,10 +494,11 @@ impl PendingAudit {
     }
 
     /// Submit the audit record. Consumes the handle so Drop won't double-fire.
-    /// All response-side data (`raw_response`, `ttft_ms`, `status_code`) must
+    /// All response-side data (`raw_response`, timing fields, `status_code`) must
     /// have been fed in via the setters above; this method just stamps the
     /// terminal timestamp and forwards.
     pub fn finalize(mut self, error: Option<String>) {
+        let (time_to_first_byte_ms, time_to_first_token_ms) = self.resolved_timing();
         let raw_response = std::mem::take(&mut self.raw_response).freeze();
         let log = AuditLog {
             request_id: std::mem::take(&mut self.request_id),
@@ -485,7 +512,8 @@ impl PendingAudit {
             status_code: self.status_code,
             request_start_ms: self.start_ms,
             response_end_ms: now_ms(),
-            time_to_first_byte_ms: self.ttft_ms,
+            time_to_first_byte_ms,
+            time_to_first_token_ms,
             error,
         };
         // Mark as finalized by stealing the sink Sender out of `self`.
@@ -512,6 +540,7 @@ impl Drop for PendingAudit {
         // Safety-net path: emit whatever data was accumulated so far. This
         // keeps partial streaming responses observable when the client
         // disconnected before terminal events fired.
+        let (time_to_first_byte_ms, time_to_first_token_ms) = self.resolved_timing();
         let raw_response = std::mem::take(&mut self.raw_response).freeze();
         let log = AuditLog {
             request_id: std::mem::take(&mut self.request_id),
@@ -525,7 +554,8 @@ impl Drop for PendingAudit {
             status_code: self.status_code,
             request_start_ms: self.start_ms,
             response_end_ms: now_ms(),
-            time_to_first_byte_ms: self.ttft_ms,
+            time_to_first_byte_ms,
+            time_to_first_token_ms,
             error: Some("dropped_without_finalize".to_string()),
         };
         self.sink.try_send(log);
@@ -538,7 +568,8 @@ impl Drop for PendingAudit {
 /// 1. Passes through each response chunk unchanged (so SSE streaming keeps
 ///    its incremental delivery semantics).
 /// 2. Records the wall-clock delta between request start and the *first*
-///    chunk — i.e. Time To First Byte / Time To First Token.
+///    chunk as the fallback Time To First Byte value. The authoritative
+///    Time To First Token is supplied by the SSE observer when available.
 /// 3. Accumulates all chunks into a [`BytesMut`] buffer so the audit log
 ///    can carry the full upstream payload.
 /// 4. On stream end (normal, error, or drop-on-disconnect) finalizes the
@@ -743,6 +774,7 @@ mod tests {
             request_start_ms: 0,
             response_end_ms: 0,
             time_to_first_byte_ms: None,
+            time_to_first_token_ms: None,
             error: None,
         };
         // Fill the queue + overflow several times.
@@ -751,6 +783,38 @@ mod tests {
         }
         let s = sink.stats();
         assert!(s.dropped_full > 0, "expected drops, got {s:?}");
+    }
+
+    #[test]
+    fn token_ttft_overrides_first_byte_timing() {
+        let recorder = ChatStreamTtftRecorder::new();
+        recorder.record(Duration::from_millis(42));
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let pending = PendingAudit {
+            sink: AuditSink {
+                tx,
+                sample_rate: 1.0,
+                stats: Arc::new(Stats::default()),
+            },
+            request_id: "request".into(),
+            api_key: String::new(),
+            user_id: String::new(),
+            model: "model".into(),
+            endpoint: "/v1/chat/completions".into(),
+            is_streaming: true,
+            raw_request: Bytes::new(),
+            start_ms: 0,
+            raw_response: BytesMut::new(),
+            first_byte_ms: Some(7),
+            ttft_recorder: Some(recorder),
+            status_code: 200,
+        };
+
+        pending.finalize(None);
+        let log = rx.try_recv().expect("finalized audit log should be queued");
+        assert_eq!(log.time_to_first_byte_ms, Some(42));
+        assert_eq!(log.time_to_first_token_ms, Some(42));
     }
 
     #[test]
