@@ -26,8 +26,8 @@ use tokio::{
 };
 
 use super::{
-    event::WorkerConnected, overload::OverloadThresholds, CircuitBreaker, ResolvedResilience,
-    WorkerError, WorkerResult, UNKNOWN_MODEL_ID,
+    event::WorkerConnected, overload::OverloadThresholds, pd_pairing::PdPairing, CircuitBreaker,
+    ResolvedResilience, WorkerError, WorkerResult, UNKNOWN_MODEL_ID,
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
@@ -426,6 +426,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Get worker-specific metadata
     fn metadata(&self) -> &WorkerMetadata;
 
+    /// The PD pairing descriptor placement compares across a prefill and a
+    /// decode.
+    fn pd_pairing(&self) -> &PdPairing {
+        &self.metadata().pd_pairing
+    }
+
     /// Worker-reported in-flight capacity, if available.
     ///
     /// Reads the running-window label populated by the metadata discovery
@@ -609,6 +615,31 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     fn dp_size(&self) -> Option<usize> {
         self.metadata().dp_size()
     }
+
+    /// The KV transfer engine id the worker's engine currently reports: the
+    /// spec's, unless a recovery re-read it (see
+    /// [`Self::refresh_kv_engine_id`]). A PD handoff must be minted for the
+    /// engine process that is there now, not the one discovered at
+    /// registration (#2491).
+    fn kv_engine_id(&self) -> Option<String> {
+        self.metadata().spec.kv_engine_id.clone()
+    }
+
+    /// Replace the engine id after a re-read. Returns `true` when it changed.
+    fn refresh_kv_engine_id(&self, _kv_engine_id: Option<String>) -> bool {
+        false
+    }
+
+    /// Whether the engine id in force has been confirmed by the engine since
+    /// the worker last recovered. `false` after a re-read that failed,
+    /// expired or returned no id, so the next probe tries again instead of
+    /// the worker serving with a possibly stale id until its next outage.
+    fn kv_engine_id_confirmed(&self) -> bool {
+        true
+    }
+
+    /// Record the outcome of a re-read (see [`Self::kv_engine_id_confirmed`]).
+    fn set_kv_engine_id_confirmed(&self, _confirmed: bool) {}
 
     /// Transform a request for DP-aware routing.
     ///
@@ -888,6 +919,9 @@ pub struct WorkerMetadata {
     /// `spec.http_pool.http2` when declared, else negotiated at registration
     /// under `upstream_http2`.
     pub http2: bool,
+    /// What this worker offers a PD rendezvous partner, derived once from
+    /// the spec and its discovered labels (#2483).
+    pub pd_pairing: PdPairing,
 }
 
 impl WorkerMetadata {
@@ -1273,6 +1307,16 @@ pub struct BasicWorker {
     /// When not `Wildcard`, overrides metadata.models for routing decisions.
     /// Uses `ArcSwap` for lock-free reads on the hot path (`supports_model`).
     pub models_override: Arc<ArcSwap<WorkerModels>>,
+    /// The KV transfer engine id in force, seeded from the spec and replaced
+    /// when a recovered engine reports a new one (see
+    /// [`Worker::refresh_kv_engine_id`]). Not shared across same-URL
+    /// replacements: a worker built from a fresh discovery starts from its
+    /// own spec, and one rebuilt by a properties update starts from that
+    /// spec's (unrefreshed) id.
+    pub kv_engine_id: ArcSwapOption<String>,
+    /// Set while a recovery re-read of the engine id has not succeeded yet
+    /// (see [`Worker::kv_engine_id_confirmed`]).
+    pub kv_engine_id_unconfirmed: AtomicBool,
     /// Worker-directed HTTP client, shared across same-config workers, built
     /// on first use (see [`LazyHttpClient`]).
     pub http_client: Arc<LazyHttpClient>,
@@ -1291,6 +1335,10 @@ impl Clone for BasicWorker {
             zmq_connect_abort: Arc::clone(&self.zmq_connect_abort),
             connect_signal_tx: self.connect_signal_tx.clone(),
             models_override: Arc::clone(&self.models_override),
+            kv_engine_id: ArcSwapOption::new(self.kv_engine_id.load_full()),
+            kv_engine_id_unconfirmed: AtomicBool::new(
+                self.kv_engine_id_unconfirmed.load(Ordering::Relaxed),
+            ),
             http_client: Arc::clone(&self.http_client),
             resilience: self.resilience.clone(),
         }
@@ -1426,6 +1474,28 @@ impl BasicWorker {
 
 #[async_trait]
 impl Worker for BasicWorker {
+    fn kv_engine_id(&self) -> Option<String> {
+        self.kv_engine_id.load_full().map(|id| (*id).clone())
+    }
+
+    fn refresh_kv_engine_id(&self, kv_engine_id: Option<String>) -> bool {
+        let previous = self.kv_engine_id.load_full();
+        if previous.as_deref() == kv_engine_id.as_ref() {
+            return false;
+        }
+        self.kv_engine_id.store(kv_engine_id.map(Arc::new));
+        true
+    }
+
+    fn kv_engine_id_confirmed(&self) -> bool {
+        !self.kv_engine_id_unconfirmed.load(Ordering::Relaxed)
+    }
+
+    fn set_kv_engine_id_confirmed(&self, confirmed: bool) {
+        self.kv_engine_id_unconfirmed
+            .store(!confirmed, Ordering::Relaxed);
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1954,6 +2024,9 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
     let metadata = worker.metadata();
     let spec = metadata.spec.clone();
     let status = worker.status();
+    // Only PD legs pair; a regular worker's descriptor would be noise.
+    let pd_pairing = matches!(spec.worker_type, WorkerType::Prefill | WorkerType::Decode)
+        .then(|| metadata.pd_pairing.key());
 
     WorkerInfo {
         id: worker.url().to_string(),
@@ -1963,6 +2036,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         status: Some(status),
         load: worker.load(),
         http2: metadata.http2,
+        pd_pairing,
         engine_load: None,
         job_status: None,
     }
@@ -2850,6 +2924,7 @@ mod tests {
     #[test]
     fn test_worker_metadata_empty_models_accepts_all() {
         let metadata = WorkerMetadata {
+            pd_pairing: PdPairing::derive(&WorkerSpec::new("http://test:8080")),
             spec: Arc::new(WorkerSpec::new("http://test:8080")),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
@@ -2875,6 +2950,7 @@ mod tests {
         let mut spec = WorkerSpec::new("http://test:8080");
         spec.models = WorkerModels::from(vec![model1, model2]);
         let metadata = WorkerMetadata {
+            pd_pairing: PdPairing::derive(&spec),
             spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),

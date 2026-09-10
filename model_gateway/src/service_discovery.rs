@@ -1266,6 +1266,7 @@ mod tests {
             )),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
+            rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             remote_auth_client: None,
             audit_sink: None,

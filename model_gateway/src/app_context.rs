@@ -88,6 +88,8 @@ pub struct AppContext {
     pub worker_client_cache: Arc<WorkerHttpClientCache>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    /// RL control plane state; `None` unless `router_config.rl.enabled`.
+    pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
     /// Optional remote-auth HTTP client. When set, every chat-completion-style
     /// handler verifies the caller's token + model_id against the remote
@@ -393,6 +395,8 @@ impl AppContextBuilder {
             &router_config.tenant_api_keys,
         );
 
+        let rl = crate::rl_adapter::build_rl_state(&worker_registry, &router_config);
+
         Ok(AppContext {
             gateway_auth,
             client: self
@@ -437,6 +441,7 @@ impl AppContextBuilder {
             worker_client_cache,
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
+            rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             remote_auth_client: self.remote_auth_client,
             audit_sink: AuditConfig::from_env().map(|cfg| Arc::new(AuditSink::spawn(cfg))),
@@ -594,10 +599,13 @@ impl AppContextBuilder {
 
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
-        self.policy_registry = Some(Arc::new(PolicyRegistry::with_override(
-            config.policy.clone(),
-            config.routing_key_override.clone(),
-        )));
+        self.policy_registry = Some(Arc::new(
+            PolicyRegistry::with_override(
+                config.policy.clone(),
+                config.routing_key_override.clone(),
+            )
+            .with_pd_pairing_mode(config.pd_pairing_mode),
+        ));
         self
     }
 

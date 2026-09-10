@@ -599,12 +599,12 @@ impl Router {
                 ) {
                     PlacementFailure::NoCandidates => error::model_not_found(model_id),
                     PlacementFailure::AllOverloaded(shed) => shed,
-                    PlacementFailure::Unavailable | PlacementFailure::PolicyDeclined(_) => {
-                        error::service_unavailable(
-                            "no_available_workers",
-                            "All workers are unavailable (circuit breaker open or unhealthy)",
-                        )
-                    }
+                    PlacementFailure::Unavailable
+                    | PlacementFailure::PolicyDeclined(_)
+                    | PlacementFailure::NoCompatiblePair { .. } => error::service_unavailable(
+                        "no_available_workers",
+                        "All workers are unavailable (circuit breaker open or unhealthy)",
+                    ),
                 };
             }
         };
@@ -936,7 +936,8 @@ impl Router {
                 PlacementFailure::AllOverloaded(shed) => shed,
                 PlacementFailure::NoCandidates
                 | PlacementFailure::Unavailable
-                | PlacementFailure::PolicyDeclined(_) => {
+                | PlacementFailure::PolicyDeclined(_)
+                | PlacementFailure::NoCompatiblePair { .. } => {
                     // The verdict cannot tell a policy miss from a drained
                     // pool; the pool can.
                     let message = if non_dp_workers.iter().any(|w| w.is_available()) {
@@ -1078,6 +1079,15 @@ impl Router {
                 loop {
                     tokio::select! {
                         chunk = stream.next() => match chunk {
+                            // An upstream body can yield a zero-length chunk (the
+                            // chunked-encoding terminator surfaces as one). Forwarded,
+                            // hyper's h2 server sends it as an empty non-END_STREAM
+                            // DATA frame, and h2 >= 0.4.16 clients count those per
+                            // connection (never reset) and close the connection with
+                            // ENHANCE_YOUR_CALM after 100 — i.e. after ~100 streamed
+                            // responses on one client connection. Carry no bytes, send
+                            // no frame.
+                            Some(Ok(bytes)) if bytes.is_empty() => {}
                             Some(Ok(bytes)) => {
                                 if tx.send(Ok(bytes)).await.is_err() {
                                     client_disconnected = true;
@@ -1790,6 +1800,9 @@ impl Router {
                 loop {
                     tokio::select! {
                         chunk = stream.next() => match chunk {
+                            // Same as the regular relay: an empty upstream chunk must
+                            // not become an empty h2 DATA frame toward the client.
+                            Some(Ok(bytes)) if bytes.is_empty() => {}
                             Some(Ok(bytes)) => {
                                 if let Some(observer) = ttft_observer.as_mut() {
                                     observer.observe_chunk(&bytes);
