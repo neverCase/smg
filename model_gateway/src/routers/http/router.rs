@@ -1330,7 +1330,8 @@ impl Router {
                 PlacementFailure::AllOverloaded(shed) => shed,
                 PlacementFailure::NoCandidates
                 | PlacementFailure::Unavailable
-                | PlacementFailure::PolicyDeclined(_) => {
+                | PlacementFailure::PolicyDeclined(_)
+                | PlacementFailure::NoCompatiblePair { .. } => {
                     // The verdict cannot tell a policy miss from a drained
                     // pool; the pool can.
                     let message = if non_dp_workers.iter().any(|w| w.is_available()) {
@@ -1345,7 +1346,7 @@ impl Router {
             return resp;
         };
 
-        // Same dispatch-time re-check the regular path takes. A multipart request
+        // Same dispatch-time re-check the regular path takes. A transcription
         // occupies its worker for far longer than a chat completion, so a
         // report landing in the selection→dispatch window is the one case where
         // dispatching anyway is measurably worse.
@@ -1354,7 +1355,7 @@ impl Router {
             return resp;
         }
 
-        // Multipart requests currently have no rid; the header is the whole sticky key.
+        // Streamed requests have no rid; the header is the whole sticky key.
         let load_guard = WorkerLoadGuard::with_key(
             worker.clone(),
             self.policy_registry.sticky_header_key(headers),
@@ -1390,7 +1391,7 @@ impl Router {
             Ok(res) => res,
             Err(e) => {
                 error!(
-                    "Failed to send multipart request worker_url={} route={} error={}",
+                    "Failed to send multipart transcription request worker_url={} route={} error={}",
                     worker.url(),
                     route,
                     e
@@ -1472,6 +1473,15 @@ impl Router {
                 loop {
                     tokio::select! {
                         chunk = stream.next() => match chunk {
+                            // An upstream body can yield a zero-length chunk (the
+                            // chunked-encoding terminator surfaces as one). Forwarded,
+                            // hyper's h2 server sends it as an empty non-END_STREAM
+                            // DATA frame, and h2 >= 0.4.16 clients count those per
+                            // connection (never reset) and close the connection with
+                            // ENHANCE_YOUR_CALM after 100 — i.e. after ~100 streamed
+                            // responses on one client connection. Carry no bytes, send
+                            // no frame.
+                            Some(Ok(bytes)) if bytes.is_empty() => {}
                             Some(Ok(bytes)) => {
                                 if tx.send(Ok(bytes)).await.is_err() {
                                     client_disconnected = true;
