@@ -60,7 +60,6 @@ use crate::{
     routers::{
         common::realtime::ws::RealtimeQueryParams,
         http::chat_metrics::ChatStreamTtftRecorder,
-        conversations,
         gateway::Gateway,
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         RouterTrait,
@@ -179,10 +178,9 @@ async fn check_remote_auth(
             .into_response());
     };
 
-    let exists = state.router_manager
-        .as_ref().unwrap().
-        get_models_all().iter().
-        any(|card| card.id == model_id);
+    let exists = models::get_models_all(&state.context)
+        .iter()
+        .any(|card| card.id == model_id);
     if !exists {
         return Err((
             StatusCode::FORBIDDEN,

@@ -25,6 +25,16 @@ use crate::{
     worker::{ProviderType, RuntimeType, WorkerRegistry},
 };
 
+// Return all health model cards
+pub fn get_models_all(context: &AppContext) -> Vec<ModelCard> {
+    context.worker_registry
+        .get_all()
+        .iter()
+        .filter(|w| !matches!(w.metadata().spec.runtime_type, RuntimeType::External))
+        .flat_map(|w| w.models())
+        .collect()
+}
+
 /// Answer `GET /v1/models` for the caller identified by `headers`.
 pub async fn list_models(context: &AppContext, headers: &HeaderMap) -> Response {
     list_models_with(

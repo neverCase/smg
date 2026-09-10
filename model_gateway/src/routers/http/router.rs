@@ -1274,23 +1274,14 @@ impl Router {
             }
         };
 
-        // Multipart requests cannot route through `worker.prepare_request`,
+        // Multipart transcription can't route through `worker.prepare_request`,
         // which is the hook that injects `data_parallel_rank` for DP-aware
         // workers. Pre-filter DP-aware workers out of the candidate pool so
         // the policy can pick a non-DP worker when one exists; only fall back
         // to model_not_found / 400 when every candidate is DP-aware.
-        let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
-            None
-        } else {
-            Some(model_id)
-        };
-        let all_workers = self.worker_registry.get_workers_filtered(
-            model_filter,
-            Some(WorkerType::Regular),
-            Some(ConnectionMode::Http),
-            None,
-            false,
-        );
+        let all_workers = self
+            .worker_registry
+            .get_routing_pool(model_id, RoutingPool::HttpRegular);
         if all_workers.is_empty() {
             let resp = error::model_not_found(model_id);
             record_pre_send_error(&resp);
@@ -1309,55 +1300,40 @@ impl Router {
             record_pre_send_error(&resp);
             return resp;
         }
-        let available: Vec<Arc<dyn Worker>> = non_dp_workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-        if available.is_empty() {
-            let resp =
-                overload::shed_if_all_overloaded(&non_dp_workers, model_id).unwrap_or_else(|| {
-                    error::service_unavailable(
-                        "no_available_workers",
-                        "All workers are unavailable (circuit breaker open or unhealthy)",
-                    )
-                });
-            record_pre_send_error(&resp);
-            return resp;
-        }
-
-        let policy = self.policy_registry.get_policy_or_default(model_id);
-        let hash_ring = self.worker_registry.get_hash_ring(model_id);
-        let idx = match self.policy_registry.select_worker(
-            &policy,
-            &available,
-            &SelectWorkerInfo {
-                request_text: text.as_deref(),
+        let Some(worker) = placement::select_from(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            &non_dp_workers,
+            PlacementInputs {
+                text: text.as_deref(),
                 tokens: hinted_tokens.as_deref(),
                 headers,
-                routing_key: self.policy_registry.resolve_routing_key(headers),
                 rid_key: None,
-                hash_ring,
-                leg: crate::policies::WorkerLeg::Single,
+                cache_namespace: None,
             },
-        ) {
-            Some(i) => i,
-            None => {
-                let resp = error::service_unavailable(
-                    "no_available_workers",
-                    "Policy returned no eligible worker",
-                );
-                record_pre_send_error(&resp);
-                return resp;
-            }
+        ) else {
+            // Judged from the same candidates whether the pre-filter emptied
+            // or a self-filtering policy missed on an all-overloaded pool, so
+            // a shed keeps its Retry-After, retryability and metric.
+            let resp = match placement::failure_from(&non_dp_workers, model_id) {
+                PlacementFailure::AllOverloaded(shed) => shed,
+                PlacementFailure::NoCandidates
+                | PlacementFailure::Unavailable
+                | PlacementFailure::PolicyDeclined(_) => {
+                    // The verdict cannot tell a policy miss from a drained
+                    // pool; the pool can.
+                    let message = if non_dp_workers.iter().any(|w| w.is_available()) {
+                        "Policy returned no eligible worker"
+                    } else {
+                        "All workers are unavailable (circuit breaker open or unhealthy)"
+                    };
+                    error::service_unavailable("no_available_workers", message)
+                }
+            };
+            record_pre_send_error(&resp);
+            return resp;
         };
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_REGULAR,
-            metrics_labels::CONNECTION_HTTP,
-            model_id,
-            policy.name(),
-        );
-        let worker = available[idx].clone();
 
         // Same dispatch-time re-check the regular path takes. A multipart request
         // occupies its worker for far longer than a chat completion, so a
@@ -1390,7 +1366,7 @@ impl Router {
         };
 
         let endpoint_url = worker.endpoint_url(route);
-        let mut request_builder = self.client.post(&endpoint_url).multipart(form);
+        let mut request_builder = worker.http_client().post(&endpoint_url).multipart(form);
 
         // reqwest sets the multipart Content-Type (with boundary) itself; the
         // forward allow-list already excludes Content-Type/Content-Length.

@@ -43,7 +43,7 @@ use tracing::{debug, info, warn};
 use crate::{
     app_context::AppContext,
     config::RoutingMode,
-    middleware::{AuthConfig, RemoteAuthClient, TenantRequestMeta},
+    middleware::{RemoteAuthClient, TenantRequestMeta},
     routers::{
         common::body_policy::REASON_MODEL_SELECTION,
         error as route_error,
@@ -56,8 +56,6 @@ use crate::{
 
 pub struct Gateway {
     worker_registry: Arc<WorkerRegistry>,
-    /// Optional remote auth client; when set, `/v1/models` filters returned
-    /// cards by the caller token's allowed-models list.
     remote_auth_client: Option<Arc<RemoteAuthClient>>,
     routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
     default_router: Arc<std::sync::RwLock<Option<RouterId>>>,
