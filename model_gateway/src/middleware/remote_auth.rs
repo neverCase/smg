@@ -6,7 +6,7 @@
 //! - `POST {url}/verify`   — accepts `{ "token": "...", "model_id": "..." }`,
 //!   returns 200 on success / 403 on deny.
 //! - `POST {url}/allowed-models` — accepts `{ "token": "..." }`,
-//!   returns `{ "models": ["m1", "m2", ...] }`.
+//!   returns `{ "allow_all": false, "models": ["m1", "m2", ...] }`.
 //!
 //! The client is read-only; it only calls *out* to the auth service and never
 //! mutates local state.  Timeout and fail-closed/-open are configurable via
@@ -70,6 +70,7 @@ impl RemoteAuthClient {
                     .starts_with("bearer ")
                     .then(|| h[7..].to_string())
             })
+            .filter(|token| !token.is_empty())
         {
             return Some(token);
         }
@@ -169,9 +170,9 @@ impl RemoteAuthClient {
     ///
     /// Calls `POST {url}/allowed-models` with JSON body `{ "token" }`.
     ///
-    /// Returns an empty `Vec` on any error (auth service unreachable, non-2xx,
-    /// or malformed JSON) — the caller should treat this as "no models
-    /// available" for the given token.
+    /// Returns `None` on any error (auth service unreachable, non-2xx, or
+    /// malformed JSON). The caller should treat this as "no models available"
+    /// for the given token.
     pub async fn allowed_models(&self, token: &str) -> Option<AllowedModelsResponse> {
         let url = format!("{}/allowed-models", self.config.url);
         let timeout = Duration::from_secs(self.config.timeout_secs);
@@ -191,6 +192,7 @@ impl RemoteAuthClient {
                 match resp.json::<AllowedModelsResponse>().await {
                     Ok(body) => {
                         debug!(
+                            allow_all = body.allow_all,
                             count = body.models.len(),
                             "RemoteAuth: received allowed models"
                         );
@@ -228,9 +230,10 @@ impl RemoteAuthClient {
 
 // ── internal types ──────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct AllowedModelsResponse {
     pub allow_all: bool,
+    #[serde(default)]
     pub models: Vec<String>,
 }
 

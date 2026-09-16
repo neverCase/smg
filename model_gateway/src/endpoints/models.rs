@@ -5,6 +5,8 @@
 //! external upstreams instead, but never when that credential is one of the
 //! gateway's own keys: a tenant-scoped key must not be forwarded to a third
 //! party as if it were the caller's.
+//! When remote auth is configured, its token is never treated as BYOK: the
+//! endpoint returns only healthy local models approved by `/allowed-models`.
 
 use std::collections::HashSet;
 
@@ -20,7 +22,7 @@ use tracing::{debug, warn};
 
 use crate::{
     app_context::AppContext,
-    middleware::AuthConfig,
+    middleware::{AuthConfig, RemoteAuthClient},
     routers::common::header_utils::apply_provider_headers,
     worker::{ProviderType, RuntimeType, WorkerRegistry},
 };
@@ -37,6 +39,10 @@ pub fn get_models_all(context: &AppContext) -> Vec<ModelCard> {
 
 /// Answer `GET /v1/models` for the caller identified by `headers`.
 pub async fn list_models(context: &AppContext, headers: &HeaderMap) -> Response {
+    if let Some(remote_auth) = context.remote_auth_client.as_ref() {
+        return list_remote_authorized_models(&context.worker_registry, remote_auth, headers).await;
+    }
+
     list_models_with(
         &context.worker_registry,
         &context.client,
@@ -44,6 +50,38 @@ pub async fn list_models(context: &AppContext, headers: &HeaderMap) -> Response 
         headers,
     )
     .await
+}
+
+/// Return the healthy local models authorized by the remote auth service.
+///
+/// Remote-auth tokens are platform credentials, so this path intentionally
+/// bypasses BYOK discovery and never forwards the token to an external worker.
+async fn list_remote_authorized_models(
+    registry: &WorkerRegistry,
+    remote_auth: &RemoteAuthClient,
+    headers: &HeaderMap,
+) -> Response {
+    let Some(token) = remote_auth.extract_token(headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "Missing bearer token",
+                    "type": "authentication_error", 
+                }
+            })),
+        )
+            .into_response();
+    };
+
+    let Some(authorization) = remote_auth.allowed_models(&token).await else {
+        return no_models_response();
+    };
+
+    let allowed_models = (!authorization.allow_all)
+        .then(|| authorization.models.into_iter().collect::<HashSet<_>>());
+
+    authorized_registry_models_response(registry, allowed_models.as_ref())
 }
 
 /// [`list_models`] over explicit collaborators.
@@ -103,12 +141,36 @@ fn registry_models_response(registry: &WorkerRegistry) -> Response {
         .filter(|w| !matches!(w.metadata().spec.runtime_type, RuntimeType::External))
         .flat_map(|w| w.models())
         .collect();
+    model_cards_response(cards)
+}
+
+/// The remotely-authorized inventory contains only healthy local workers.
+fn authorized_registry_models_response(
+    registry: &WorkerRegistry,
+    allowed_models: Option<&HashSet<String>>,
+) -> Response {
+    let cards: Vec<_> = registry
+        .get_workers_filtered(None, None, None, None, true)
+        .iter()
+        .filter(|w| !matches!(w.metadata().spec.runtime_type, RuntimeType::External))
+        .flat_map(|w| w.models())
+        .filter(|card| allowed_models.is_none_or(|allowed| allowed.contains(&card.id)))
+        .collect();
+    let response = ListModelsResponse::from_model_cards(cards);
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+fn model_cards_response(cards: Vec<ModelCard>) -> Response {
     if cards.is_empty() {
-        (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
+        no_models_response()
     } else {
         let resp = ListModelsResponse::from_model_cards(cards);
         (StatusCode::OK, Json(resp)).into_response()
     }
+}
+
+fn no_models_response() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
 }
 
 /// Fan out to all healthy external upstreams concurrently with the caller's
@@ -202,14 +264,184 @@ mod tests {
         Arc,
     };
 
-    use axum::http::Request;
+    use axum::{http::Request, routing::post};
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
     use crate::{
-        config::types::TenantApiKeyEntry,
+        config::types::{RemoteAuthConfig, TenantApiKeyEntry},
         worker::{BasicWorkerBuilder, Worker, WorkerType},
     };
+
+    #[expect(
+        clippy::disallowed_methods,
+        clippy::unwrap_used,
+        reason = "test infrastructure"
+    )]
+    async fn spawn_remote_auth(
+        response: serde_json::Value,
+    ) -> (RemoteAuthClient, Arc<AtomicUsize>) {
+        let hit_count = Arc::new(AtomicUsize::new(0));
+        let handler_hit_count = hit_count.clone();
+        let app = axum::Router::new().route(
+            "/allowed-models",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let response = response.clone();
+                let hit_count = handler_hit_count.clone();
+                async move {
+                    hit_count.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(body["token"], "test-token");
+                    Json(response)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = RemoteAuthClient::new(
+            reqwest::Client::new(),
+            RemoteAuthConfig {
+                url: format!("http://{addr}"),
+                timeout_secs: 1,
+                fail_closed: true,
+                token_header: "authorization".to_string(),
+            },
+        );
+        (client, hit_count)
+    }
+
+    fn register_local_model(registry: &WorkerRegistry, url: &str, model: &str, healthy: bool) {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .runtime_type(RuntimeType::Sglang)
+                .models(vec![ModelCard::new(model)])
+                .health_config(HealthCheckConfig {
+                    disable_health_check: healthy,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        registry.register(worker);
+    }
+
+    #[expect(clippy::unwrap_used, reason = "test response parsing")]
+    async fn response_model_ids(response: Response) -> HashSet<String> {
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response: ListModelsResponse = serde_json::from_slice(&body).unwrap();
+        response.data.into_iter().map(|model| model.id).collect()
+    }
+
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test request construction")]
+    async fn remote_auth_returns_only_allowed_available_local_models() {
+        let registry = WorkerRegistry::new();
+        register_local_model(&registry, "http://allowed.invalid", "allowed", true);
+        register_local_model(&registry, "http://denied.invalid", "denied", true);
+        register_local_model(&registry, "http://unhealthy.invalid", "unhealthy", false);
+        let external_worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://external.invalid")
+                .worker_type(WorkerType::Regular)
+                .runtime_type(RuntimeType::External)
+                .models(vec![ModelCard::new("external")])
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        registry.register(external_worker);
+
+        let (remote_auth, hit_count) = spawn_remote_auth(serde_json::json!({
+            "allow_all": false,
+            "models": ["allowed", "unhealthy", "external", "not-registered"]
+        }))
+        .await;
+        let request = Request::builder()
+            .header(header::AUTHORIZATION, "bearer test-token")
+            .body(())
+            .unwrap();
+
+        let response =
+            list_remote_authorized_models(&registry, &remote_auth, request.headers()).await;
+
+        assert_eq!(
+            response_model_ids(response).await,
+            HashSet::from(["allowed".into()])
+        );
+        assert_eq!(hit_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test request construction")]
+    async fn remote_auth_allow_all_returns_every_available_local_model() {
+        let registry = WorkerRegistry::new();
+        register_local_model(&registry, "http://one.invalid", "model-one", true);
+        register_local_model(&registry, "http://two.invalid", "model-two", true);
+
+        // `models` may be omitted when `allow_all` is true.
+        let (remote_auth, _) = spawn_remote_auth(serde_json::json!({ "allow_all": true })).await;
+        let request = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer test-token")
+            .body(())
+            .unwrap();
+
+        let response =
+            list_remote_authorized_models(&registry, &remote_auth, request.headers()).await;
+
+        assert_eq!(
+            response_model_ids(response).await,
+            HashSet::from(["model-one".into(), "model-two".into()])
+        );
+    }
+
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test request construction")]
+    async fn remote_auth_returns_empty_list_when_no_allowed_model_is_available() {
+        let registry = WorkerRegistry::new();
+        register_local_model(&registry, "http://local.invalid", "local-model", true);
+
+        let (remote_auth, _) = spawn_remote_auth(serde_json::json!({
+            "allow_all": false,
+            "models": ["not-available"]
+        }))
+        .await;
+        let request = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer test-token")
+            .body(())
+            .unwrap();
+
+        let response =
+            list_remote_authorized_models(&registry, &remote_auth, request.headers()).await;
+
+        assert!(response_model_ids(response).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_auth_requires_token_before_fetching_allowed_models() {
+        let registry = WorkerRegistry::new();
+        let (remote_auth, hit_count) =
+            spawn_remote_auth(serde_json::json!({ "allow_all": true })).await;
+
+        let response =
+            list_remote_authorized_models(&registry, &remote_auth, &HeaderMap::new()).await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let mut empty_token_headers = HeaderMap::new();
+        empty_token_headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer "));
+        let response =
+            list_remote_authorized_models(&registry, &remote_auth, &empty_token_headers).await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(hit_count.load(Ordering::SeqCst), 0);
+    }
 
     /// A tenant-scoped credential must never reach the upstream fan-out:
     /// that would forward the gateway's own secret to an external provider
