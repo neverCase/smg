@@ -189,6 +189,24 @@ fn is_audited_path(path: &str) -> bool {
     matches!(path, "/v1/chat/completions" | "/v1/rerank" | "/v1/embeddings")
 }
 
+/// Extract the credential from an Authorization header for the audit payload.
+/// Authentication schemes are case-insensitive per RFC 7235.
+fn audit_api_key(headers: &http::HeaderMap) -> String {
+    const BEARER_PREFIX: &str = "Bearer ";
+
+    headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .get(..BEARER_PREFIX.len())
+                .filter(|prefix| prefix.eq_ignore_ascii_case(BEARER_PREFIX))
+                .map_or(value, |_| &value[BEARER_PREFIX.len()..])
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
 /// Lock-free atomic counters exposed for tests and ops dashboards.
 #[derive(Debug, Default)]
 struct Stats {
@@ -288,11 +306,7 @@ impl AuditSink {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let api_key = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim_start_matches("Bearer ").to_string())
-            .unwrap_or_default();
+        let api_key = audit_api_key(headers);
         let user_id = body.safety_identifier.clone().unwrap_or_default();
         Some(PendingAudit {
             sink: self.clone(),
@@ -329,11 +343,7 @@ impl AuditSink {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let api_key = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim_start_matches("Bearer ").to_string())
-            .unwrap_or_default();
+        let api_key = audit_api_key(headers);
         let user_id = body.user.clone().unwrap_or_default();
         Some(PendingAudit {
             sink: self.clone(),
@@ -370,11 +380,7 @@ impl AuditSink {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let api_key = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim_start_matches("Bearer ").to_string())
-            .unwrap_or_default();
+        let api_key = audit_api_key(headers);
         let user_id = body.user.clone().unwrap_or_default();
         Some(PendingAudit {
             sink: self.clone(),
@@ -740,6 +746,27 @@ fn rand_unit() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_api_key_strips_bearer_scheme_case_insensitively() {
+        for value in ["Bearer secret", "bearer secret", "bEaReR secret"] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert("authorization", http::HeaderValue::from_static(value));
+
+            assert_eq!(audit_api_key(&headers), "secret");
+        }
+    }
+
+    #[test]
+    fn audit_api_key_preserves_non_bearer_authorization() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Basic credentials"),
+        );
+
+        assert_eq!(audit_api_key(&headers), "Basic credentials");
+    }
 
     #[test]
     fn path_allow_list_only_chat() {
