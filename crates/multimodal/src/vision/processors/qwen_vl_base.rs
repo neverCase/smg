@@ -300,12 +300,26 @@ fn resize_dynamic_frame_to_raw(
 #[derive(Debug, Clone)]
 pub struct QwenVLProcessorBase {
     config: QwenVLConfig,
+    allow_video_dimensions_below_factor: bool,
 }
 
 impl QwenVLProcessorBase {
     /// Create a new processor with the given configuration.
     pub fn new(config: QwenVLConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            allow_video_dimensions_below_factor: false,
+        }
+    }
+
+    /// Allow non-zero video dimensions below the patch-alignment factor.
+    ///
+    /// Some model families upscale these inputs to the minimum aligned size,
+    /// while Qwen processors reject them. This opt-in preserves the Qwen
+    /// default and lets wrappers select the model-specific behavior.
+    pub fn allow_video_dimensions_below_factor(mut self) -> Self {
+        self.allow_video_dimensions_below_factor = true;
+        self
     }
 
     /// Get the patch size.
@@ -539,7 +553,14 @@ impl QwenVLProcessorBase {
             });
         }
 
-        if height < factor || width < factor {
+        if height == 0 || width == 0 {
+            return Err(TransformError::InvalidShape {
+                expected: "non-zero dimensions".to_string(),
+                actual: vec![height, width],
+            });
+        }
+
+        if !self.allow_video_dimensions_below_factor && (height < factor || width < factor) {
             return Err(TransformError::InvalidShape {
                 expected: format!("height and width >= factor ({factor})"),
                 actual: vec![height, width],
@@ -1382,6 +1403,80 @@ mod tests {
     use super::*;
     use crate::vision::transforms::to_tensor_and_normalize;
 
+    /// The opted-in Qwen processors must produce bit-identical pixels and
+    /// metadata when individual images are concatenated instead of batched.
+    #[test]
+    fn test_preprocess_per_image_concat_matches_batch() {
+        use crate::{
+            types::FieldLayout,
+            vision::processors::{Qwen2VLProcessor, Qwen3VLProcessor},
+        };
+
+        let processors: [&dyn VisionPreProcessor; 2] =
+            [&Qwen2VLProcessor::new(), &Qwen3VLProcessor::new()];
+        for processor in processors {
+            assert!(processor.supports_per_image_preprocessing());
+            let config = PreProcessorConfig {
+                image_mean: Some(processor.default_mean().to_vec()),
+                image_std: Some(processor.default_std().to_vec()),
+                min_pixels: Some(56 * 56),
+                max_pixels: Some(112 * 112),
+                ..Default::default()
+            };
+            let images = vec![
+                create_sized_pattern_frame(7, 9, 3),
+                create_sized_pattern_frame(12, 6, 42),
+                create_sized_pattern_frame(8, 8, 250),
+            ];
+
+            let batched = processor.preprocess(&images, &config).unwrap();
+
+            let layouts = std::collections::HashMap::from([
+                ("image_grid_thw".to_string(), FieldLayout::Batched),
+                ("patches_per_image".to_string(), FieldLayout::Batched),
+            ]);
+            let parts = images
+                .iter()
+                .map(|image| {
+                    processor
+                        .preprocess(std::slice::from_ref(image), &config)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let merged = PreprocessedEncoderInputs::concat(parts, &layouts).unwrap();
+
+            assert_eq!(merged.encoder_input_shape(), batched.encoder_input_shape());
+            assert_eq!(merged.feature_token_counts, batched.feature_token_counts);
+            assert_eq!(merged.item_sizes, batched.item_sizes);
+            let merged_values = merged.encoder_input.as_slice_memory_order().unwrap();
+            let batched_values = batched.encoder_input.as_slice_memory_order().unwrap();
+            for (idx, (&got, &want)) in merged_values.iter().zip(batched_values.iter()).enumerate()
+            {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "merged patch value differs at index {idx}: got {got}, want {want}"
+                );
+            }
+            for key in ["image_grid_thw", "patches_per_image"] {
+                let (merged_extra, batched_extra) = (
+                    merged.model_specific.get(key).unwrap(),
+                    batched.model_specific.get(key).unwrap(),
+                );
+                assert!(
+                    matches!(
+                        (merged_extra, batched_extra),
+                        (
+                            ModelSpecificValue::IntTensor { data: got, shape: got_shape },
+                            ModelSpecificValue::IntTensor { data: want, shape: want_shape },
+                        ) if got == want && got_shape == want_shape
+                    ),
+                    "model-specific value {key:?} differs between merged and batched outputs"
+                );
+            }
+        }
+    }
+
     fn create_test_config() -> QwenVLConfig {
         QwenVLConfig {
             patch_size: 14,
@@ -1710,6 +1805,33 @@ mod tests {
     fn test_qwen_vl_base_factor() {
         let processor = QwenVLProcessorBase::new(create_test_config());
         assert_eq!(processor.get_factor(), 28); // 14 * 2
+    }
+
+    #[test]
+    fn test_video_dimension_guards() {
+        let qwen = QwenVLProcessorBase::new(create_test_config());
+        let permissive = qwen.clone().allow_video_dimensions_below_factor();
+        for (height, width) in [(20, 100), (100, 20), (1, 1), (27, 28), (28, 27)] {
+            assert!(matches!(
+                qwen.smart_resize_video(2, height, width),
+                Err(TransformError::InvalidShape { .. })
+            ));
+            assert!(permissive.smart_resize_video(2, height, width).is_ok());
+        }
+        for processor in [&qwen, &permissive] {
+            for (height, width) in [(0, 100), (100, 0), (0, 0)] {
+                assert!(matches!(
+                    processor.smart_resize_video(2, height, width),
+                    Err(TransformError::InvalidShape { .. })
+                ));
+            }
+        }
+        for (height, width) in [(28, 28), (100, 100), (720, 1280)] {
+            assert_eq!(
+                qwen.smart_resize_video(2, height, width).unwrap(),
+                permissive.smart_resize_video(2, height, width).unwrap()
+            );
+        }
     }
 
     #[test]
