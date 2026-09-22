@@ -30,7 +30,7 @@ use super::{
         helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask},
         RateLimitCell,
     },
-    multimodal::{MultimodalComponents, MultimodalIntermediate},
+    multimodal::{InflightPermit, MediaPlan, MultimodalComponents, MultimodalIntermediate},
     proto_wrapper::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
         ProtoRequest, ProtoStream,
@@ -187,10 +187,22 @@ pub(crate) struct ProcessingState {
     /// building `take()`s it for the prefill serialization.
     pub multimodal_intermediate: Option<MultimodalIntermediate>,
 
+    /// Media references kept for a worker that processes them itself; never
+    /// `Some` together with `multimodal_intermediate`. Request building takes it.
+    pub multimodal_refs: Option<MediaPlan>,
+
+    /// Set once request building attached media references, so retry
+    /// re-selection stays pinned to workers that accept them.
+    pub media_refs_forwarded: bool,
+
     /// `Some` iff the request is multimodal EPD and worker selection produced
     /// encode assignments. Request building injects the bootstrap info and drops
     /// prefill pixels; request execution `take()`s the dispatch plan.
     pub encode_outputs: Option<EncodeOutputs>,
+
+    /// Share of the in-flight media budget this request holds until the
+    /// engines have its body.
+    pub multimodal_inflight: Option<InflightPermit>,
 
     /// Resolved tokenizer (set once in preparation, reused in response processing)
     /// This avoids redundant registry lookups across pipeline stages.
@@ -231,16 +243,18 @@ pub(crate) struct RoutingSnapshot {
 pub(crate) use crate::routers::common::placement::WireConstraint;
 
 impl WireConstraint {
-    fn of(workers: &WorkerSelection) -> Self {
+    fn of(workers: &WorkerSelection, requires_media_refs: bool) -> Self {
         match workers {
             WorkerSelection::Single { worker } => Self {
                 runtime: worker.metadata().spec.runtime_type,
                 connection: *worker.connection_mode(),
+                requires_media_refs,
             },
             // Disaggregated legs are gRPC-only.
             WorkerSelection::Disaggregated { runtime_type, .. } => Self {
                 runtime: *runtime_type,
                 connection: ConnectionMode::Grpc,
+                requires_media_refs,
             },
         }
     }
@@ -271,6 +285,7 @@ pub(crate) struct DispatchContext {
     /// Consumed by the first dispatch; retries re-dispatch only the
     /// prefill/decode legs against the already-running encode jobs.
     pub encode_outputs: Option<EncodeOutputs>,
+    pub multimodal_inflight: Option<InflightPermit>,
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
     pub response: ResponseState,
@@ -701,6 +716,9 @@ pub(crate) struct ResponseState {
     /// Final processed response
     pub final_response: Option<FinalResponse>,
 
+    /// Rendered prompt tokens the client-facing usage drops; settlement adds them back.
+    pub unbilled_prompt_tokens: u32,
+
     /// Responses API iteration result (Harmony only, for tool loop orchestration)
     pub responses_iteration_result: Option<super::harmony::ResponsesIterationResult>,
 }
@@ -806,7 +824,7 @@ impl RequestContext {
         let wire = state
             .workers
             .as_ref()
-            .map(WireConstraint::of)
+            .map(|workers| WireConstraint::of(workers, state.media_refs_forwarded))
             .ok_or_else(|| {
                 error!(
                     function = "RequestContext::into_dispatch",
@@ -830,6 +848,7 @@ impl RequestContext {
             sticky_key: state.sticky_key,
             clients: state.clients,
             encode_outputs: state.encode_outputs,
+            multimodal_inflight: state.multimodal_inflight,
             dispatch: None,
             load_guards: None,
             response: state.response,

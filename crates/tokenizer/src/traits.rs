@@ -40,6 +40,22 @@ impl std::fmt::Debug for EncodeJob {
     }
 }
 
+/// Renderer behaviours the gateway mirrors when it prepares a request, so
+/// the rendered prompt and the request handling never disagree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RendererCapabilities {
+    /// The renderer reads `enable_thinking` as an alias of its thinking key.
+    pub enable_thinking_alias: bool,
+    /// With `add_generation_prompt` false the renderer continues a trailing
+    /// assistant message itself (no EOS, no generation header); the gateway
+    /// must keep the message instead of popping it into a text prefix.
+    pub native_assistant_continuation: bool,
+    /// The renderer parses tool-call `arguments` strings itself with the
+    /// reference's tolerance (non-object and double-encoded values); the
+    /// gateway must forward them as written instead of pre-parsing them.
+    pub raw_tool_call_arguments: bool,
+}
+
 /// How the `text` of a [`ChatTemplateOutput`] becomes token ids.
 #[derive(Debug)]
 pub enum PromptEncoding {
@@ -56,6 +72,8 @@ pub struct ChatTemplateOutput {
     /// The flat prompt, for logs, routing, and `original_text`.
     pub text: String,
     pub encoding: PromptEncoding,
+    /// Prompt tokens the provider does not bill (K3's response-channel stub); 0 for flat renderers.
+    pub unbilled_prompt_tokens: u32,
 }
 
 /// Core encoding trait - separate from decoding for modularity
@@ -158,6 +176,7 @@ pub trait Tokenizer: Encoder + Decoder {
         Ok(ChatTemplateOutput {
             text,
             encoding: PromptEncoding::FromText,
+            unbilled_prompt_tokens: 0,
         })
     }
 
@@ -186,6 +205,11 @@ pub trait Tokenizer: Encoder + Decoder {
     /// Whether the template injects `<think>` in the generation prompt.
     fn think_in_prefill(&self) -> bool {
         false
+    }
+
+    /// Renderer behaviours the gateway mirrors when it prepares a request.
+    fn renderer_capabilities(&self) -> RendererCapabilities {
+        RendererCapabilities::default()
     }
 
     /// Set or override the chat template.

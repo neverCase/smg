@@ -64,6 +64,7 @@ elif [ "$HOST_VERSION" = "$PY_VERSION" ]; then
             exit 1
         fi
         echo "venv creation failed - installing python3-venv/python3-pip, then retrying"
+        bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
         $RETRY 3 10 $SUDO apt-get update
         $RETRY 3 10 $SUDO apt-get install -y python3-pip python3-venv
         rm -rf .venv
@@ -105,6 +106,18 @@ echo "venv interpreter: $ACTUAL_VERSION (pinned)"
 if [ -n "${GITHUB_PATH:-}" ]; then
     echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
     echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
+    # Expose the host CUDA toolkit when there is one. vLLM only enables its
+    # FlashInfer paths when `nvcc` is on PATH (or flashinfer-cubin is installed,
+    # which no longer ships for current FlashInfer releases); the pip
+    # nvidia-cuda-nvcc wheel lands under site-packages, where shutil.which never
+    # looks. With the toolkit installed but off PATH, a bare-metal runner runs
+    # every lane with FlashInfer silently disabled, and vLLM 0.27.1's MXFP8
+    # kernel selector then picks a FlashInfer kernel it cannot run
+    # ("module 'vllm.utils.flashinfer' has no attribute 'mm_mxfp8'"). The k8s
+    # GPU images ship the CUDA runtime but no toolkit, so this is a no-op there.
+    if [ -x /usr/local/cuda/bin/nvcc ]; then
+        echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+    fi
 else
     echo "Activate venv with: source .venv/bin/activate"
 fi

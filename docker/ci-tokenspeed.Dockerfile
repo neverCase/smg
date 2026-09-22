@@ -32,8 +32,9 @@ FROM ${BASE_IMAGE}
 
 WORKDIR /opt/smg-ci
 
-# Copied ahead of the apt bootstrap so that bootstrap can retry too.
-COPY scripts/ci_retry.sh scripts/
+# Copied ahead of the apt bootstrap so that bootstrap can retry and fail
+# over to a mirror too.
+COPY scripts/ci_retry.sh scripts/ci_apt_mirror.sh scripts/
 
 # Build prerequisites the bare base lacks (the runner pods already carry
 # these). python3 is 3.12 on noble, matching the CI interpreter pin.
@@ -41,13 +42,14 @@ COPY scripts/ci_retry.sh scripts/
 # find_package(Python COMPONENTS Interpreter Development.Module), which
 # needs Python.h — without it the configure step fails.
 ENV DEBIAN_FRONTEND=noninteractive
-RUN bash scripts/ci_retry.sh 3 10 apt-get update \
+RUN bash scripts/ci_apt_mirror.sh \
+    && bash scripts/ci_retry.sh 3 10 apt-get update \
     && bash scripts/ci_retry.sh 3 10 apt-get install -y --no-install-recommends \
         ca-certificates curl git build-essential pkg-config \
         python3 python3-dev python3-venv python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-COPY scripts/ci_setup_python_venv.sh scripts/ci_install_tokenspeed.sh scripts/
+COPY scripts/ci_setup_python_venv.sh scripts/ci_install_tokenspeed.sh scripts/ci_ensure_python_headers.sh scripts/
 COPY .github/versions/tokenspeed.ref .github/versions/tokenspeed.ref
 
 # Keep the TokenSpeed checkout inside the image: the venv's editable installs

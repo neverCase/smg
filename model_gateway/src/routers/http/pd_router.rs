@@ -1353,6 +1353,7 @@ impl PDRouter {
                 headers,
                 rid_key,
                 cache_namespace,
+                candidate_filter: None,
             },
         )
         .map_err(|failure| Box::new(Self::pair_failure(*failure)))?;
@@ -2167,6 +2168,7 @@ mod tests {
         let request = ChatCompletionRequest {
             model: "test-model".to_string(),
             messages: vec![ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Text("hello".to_string()),
                 name: None,
             }],

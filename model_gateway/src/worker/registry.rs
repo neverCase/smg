@@ -1566,6 +1566,14 @@ impl WorkerRegistry {
         self.url_to_id.entry(url.to_string()).or_default().clone()
     }
 
+    /// Drop a reservation from [`Self::reserve_id_for_url`] whose worker never
+    /// registered, so a failed AddWorker does not orphan the entry (#1533).
+    /// A URL that already has a live worker is left untouched.
+    pub fn release_reservation(&self, url: &str) {
+        self.url_to_id
+            .remove_if(url, |_, id| !self.workers.contains_key(id));
+    }
+
     // ───────────────────────────────────────────────────────────────────
     // 7. Remove
     // ───────────────────────────────────────────────────────────────────

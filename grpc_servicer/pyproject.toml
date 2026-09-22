@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smg-grpc-servicer"
-version = "0.9.1"
+version = "0.12.0"
 description = "SMG gRPC servicer implementations for LLM inference engines (vLLM, MLX, TokenSpeed, SGLang)"
 requires-python = ">=3.10"
 dependencies = [
-    "smg-grpc-proto>=0.4.18",  # 0.4.18: first release with GetServerInfoResponse.pairing_protocol (15)
+    "smg-grpc-proto>=0.4.20",  # 0.4.20: first release with GenerateRequest.extra_mm_inputs (field 11)
     "grpcio>=1.81.1",
     "grpcio-reflection>=1.81.1",
     "grpcio-health-checking>=1.81.1",
@@ -31,6 +31,8 @@ classifiers = [
 
 [project.optional-dependencies]
 vllm = ["vllm>=0.19.0", "pyzmq>=25.0.0", "msgspec>=0.18.0"]
+# Redis media-processing sidecar backend for vLLM (SMG_VLLM_MM_PROCESSOR=redis).
+vllm-redis = ["redis>=5.0", "msgspec>=0.18.0"]
 # 0.5.18 dropped the server_args parameter from
 # create_load_snapshot_reader(); the floor tracks that signature, which the
 # request manager calls unconditionally. (Earlier floors recorded the shmem

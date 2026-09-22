@@ -21,8 +21,10 @@ from .constants import (
     ENV_SHOW_WORKER_LOGS,
     HEALTH_CHECK_INTERVAL,
     LAUNCH_STAGGER_DELAY,
+    MM_PROCESSING_WORKER,
     ConnectionMode,
     WorkerType,
+    get_mm_processing,
     get_runtime,
     get_zmq_engine_count,
     sglang_transfer_backend,
@@ -31,6 +33,7 @@ from .constants import (
 from .model_specs import get_model_spec
 from .process_utils import (
     detect_ib_device,
+    detect_rdma_fabric_devices,
     get_open_port,
     gpu_memory_used_mib,
     wait_for_gpu_memory_release,
@@ -544,6 +547,15 @@ class Worker:
         env.setdefault("PYTHONUNBUFFERED", "1")
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpu_ids))
 
+        if (
+            self.engine == "vllm"
+            and self.mode == ConnectionMode.GRPC
+            and get_mm_processing() == MM_PROCESSING_WORKER
+        ):
+            # The worker advertises mm_processor and the gateway, left in auto
+            # mode, forwards media references instead of preprocessed tensors.
+            env["SMG_VLLM_MM_PROCESSOR"] = "inprocess"
+
         if self.engine == "tokenspeed" and self.worker_type in (
             WorkerType.ENCODE,
             WorkerType.PREFILL,
@@ -553,6 +565,22 @@ class Worker:
             env.setdefault("TOKENSPEED_SKIP_GRPC_WARMUP", "1")
             env.setdefault("NO_PROXY", "*")
             env.setdefault("no_proxy", "*")
+
+        if (
+            self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE)
+            and self.effective_kv_backend() == "nixl"
+        ):
+            # NIXL moves KV over UCX, which binds to the mlx5 device closest to
+            # the GPU. A host also exposes mlx5 devices for ordinary VM
+            # networking, and picking one of those breaks the worker: it either
+            # fails to open the device, when that NIC carries no RoCE GIDs, or
+            # opens it and dies on the first transfer, when it has GIDs but
+            # cannot route RDMA. Only the workers whose GPUs sit nearest such a
+            # NIC are affected, so a lane fails or passes by topology. Pin UCX
+            # to the fabric devices to take that choice away.
+            fabric_devices = detect_rdma_fabric_devices()
+            if fabric_devices:
+                env.setdefault("UCX_NET_DEVICES", ",".join(fabric_devices))
 
         if (
             self.engine == "sglang"

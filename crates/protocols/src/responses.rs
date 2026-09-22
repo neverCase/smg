@@ -9,9 +9,10 @@ use validator::{Validate, ValidationError};
 
 use super::{
     common::{
-        default_true, validate_stop, ChatLogProbs, ContextManagementEntry, ConversationRef, Detail,
-        Function, FunctionChoice, GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo,
-        ResponsePrompt, StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
+        default_true, validate_json_schema_shape, validate_stop, ChatLogProbs,
+        ContextManagementEntry, ConversationRef, Detail, Function, FunctionChoice,
+        GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo, ResponsePrompt,
+        StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
         ToolChoiceValue as ChatToolChoiceValue, ToolReference, UsageInfo,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
@@ -328,11 +329,17 @@ impl ResponsesToolChoice {
                 mode: mode.clone(),
                 tools: tools.clone(),
             },
+            // The regular router downgrades custom tools to function tools
+            // (single `input` string parameter), so pinning the chat
+            // tool_choice by name preserves the forcing semantics.
+            Self::Custom { name, .. } => ChatToolChoice::Function {
+                tool_type: "function".to_string(),
+                function: FunctionChoice { name: name.clone() },
+            },
             // No matching Chat spec variant — fall through to `auto` so
             // downstream Chat backends still see tool-calling enabled.
             Self::Types { .. }
             | Self::Mcp { .. }
-            | Self::Custom { .. }
             | Self::ApplyPatch { .. }
             | Self::Shell { .. } => ChatToolChoice::Value(ChatToolChoiceValue::Auto),
         }
@@ -2302,6 +2309,19 @@ pub enum ResponseOutputItem {
         output: Option<String>,
         status: String,
     },
+    /// `type: "custom_tool_call"` — the model's invocation of a user-declared
+    /// custom tool. Same wire shape as the [`ResponseInputOutputItem`] variant
+    /// so emitted items replay losslessly.
+    #[serde(rename = "custom_tool_call")]
+    CustomToolCall {
+        call_id: String,
+        input: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+    },
     #[serde(rename = "mcp_list_tools")]
     McpListTools {
         id: String,
@@ -3701,14 +3721,10 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
     Ok(())
 }
 
-/// Validates text format configuration (JSON schema name cannot be empty)
+/// Validates text format configuration (JSON schema name non-empty, schema an object)
 fn validate_text_format(text: &TextConfig) -> Result<(), ValidationError> {
-    if let Some(TextFormat::JsonSchema { name, .. }) = &text.format {
-        if name.is_empty() {
-            let mut e = ValidationError::new("json_schema_name_empty");
-            e.message = Some("JSON schema name cannot be empty".into());
-            return Err(e);
-        }
+    if let Some(TextFormat::JsonSchema { name, schema, .. }) = &text.format {
+        validate_json_schema_shape(name, schema)?;
     }
     Ok(())
 }

@@ -117,14 +117,7 @@ impl ResponseProcessor {
             ) {
                 // If the template injected `<think>` in the prefill (thinking toggle
                 // is supported and effectively ON), start in reasoning mode.
-                if utils::should_mark_reasoning_started(
-                    utils::resolve_user_thinking(
-                        original_request.chat_template_kwargs.as_ref(),
-                        original_request.reasoning_effort.as_deref(),
-                        tokenizer.as_ref(),
-                    ),
-                    tokenizer.as_ref(),
-                ) {
+                if original_request.reasoning_starts_in_prefill(tokenizer.as_ref()) {
                     parser.mark_reasoning_started();
                 }
 
@@ -316,7 +309,8 @@ impl ResponseProcessor {
         }
 
         // Build usage from gRPC response counters.
-        let usage = response_formatting::build_usage(&all_responses);
+        let usage = response_formatting::build_usage(&all_responses)
+            .with_unbilled_prompt_tokens(chat_request.unbilled_prompt_tokens);
 
         // Build final ChatCompletionResponse
         Ok(
@@ -826,6 +820,8 @@ impl ResponseProcessor {
 
         let mut total_prompt = 0u32;
         let mut total_completion = 0u32;
+        let mut total_spec_accepted = 0u32;
+        let mut total_spec_drafted = 0u32;
         let mut choices = Vec::new();
 
         for (prompt_index, all_responses) in collected.into_iter().enumerate() {
@@ -876,6 +872,8 @@ impl ResponseProcessor {
 
                 prompt_tokens = prompt_tokens.max(complete.prompt_tokens());
                 total_completion += complete.completion_tokens();
+                total_spec_accepted += complete.spec_accepted_tokens();
+                total_spec_drafted += complete.spec_draft_tokens();
 
                 // A local stop-decoder match takes precedence over the engine's
                 // reason (which is "length" when stop strings are enforced
@@ -940,7 +938,10 @@ impl ResponseProcessor {
             created: dispatch.created,
             model: dispatch.model.clone(),
             choices,
-            usage: Some(Usage::from_counts(total_prompt, total_completion)),
+            usage: Some(
+                Usage::from_counts(total_prompt, total_completion)
+                    .with_speculative_tokens(total_spec_accepted, total_spec_drafted),
+            ),
             system_fingerprint: dispatch.weight_version.clone(),
         })
     }

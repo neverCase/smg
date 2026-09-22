@@ -34,10 +34,13 @@ pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
         .max()
         .unwrap_or(0);
     let total_reasoning_tokens: u32 = responses.iter().map(|r| r.reasoning_tokens()).sum();
+    let total_spec_accepted: u32 = responses.iter().map(|r| r.spec_accepted_tokens()).sum();
+    let total_spec_drafted: u32 = responses.iter().map(|r| r.spec_draft_tokens()).sum();
 
     Usage::from_counts(total_prompt_tokens, total_completion_tokens)
         .with_cached_tokens(total_cached_tokens)
         .with_reasoning_tokens(total_reasoning_tokens)
+        .with_speculative_tokens(total_spec_accepted, total_spec_drafted)
 }
 
 /// Tracks per-index completion token counts across streaming chunks.
@@ -121,6 +124,22 @@ mod tests {
             usage.completion_tokens, 10,
             "each choice generates its own completion -- must be summed"
         );
+    }
+
+    #[test]
+    fn build_usage_then_unbilled_charges_the_stub_once_for_n_greater_than_1() {
+        let usage =
+            build_usage(&[complete(10, 10, 4), complete(10, 10, 6)]).with_unbilled_prompt_tokens(3);
+        assert_eq!(usage.prompt_tokens, 7);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens),
+            Some(7)
+        );
+        assert_eq!(usage.completion_tokens, 10);
+        assert_eq!(usage.total_tokens, 17);
     }
 
     #[test]

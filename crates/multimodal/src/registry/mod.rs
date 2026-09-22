@@ -1,3 +1,4 @@
+mod deepseek_v41;
 mod glm53_flash;
 mod inkling;
 mod kimi_k25;
@@ -13,6 +14,8 @@ mod qwen_vl;
 mod traits;
 pub mod transcription;
 
+use deepseek_v41::DeepseekV41VisionSpec;
+pub use deepseek_v41::DEEPSEEK_V41_IMAGE_PLACEHOLDER;
 use glm53_flash::Glm53FlashSpec;
 use inkling::InklingSpec;
 use kimi_k25::KimiK25VisionSpec;
@@ -28,8 +31,8 @@ use qwen3_vl::Qwen3VLVisionSpec;
 use qwen_vl::QwenVLVisionSpec;
 // Re-export public API from traits.
 pub use traits::{
-    MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
-    Tokenizer,
+    MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
+    RegistryResult, Tokenizer,
 };
 
 pub struct ModelRegistry {
@@ -40,6 +43,8 @@ impl ModelRegistry {
     pub fn new() -> Self {
         Self {
             specs: vec![
+                // DeepSeek-V4.1 matches only its own model_type / id, so it can lead.
+                LazySpec::new(|| Box::new(DeepseekV41VisionSpec)),
                 LazySpec::new(|| Box::new(Glm53FlashSpec)),
                 LazySpec::new(|| Box::new(InklingSpec)),
                 // Kimi-K3 must be registered before Kimi-K2.5: the two families
