@@ -476,6 +476,7 @@ fn choice_has_output(choice: &Value) -> bool {
 
     has_non_empty_string(delta.get("content"))
         || has_non_empty_string(delta.get("reasoning_content"))
+        || has_non_empty_string(delta.get("reasoning"))
         || has_non_empty_string(delta.get("refusal"))
         || has_non_empty_array(delta.get("tool_calls"))
         || has_non_empty_object(delta.get("function_call"))
@@ -535,6 +536,45 @@ mod tests {
         );
 
         assert!(recorder.get().is_some());
+    }
+
+    #[test]
+    fn records_reasoning_ttft_before_content() {
+        for reasoning_field in ["reasoning", "reasoning_content"] {
+            let recorder = ChatStreamTtftRecorder::new();
+            let mut observer = ChatStreamTtftObserver::new(RoutedChatMetricsContext {
+                started_at: Instant::now(),
+                model: "test-model".to_string(),
+                worker: "worker-0".to_string(),
+                worker_uid: "uid-0".to_string(),
+                ttft_recorder: Some(recorder.clone()),
+            });
+
+            observer.observe_chunk(
+                b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"reasoning\":\"\",\"reasoning_content\":null}}]}\n\n",
+            );
+            assert!(recorder.get().is_none());
+
+            let reasoning_chunk = format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "choices": [{"delta": {(reasoning_field): "thinking"}}]
+                })
+            );
+            observer.observe_chunk(reasoning_chunk.as_bytes());
+
+            let reasoning_ttft = recorder.get().expect("reasoning must record TTFT");
+            let first_token_at = observer.first_token_at;
+            assert!(first_token_at.is_some());
+
+            observer
+                .observe_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n");
+            observer.observe_chunk(b"data: [DONE]\n\n");
+
+            assert!(observer.finished);
+            assert_eq!(recorder.get(), Some(reasoning_ttft));
+            assert_eq!(observer.first_token_at, first_token_at);
+        }
     }
 
     #[test]
