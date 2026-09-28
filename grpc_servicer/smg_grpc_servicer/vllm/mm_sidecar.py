@@ -16,10 +16,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import time
+from urllib.parse import urlsplit, urlunsplit
 
 from smg_grpc_servicer.mm_sidecar_protocol import (
-    DEFAULT_REDIS_URL,
+    CODE_RESULT_PUSH_FAILED,
+    CODE_RESULT_TOO_LARGE,
+    DEFAULT_MAX_RESULT_BYTES,
+    DEFAULT_MAX_VIDEO_FRAMES,
+    ENV_MAX_RESULT_BYTES,
+    ENV_MAX_VIDEO_FRAMES,
     HELLO_REFRESH_S,
     HELLO_TTL_S,
     RESULT_TTL_S,
@@ -36,7 +43,13 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
     resolve_namespace,
 )
 from smg_grpc_servicer.vllm.media_refs import advertised_schemes, parse_scheme_list, url_scheme
-from smg_grpc_servicer.vllm.mm_processor import fingerprint_from_model_config
+from smg_grpc_servicer.vllm.mm_processor import (
+    MmSettings,
+    clamp_video_frames,
+    env_int,
+    fingerprint_from_model_config,
+    vllm_default_video_frames,
+)
 
 logger = logging.getLogger("smg_grpc_servicer.vllm.mm_sidecar")
 
@@ -47,8 +60,20 @@ JOB_WAIT_S = 5
 JOB_WAIT_MARGIN_S = 2
 # How long a worker holds off after a refused or unanswered wait.
 RECONNECT_PAUSE_S = 1
+# The worker settings this process runs on, and the flags it spells them as.
+# The worker's job timeout is not one of them: it reaches the sidecar as
+# each job's deadline.
+SIDECAR_SETTINGS = ("redis_url", "sidecar_namespace")
+SIDECAR_FLAGS = {
+    "redis_url": "--redis-url",
+    "sidecar_namespace": "--namespace",
+}
 # The least time a finished job's answer gets to reach the requester.
 PUSH_FLOOR_S = 5
+# A failure notice is small; the second push gets at most this long.
+FAILURE_PUSH_S = 5.0
+# Redis's per-value cap; a push at or above it is refused, not queued.
+REDIS_BULK_LIMIT = "proto-max-bulk-len"
 
 
 def build_config(args: argparse.Namespace):
@@ -87,7 +112,16 @@ def classify_process_error(exc: BaseException) -> str:
 
 
 class Sidecar:
-    def __init__(self, vllm_config, renderer, client, *, namespace: str | None, concurrency: int):
+    def __init__(
+        self,
+        vllm_config,
+        renderer,
+        client,
+        *,
+        namespace: str | None,
+        concurrency: int,
+        settings: MmSettings | None = None,
+    ):
         from vllm import TokensPrompt, envs
         from vllm.multimodal.media.connector import MEDIA_CONNECTOR_REGISTRY
         from vllm.transformers_utils.processor import get_video_processor_cls_name
@@ -101,11 +135,22 @@ class Sidecar:
         self._encoder = MsgpackEncoder(size_threshold=2**62)
         self._client = client
         self._concurrency = max(1, concurrency)
+        # Where each setting this process runs on came from, for the hello hash.
+        self._settings_sources = dict(settings.sources) if settings is not None else {}
         self._fingerprint = config_fingerprint(vllm_config)
         self._keys = Keys.for_namespace(resolve_namespace(self._fingerprint, namespace))
+        # Lowered further by redis's own cap once connected (`_learn_result_limit`).
+        self._max_result_bytes = env_int(os.environ, ENV_MAX_RESULT_BYTES, DEFAULT_MAX_RESULT_BYTES)
+        self._max_video_frames = env_int(
+            os.environ, ENV_MAX_VIDEO_FRAMES, DEFAULT_MAX_VIDEO_FRAMES, minimum=0
+        )
+        # The fingerprint keeps the engine's kwargs: the budget bounds this
+        # sidecar's sampling, it does not describe a different engine.
         self._connector = MEDIA_CONNECTOR_REGISTRY.load(
             envs.VLLM_MEDIA_CONNECTOR,
-            media_io_kwargs=mm_config.media_io_kwargs,
+            media_io_kwargs=clamp_video_frames(
+                mm_config.media_io_kwargs, self._max_video_frames, vllm_default_video_frames()
+            ),
             allowed_local_media_path=model_config.allowed_local_media_path,
             allowed_media_domains=model_config.allowed_media_domains,
         )
@@ -119,6 +164,7 @@ class Sidecar:
             )
 
     async def run(self) -> None:
+        await self._learn_result_limit()
         logger.info(
             "media sidecar serving under %s (concurrency=%d) fingerprint=%s",
             self._keys.prefix,
@@ -133,12 +179,38 @@ class Sidecar:
             for task in tasks:
                 task.cancel()
 
+    async def _learn_result_limit(self) -> None:
+        """Cap results at redis's bulk limit when it is lower than the configured one.
+
+        Managed redis often refuses CONFIG; the configured limit then stands.
+        """
+        try:
+            reply = await asyncio.wait_for(self._client.config_get(REDIS_BULK_LIMIT), HELLO_TTL_S)
+            (value,) = reply.values()
+            redis_limit = int(value)
+        except Exception as e:  # noqa: BLE001 - CONFIG unavailable or unreadable: keep the configured limit
+            logger.info(
+                "result limit %d bytes (%s not readable: %s)",
+                self._max_result_bytes,
+                REDIS_BULK_LIMIT,
+                e,
+            )
+            return
+        self._max_result_bytes = min(self._max_result_bytes, redis_limit)
+        logger.info(
+            "result limit %d bytes (%s=%d)", self._max_result_bytes, REDIS_BULK_LIMIT, redis_limit
+        )
+
     async def _heartbeat(self) -> None:
         mapping = {
             **self._fingerprint.to_hello(),
             "schema": str(SCHEMA_VERSION),
             "schemes": self._schemes,
             "started_at": str(int(self._started_at)),
+            "settings_source": ",".join(
+                f"{name}={source}" for name, source in sorted(self._settings_sources.items())
+            ),
+            "max_result_bytes": str(self._max_result_bytes),
         }
         while True:
             try:
@@ -185,19 +257,61 @@ class Sidecar:
             except Exception as e:  # noqa: BLE001 - one bad job must not kill the worker
                 logger.exception("worker %d: job %s failed", index, job.job_id)
                 result = failure(job.job_id, "processor_error", repr(e))
+            raw = encode_result(result)
+            if len(raw) >= self._max_result_bytes:
+                # Redis would refuse the value; the requester gets told why instead.
+                logger.warning(
+                    "worker %d: result for %s is %d bytes, at or above the %d-byte transport "
+                    "limit (%d items: %s); answering %s",
+                    index,
+                    job.job_id,
+                    len(raw),
+                    self._max_result_bytes,
+                    len(job.items),
+                    ",".join(sorted({item.modality for item in job.items})),
+                    CODE_RESULT_TOO_LARGE,
+                )
+                result = failure(
+                    job.job_id,
+                    CODE_RESULT_TOO_LARGE,
+                    f"encoded media result is {len(raw)} bytes, transport limit "
+                    f"{self._max_result_bytes} bytes; reduce video length, fps or resolution",
+                )
+                raw = encode_result(result)
+            await self._deliver(index, job, raw)
+
+    async def _deliver(self, index: int, job: Job, raw: bytes) -> None:
+        """Answer on the job's result key; a refused answer is replaced by a small one."""
+        key = self._keys.result(job.job_id)
+        try:
+            await self._push(key, raw, self._push_budget(job))
+        except Exception as first:  # noqa: BLE001 - the requester is told, not left to time out
+            logger.warning("worker %d: result push failed for %s: %s", index, job.job_id, first)
+            notice = failure(
+                job.job_id, CODE_RESULT_PUSH_FAILED, f"{type(first).__name__}: {first}"
+            )
             try:
-                key = self._keys.result(job.job_id)
-                pipe = self._client.pipeline(transaction=True)
-                pipe.lpush(key, encode_result(result))
-                pipe.expire(key, RESULT_TTL_S)
-                # An answer is worth only as long as the requester is still
-                # waiting for it, and this push carries the whole payload, so
-                # it gets the time the job has left and no more. Unbounded, a
-                # worker that lands on a stalled connection is gone for good
-                # while the sidecar goes on advertising it.
-                await asyncio.wait_for(pipe.execute(), self._push_budget(job))
-            except Exception as e:  # noqa: BLE001 - the servicer times out and retries
-                logger.warning("worker %d: result push failed for %s: %s", index, job.job_id, e)
+                await self._push(
+                    key, encode_result(notice), min(self._push_budget(job), FAILURE_PUSH_S)
+                )
+            except Exception as second:  # noqa: BLE001 - the servicer times out and retries
+                logger.error(
+                    "worker %d: result push failed twice for %s: %s; then %s",
+                    index,
+                    job.job_id,
+                    first,
+                    second,
+                )
+
+    async def _push(self, key: str, raw: bytes, budget: float) -> None:
+        pipe = self._client.pipeline(transaction=True)
+        pipe.lpush(key, raw)
+        pipe.expire(key, RESULT_TTL_S)
+        # An answer is worth only as long as the requester is still waiting for
+        # it, and this push carries the whole payload, so it gets the time the
+        # job has left and no more. Unbounded, a worker that lands on a stalled
+        # connection is gone for good while the sidecar goes on advertising it.
+        await asyncio.wait_for(pipe.execute(), budget)
 
     @staticmethod
     def _push_budget(job: Job) -> float:
@@ -301,6 +415,19 @@ async def serve(args: argparse.Namespace) -> None:
     import redis.asyncio as redis_asyncio
     from vllm.renderers.registry import renderer_from_config
 
+    # The same flag > env > default resolution as the worker, for the two
+    # settings this process runs on, so the two cannot disagree on the
+    # namespace.
+    settings = MmSettings(
+        redis_url=getattr(args, "redis_url", None),
+        sidecar_namespace=getattr(args, "namespace", None),
+    ).resolve(only=SIDECAR_SETTINGS, flags=SIDECAR_FLAGS)
+    logger.info(
+        "media sidecar settings: redis_url=%s namespace=%s (%s)",
+        redacted_url(settings.redis_url),
+        settings.sidecar_namespace or "<derived>",
+        ", ".join(f"{name}={source}" for name, source in sorted(settings.sources.items())),
+    )
     vllm_config = build_config(args)
     renderer = renderer_from_config(vllm_config)
     # No read deadline of the client's own: waiting for the next job is meant
@@ -310,12 +437,44 @@ async def serve(args: argparse.Namespace) -> None:
     # default it to five seconds. Reaching the server in the first place is a
     # different question and stays bounded: there is nothing to wait for yet.
     client = redis_asyncio.from_url(
-        args.redis_url, decode_responses=False, socket_connect_timeout=1.0, socket_timeout=None
+        settings.redis_url,
+        decode_responses=False,
+        socket_connect_timeout=1.0,
+        socket_timeout=None,
     )
     sidecar = Sidecar(
-        vllm_config, renderer, client, namespace=args.namespace, concurrency=args.concurrency
+        vllm_config,
+        renderer,
+        client,
+        namespace=settings.sidecar_namespace,
+        concurrency=args.concurrency,
+        settings=settings,
     )
     await sidecar.run()
+
+
+def redacted_url(url: str) -> str:
+    """The URL's scheme, host and db for logs: userinfo is masked and the
+    query and fragment dropped, since redis-py also takes `?password=`."""
+    parts = urlsplit(url)
+    host = parts.netloc.rsplit("@", 1)[-1]
+    userinfo = "***@" if "@" in parts.netloc else ""
+    return urlunsplit((parts.scheme, f"{userinfo}{host}", parts.path, "", ""))
+
+
+def build_parser(add_engine_args, parser_cls=argparse.ArgumentParser):
+    """The sidecar's parser; `add_engine_args` appends vLLM's own flags."""
+    parser = parser_cls(description="smg media-processing sidecar for vLLM")
+    parser.add_argument(
+        "--redis-url", default=None, help="falls back to SMG_VLLM_MM_REDIS_URL, then localhost"
+    )
+    parser.add_argument(
+        "--namespace",
+        default=None,
+        help="override the derived key namespace (falls back to SMG_VLLM_MM_SIDECAR_NAMESPACE)",
+    )
+    parser.add_argument("--concurrency", type=int, default=2)
+    return add_engine_args(parser)
 
 
 def main() -> None:
@@ -323,11 +482,7 @@ def main() -> None:
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     logging.basicConfig(level=logging.INFO)
-    parser = FlexibleArgumentParser(description="smg media-processing sidecar for vLLM")
-    parser.add_argument("--redis-url", default=DEFAULT_REDIS_URL)
-    parser.add_argument("--namespace", default=None, help="override the derived key namespace")
-    parser.add_argument("--concurrency", type=int, default=2)
-    parser = AsyncEngineArgs.add_cli_args(parser)
+    parser = build_parser(AsyncEngineArgs.add_cli_args, FlexibleArgumentParser)
     args = parser.parse_args()
     asyncio.run(serve(args))
 

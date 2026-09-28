@@ -50,6 +50,12 @@ MODELS = {
             "video": ("config_id", "video_token_index"),
         },
     },
+    "glm53_flash": {
+        "model_id": "zai-org/GLM-5.3-Flash",
+        # Anchor = tokenizer token for the config's image_token_id. Video is
+        # deliberately absent: vLLM targets a three-token block for it.
+        "anchors": {"image": ("config_id", "image_token_id")},
+    },
 }
 
 PREFIX_TEXT = "Describe what you see."

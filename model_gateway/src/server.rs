@@ -22,7 +22,7 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     interactions::InteractionsRequest,
-    messages::CreateMessageRequest,
+    messages::{CountMessageTokensRequest, CreateMessageRequest},
     multipart::{AudioTranscriptionMultipart, ImageEditMultipart, ImageVariationMultipart, AudioSpeechMultipart},
     parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
     realtime_session::{
@@ -54,6 +54,7 @@ use crate::{
     mesh_discovery::{start_mesh_discovery, MeshDiscoveryConfig},
     middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
+        inflight_tracker::InFlightRequestTracker,
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
         metrics_server, otel_trace, runtime_metrics,
@@ -492,6 +493,23 @@ async fn v1_messages(
             state
                 .router
                 .route_messages(Some(&headers), &tenant_meta, body, &model),
+        )
+        .await
+}
+
+async fn v1_messages_count_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
+    Json(body): Json<CountMessageTokensRequest>,
+) -> Response {
+    let model = body.model.clone();
+    cancel
+        .guard(
+            state
+                .router
+                .route_messages_count_tokens(Some(&headers), &tenant_meta, body, &model),
         )
         .await
 }
@@ -1141,6 +1159,7 @@ pub fn build_app(
             .route("/v1/rerank", post(v1_rerank))
             .route("/v1/embeddings", post(v1_embeddings))
             .route("/v1/messages", post(v1_messages))
+            .route("/v1/messages/count_tokens", post(v1_messages_count_tokens))
             .route("/v1/interactions", post(v1_interactions))
             .route("/v1/classify", post(v1_classify))
             // Per-request buffer-vs-stream decision for typed-JSON bodies;
@@ -1334,19 +1353,42 @@ pub fn build_app(
         app = app.merge(rl_routes);
     }
 
-    Ok(app
+    Ok(attach_edge_layers(
+        app,
+        max_payload_size,
+        app_state.context.inflight_tracker.clone(),
+        request_id_headers,
+        cors_allowed_origins,
+    )
+    .with_state(app_state))
+}
+
+/// The middleware every request crosses, matched or not: body limits, access
+/// logging, HTTP metrics, request ids and CORS.
+///
+/// `Router::layer` wraps only what the router holds when it is called, so the
+/// not-found fallback goes in first. Registered after the layers, unknown
+/// routes ran outside all of them: no log line, no metric (the metrics layer
+/// already labels them `other`), no `x-request-id`, no CORS headers.
+fn attach_edge_layers<S>(
+    app: Router<S>,
+    max_payload_size: usize,
+    inflight_tracker: Arc<InFlightRequestTracker>,
+    request_id_headers: Vec<String>,
+    cors_allowed_origins: Vec<String>,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    app.fallback(sink_handler)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
         ))
         .layer(middleware::create_logging_layer())
-        .layer(middleware::HttpMetricsLayer::new(
-            app_state.context.inflight_tracker.clone(),
-        ))
+        .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
-        .fallback(sink_handler)
-        .with_state(app_state))
 }
 
 /// Discovery tasks owned by `startup`, aborted when this guard drops.
@@ -1436,11 +1478,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Seed the process-wide multimodal tensor transport defaults from the
     // resolved router config; per-worker specs still override at request time.
-    use crate::routers::grpc::multimodal::init_mm_transport_defaults;
+    use crate::routers::grpc::multimodal::{
+        init_mm_settings, init_mm_transport_defaults, MultimodalSettings,
+    };
     init_mm_transport_defaults(
         config.router_config.multimodal_tensor_transport,
         config.router_config.multimodal_shm_min_bytes,
     );
+    // Flag > env > default, resolved once; an unreadable env value stops
+    // startup here rather than at router creation.
+    let mm_settings = MultimodalSettings::resolve(&config.router_config)
+        .map_err(|error| format!("multimodal settings: {error:#}"))?;
+    llm_multimodal::init_log_video_decode_timing(mm_settings.log_mm_timing.value);
+    init_mm_settings(mm_settings);
 
     // Start the metrics server. It binds the port eagerly so we fail fast on
     // port conflicts or bad addresses.
@@ -1992,7 +2042,12 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
                 http::Method::DELETE,
                 http::Method::OPTIONS,
             ])
-            .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION])
+            .allow_headers([
+                http::header::CONTENT_TYPE,
+                http::header::AUTHORIZATION,
+                http::header::HeaderName::from_static("anthropic-version"),
+                http::header::HeaderName::from_static("anthropic-beta"),
+            ])
             .expose_headers([http::header::HeaderName::from_static("x-request-id")])
     };
 
@@ -2009,6 +2064,87 @@ mod tests {
 
     use super::*;
     use crate::config::TenantApiKeyEntry;
+
+    /// The not-found fallback sits inside the edge layers: an unknown route
+    /// gets a request id (and a log line and a metric) like a known one.
+    #[tokio::test]
+    async fn unknown_routes_cross_the_edge_middleware() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = attach_edge_layers(
+            Router::new().route("/known", get(|| async { StatusCode::OK })),
+            1024,
+            InFlightRequestTracker::new(),
+            vec![],
+            vec![],
+        );
+        for (path, status) in [("/known", StatusCode::OK), ("/nope", StatusCode::NOT_FOUND)] {
+            let response = app
+                .clone()
+                .oneshot(
+                    http::Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{path}");
+            assert!(
+                response.headers().contains_key("x-request-id"),
+                "{path} skipped the edge middleware"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_cors_allows_anthropic_headers() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/v1/messages/count_tokens",
+                post(|| async { StatusCode::OK }),
+            )
+            .layer(create_cors_layer(vec!["https://client.example".into()]));
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/messages/count_tokens")
+                    .header("origin", "https://client.example")
+                    .header("access-control-request-method", "POST")
+                    .header(
+                        "access-control-request-headers",
+                        "content-type,authorization,anthropic-version,anthropic-beta",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "https://client.example"
+        );
+        let allowed = response.headers()["access-control-allow-headers"]
+            .to_str()
+            .unwrap();
+        for header in [
+            "content-type",
+            "authorization",
+            "anthropic-version",
+            "anthropic-beta",
+        ] {
+            assert!(
+                allowed.split(',').any(|value| value.trim() == header),
+                "missing {header}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn plain_http_acceptor_enables_nodelay() {

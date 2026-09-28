@@ -42,7 +42,10 @@ use smg_grpc_client::{
 };
 use smg_mm_rdma::RdmaExporter;
 
-use crate::routers::grpc::{multimodal::mm_rdma_exporter, zmq_client::ZmqGenerateStream};
+use crate::routers::grpc::{
+    multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
+    zmq_client::ZmqGenerateStream,
+};
 
 /// How a streaming response's per-token payloads (token ids, sampled
 /// logprobs, token counts) relate across the responses of one stream.
@@ -692,12 +695,7 @@ fn vllm_tensor_payload(
 }
 
 fn log_tokenspeed_mm_timing_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SMG_LOG_MM_TIMING")
-            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
-    })
+    log_mm_timing_enabled()
 }
 
 static TOKENSPEED_SHM_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1060,6 +1058,23 @@ fn vllm_mm_identity(mm: &vllm::MultimodalInputs) -> Option<vllm::MultimodalInput
     })
 }
 
+/// The content identity of a multimodal batch for a language-model-only PD
+/// decode leg: only the per-image hashes survive. The servicer folds them
+/// into the request's `cache_salt`, so two requests whose text and expanded
+/// placeholder-token runs match but whose images differ cannot alias in the
+/// decode-side prefix cache. A hash-less batch carries no identity worth
+/// keeping.
+fn vllm_mm_hash_identity(mm: &vllm::MultimodalInputs) -> Option<vllm::MultimodalInputs> {
+    if mm.mm_hashes.is_empty() {
+        return None;
+    }
+    Some(vllm::MultimodalInputs {
+        mm_hashes: mm.mm_hashes.clone(),
+        modality: mm.modality,
+        ..Default::default()
+    })
+}
+
 pub fn collect_vllm_multimodal_inputs_shm_handles(
     inputs: &vllm::MultimodalInputs,
 ) -> Vec<common::ShmHandle> {
@@ -1259,8 +1274,16 @@ pub enum ProtoGenerateRequest {
 }
 
 /// Per-item grid metadata the engine reads to compute M-RoPE positions
-/// (`_get_mrope_input_positions` in vLLM); a few ints per item.
-const VLLM_MROPE_GRID_KEYS: [&str; 3] = ["image_grid_thw", "video_grid_thw", "second_per_grid_ts"];
+/// (`_get_mrope_input_positions` in vLLM); a few ints per item. The video
+/// timing has two spellings: `second_per_grid_ts` from the Qwen-VL
+/// processors, `video_second_per_grid` from the Qwen-Omni family and this
+/// gateway's own processors. The servicer's `GRID_KEYS` mirrors this list.
+const VLLM_MROPE_GRID_KEYS: [&str; 4] = [
+    "image_grid_thw",
+    "video_grid_thw",
+    "second_per_grid_ts",
+    "video_second_per_grid",
+];
 
 impl ProtoGenerateRequest {
     /// Append stop token ids to the request's sampling params (TRT-LLM keeps
@@ -1507,6 +1530,52 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Clone for a PD decode leg on a language-model-only decode worker (no
+    /// vision encoder, encoder-cache budget 0 — the production vLLM P/D
+    /// shape). The prefill-expanded `input_ids` and the KV handoff stay, but
+    /// every multimodal payload beyond the content hashes goes: pixels,
+    /// placeholders, grid tensors and media references. The decode engine
+    /// then sees a pure-text TokensPrompt and never touches its (zero-budget)
+    /// encoder cache, mirroring the Dynamo P/D contract; the kept hashes ride
+    /// into `cache_salt` servicer-side so different images cannot alias in
+    /// the decode prefix cache. Non-vLLM backends have no language-model-only
+    /// mode, so they take the pixel-stripping clone.
+    pub fn clone_without_mm(&mut self) -> Self {
+        match self {
+            Self::Vllm(req) => {
+                let mm = req.mm_inputs.take();
+                let extra = std::mem::take(&mut req.extra_mm_inputs);
+                let refs = req.media_refs.take();
+                let mut clone = Self::Vllm(req.clone());
+                if let Self::Vllm(clone_req) = &mut clone {
+                    clone_req.mm_inputs = mm.as_ref().and_then(vllm_mm_hash_identity);
+                    clone_req.extra_mm_inputs =
+                        extra.iter().filter_map(vllm_mm_hash_identity).collect();
+                }
+                req.mm_inputs = mm;
+                req.extra_mm_inputs = extra;
+                req.media_refs = refs;
+                clone
+            }
+            _ => self.clone_without_mm_pixels(),
+        }
+    }
+
+    /// Whether any vLLM multimodal batch carries M-RoPE grid tensors. The
+    /// decode leg of a grid-dependent model (Qwen-VL family) derives its
+    /// positions from them, so they cannot be stripped for a
+    /// language-model-only decode worker.
+    pub fn has_vllm_mrope_grids(&self) -> bool {
+        match self {
+            Self::Vllm(req) => req.mm_inputs.iter().chain(&req.extra_mm_inputs).any(|mm| {
+                mm.model_specific_tensors
+                    .keys()
+                    .any(|key| VLLM_MROPE_GRID_KEYS.contains(&key.as_str()))
+            }),
+            _ => false,
+        }
+    }
+
     /// Drop raw multimodal encoder tensors while keeping item metadata.
     ///
     /// Used by the EPD prefill leg: multimodal embeddings arrive from encode workers,
@@ -1596,6 +1665,29 @@ impl ProtoGenerateRequest {
         matches!(self, Self::Vllm(req) if req.media_refs.is_some())
     }
 
+    /// Replace this vLLM request's media references with the identity the
+    /// prefill leg produced: the expanded prompt ids and the pixel-less
+    /// per-modality inputs, in the shape a router-preprocessed decode leg has.
+    /// Applied whole or not at all: an identity without ids, or a leg whose
+    /// input is not tokenized, leaves the leg as it is (`false`), so it
+    /// reprocesses the references rather than run an empty prompt.
+    pub fn apply_media_identity(&mut self, identity: &vllm::MediaIdentity) -> bool {
+        let Self::Vllm(req) = self else {
+            return false;
+        };
+        let Some(vllm::generate_request::Input::Tokenized(tokenized)) = req.input.as_mut() else {
+            return false;
+        };
+        if identity.prompt_token_ids.is_empty() {
+            return false;
+        }
+        tokenized.input_ids.clone_from(&identity.prompt_token_ids);
+        req.mm_inputs.clone_from(&identity.mm_inputs);
+        req.extra_mm_inputs.clone_from(&identity.extra_mm_inputs);
+        req.media_refs = None;
+        true
+    }
+
     /// Number of parallel samples requested (1 when unset). vLLM, SGLang
     /// and TokenSpeed carry it in their sampling params; the others have no
     /// per-request sample count.
@@ -1671,6 +1763,17 @@ impl ProtoGenerateRequest {
             Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
                 tracing::warn!("set_kv_transfer_params_json called on non-vLLM request, ignoring");
             }
+        }
+    }
+
+    /// Whether the request carries a KV handoff from the prefill worker
+    /// (either the modern JSON params or the legacy typed host/port).
+    pub fn has_kv_transfer_params(&self) -> bool {
+        match self {
+            Self::Vllm(req) => {
+                req.kv_transfer_params_json.is_some() || req.kv_transfer_params.is_some()
+            }
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => false,
         }
     }
 
@@ -1835,7 +1938,7 @@ impl ProtoGenerateResponse {
                     ProtoResponseVariant::Chunk(ProtoGenerateStreamChunk::Vllm(chunk))
                 }
                 Some(vllm::generate_response::Response::Complete(complete)) => {
-                    ProtoResponseVariant::Complete(ProtoGenerateComplete::Vllm(complete))
+                    ProtoResponseVariant::Complete(ProtoGenerateComplete::Vllm(Box::new(complete)))
                 }
                 None => ProtoResponseVariant::None,
             },
@@ -2063,7 +2166,10 @@ impl ProtoGenerateStreamChunk {
 #[derive(Clone)]
 pub enum ProtoGenerateComplete {
     Sglang(sglang::GenerateComplete),
-    Vllm(vllm::GenerateComplete),
+    // Boxed: the media identity a PD prefill leg returns made this variant
+    // several times the size of the others, and completions move through
+    // the same channel as every streamed chunk.
+    Vllm(Box<vllm::GenerateComplete>),
     Trtllm(trtllm::GenerateComplete),
     Mlx(mlx::GenerateComplete),
     TokenSpeed(tokenspeed::GenerateComplete),
@@ -2371,6 +2477,15 @@ impl ProtoGenerateComplete {
                 .kv_transfer_params
                 .as_ref()
                 .map(|params| (params.remote_host.clone(), params.remote_port)),
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
+        }
+    }
+
+    /// The media identity a prefill leg returned for its processed
+    /// references (vLLM only; absent from older servicers).
+    pub fn media_identity(&self) -> Option<&vllm::MediaIdentity> {
+        match self {
+            Self::Vllm(c) => c.media_identity.as_ref(),
             Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
         }
     }
@@ -3337,11 +3452,9 @@ mod tests {
                 .chunk_semantics()
                 .is_delta()
         );
-        assert!(
-            ProtoGenerateComplete::Vllm(vllm::GenerateComplete::default())
-                .chunk_semantics()
-                .is_delta()
-        );
+        assert!(ProtoGenerateComplete::Vllm(Box::default())
+            .chunk_semantics()
+            .is_delta());
 
         // Every other shape reports running totals.
         for chunk in [

@@ -70,6 +70,26 @@ def stall_the_first_transaction(client):
     return stalled
 
 
+def fail_transactions_on(client, key, exc, times=None):
+    """Make every transaction touching `key` raise `exc` (the first `times` of them if given)."""
+    failures = []
+
+    class Fails(FakePipeline):
+        async def execute(self):
+            self.store.executed.append(list(self.ops))
+            if any(op[1] == key for op in self.ops) and (times is None or len(failures) < times):
+                failures.append(exc)
+                raise exc
+            return [True] * len(self.ops)
+
+    client.pipeline = lambda transaction=True: Fails(client)
+    return failures
+
+
+def pushed_values(client):
+    return [op[2] for ops in client.executed for op in ops if op[0] == "lpush"]
+
+
 def fingerprint():
     return proto.Fingerprint(
         model="m",
@@ -240,6 +260,9 @@ def sidecar(client):
     s._accepted = {"http", "https", "data"}
     s._started_at = time.time()
     s._concurrency = 1
+    s._settings_sources = {"redis_url": "flag", "sidecar_namespace": "env"}
+    s._max_result_bytes = proto.DEFAULT_MAX_RESULT_BYTES
+    s._max_video_frames = proto.DEFAULT_MAX_VIDEO_FRAMES
     return s
 
 
@@ -378,6 +401,132 @@ class TestWorkerLoop:
         assert [op[0] for op in ops] == ["lpush", "expire"]
 
 
+class TestResultDelivery:
+    """A popped job is always answered on its result key, with something redis takes."""
+
+    @staticmethod
+    def _serve(client, results, monkeypatch, *, max_result_bytes=None):
+        s = sidecar(client)
+        if max_result_bytes is not None:
+            s._max_result_bytes = max_result_bytes
+
+        async def handle(j):
+            return results[j.job_id]
+
+        monkeypatch.setattr(s, "handle", handle)
+        monkeypatch.setattr(s, "_push_budget", lambda _job: 0.5)
+        with pytest.raises(asyncio.CancelledError):
+            run(s._worker(0))
+        return s
+
+    def test_an_oversized_result_is_answered_with_result_too_large(self, monkeypatch, caplog):
+        video_job = job("j1")
+        video_job.items = [proto.JobItem(modality="video", url="https://a/1.mp4")]
+        client = FakeRedis(jobs=[video_job])
+        big = proto.JobResult(
+            v=1,
+            job_id="j1",
+            ok=True,
+            mm_kwargs={"video": [b"\x80" * 4096]},
+            mm_placeholders={"video": [proto.Placeholder(offset=1, length=4)]},
+        )
+        with caplog.at_level("WARNING", logger="smg_grpc_servicer.vllm.mm_sidecar"):
+            self._serve(client, {"j1": big}, monkeypatch, max_result_bytes=1024)
+        (raw,) = pushed_values(client)
+        assert len(raw) < 1024, "the oversized payload never reached redis"
+        answered = proto.decode_result(raw)
+        assert not answered.ok
+        assert answered.code == proto.CODE_RESULT_TOO_LARGE
+        assert "transport limit 1024 bytes" in answered.message
+        assert "reduce video length" in answered.message
+        (record,) = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert "j1" in record.getMessage() and "video" in record.getMessage()
+
+    def test_a_result_under_the_limit_is_pushed_as_is(self, monkeypatch):
+        client = FakeRedis(jobs=[job("j1")])
+        fine = proto.JobResult(v=1, job_id="j1", ok=True, mm_kwargs={"image": [b"\x80" * 64]})
+        self._serve(client, {"j1": fine}, monkeypatch)
+        (raw,) = pushed_values(client)
+        assert proto.decode_result(raw).ok
+
+    def test_a_failed_push_is_answered_with_result_push_failed(self, monkeypatch):
+        client = FakeRedis(jobs=[job("j1")])
+        s = sidecar(client)
+        key = s._keys.result("j1")
+        failures = fail_transactions_on(
+            client, key, ConnectionResetError("Connection reset by peer"), times=1
+        )
+        self._serve(client, {"j1": proto.JobResult(v=1, job_id="j1", ok=True)}, monkeypatch)
+        assert len(failures) == 1
+        first, second = pushed_values(client)
+        assert proto.decode_result(first).ok, "the real result was tried first"
+        answered = proto.decode_result(second)
+        assert not answered.ok
+        assert answered.code == proto.CODE_RESULT_PUSH_FAILED
+        assert answered.message == "ConnectionResetError: Connection reset by peer"
+
+    def test_two_failed_pushes_log_one_error_and_keep_the_loop_alive(self, monkeypatch, caplog):
+        client = FakeRedis(jobs=[job("j1"), job("j2")])
+        s = sidecar(client)
+        fail_transactions_on(client, s._keys.result("j1"), ConnectionResetError("reset"))
+        results = {
+            "j1": proto.JobResult(v=1, job_id="j1", ok=True),
+            "j2": proto.JobResult(v=1, job_id="j2", ok=True),
+        }
+        with caplog.at_level("WARNING", logger="smg_grpc_servicer.vllm.mm_sidecar"):
+            self._serve(client, results, monkeypatch)
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1
+        assert "j1" in errors[0].getMessage()
+        assert proto.decode_result(pushed_values(client)[-1]).job_id == "j2"
+        assert proto.decode_result(pushed_values(client)[-1]).ok
+
+
+class TestResultLimit:
+    """The transport limit is redis's bulk-length cap or the configured one, whichever is lower."""
+
+    class _Config(FakeRedis):
+        def __init__(self, reply=None, fail=None):
+            super().__init__()
+            self.reply = reply
+            self.fail = fail
+            self.asked = []
+
+        async def config_get(self, name):
+            self.asked.append(name)
+            if self.fail is not None:
+                raise self.fail
+            return self.reply
+
+    def test_a_lower_redis_cap_wins(self):
+        client = self._Config(reply={b"proto-max-bulk-len": b"1048576"})
+        s = sidecar(client)
+        run(s._learn_result_limit())
+        assert client.asked == ["proto-max-bulk-len"]
+        assert s._max_result_bytes == 1048576
+
+    def test_a_higher_redis_cap_keeps_the_configured_limit(self):
+        client = self._Config(reply={"proto-max-bulk-len": str(2**40)})
+        s = sidecar(client)
+        s._max_result_bytes = 4096
+        run(s._learn_result_limit())
+        assert s._max_result_bytes == 4096
+
+    def test_config_get_failing_keeps_the_configured_limit(self, caplog):
+        client = self._Config(fail=ConnectionError("CONFIG is disabled"))
+        s = sidecar(client)
+        with caplog.at_level("INFO", logger="smg_grpc_servicer.vllm.mm_sidecar"):
+            run(s._learn_result_limit())
+        assert s._max_result_bytes == proto.DEFAULT_MAX_RESULT_BYTES
+        assert any(str(proto.DEFAULT_MAX_RESULT_BYTES) in r.getMessage() for r in caplog.records)
+
+    def test_an_unreadable_reply_keeps_the_configured_limit(self):
+        client = self._Config(reply={b"proto-max-bulk-len": b"lots"})
+        s = sidecar(client)
+        run(s._learn_result_limit())
+        assert s._max_result_bytes == proto.DEFAULT_MAX_RESULT_BYTES
+
+
 class TestHeartbeat:
     def test_hello_and_ttl_are_one_transaction(self, monkeypatch):
         client = FakeRedis()
@@ -397,6 +546,8 @@ class TestHeartbeat:
         assert ops[0][0] == "hset" and ops[0][1] == s._keys.hello
         assert ops[0][2]["schemes"] == "http,https,data"
         assert ops[0][2]["model"] == "m"
+        assert ops[0][2]["settings_source"] == "redis_url=flag,sidecar_namespace=env"
+        assert ops[0][2]["max_result_bytes"] == str(proto.DEFAULT_MAX_RESULT_BYTES)
         assert ops[1] == ("expire", s._keys.hello, proto.HELLO_TTL_S)
 
     def test_heartbeat_survives_a_stalled_refresh(self, monkeypatch):
@@ -449,7 +600,11 @@ class TestServe:
             monkeypatch.setitem(sys.modules, name, mod)
             return mod
 
-        redis_asyncio = module("redis.asyncio", from_url=lambda url, **kw: seen.update(kw))
+        def from_url(url, **kw):
+            seen.update(kw)
+            seen["url"] = url
+
+        redis_asyncio = module("redis.asyncio", from_url=from_url)
         module("redis", asyncio=redis_asyncio)
         module("vllm")
         module("vllm.renderers")
@@ -458,19 +613,89 @@ class TestServe:
         async def returns_at_once():
             return None
 
+        def sidecar(*a, **kw):
+            seen["sidecar_kwargs"] = kw
+            return types.SimpleNamespace(run=returns_at_once)
+
         monkeypatch.setattr(mm_sidecar, "build_config", lambda args: object())
-        monkeypatch.setattr(
-            mm_sidecar, "Sidecar", lambda *a, **kw: types.SimpleNamespace(run=returns_at_once)
-        )
+        monkeypatch.setattr(mm_sidecar, "Sidecar", sidecar)
         return seen
 
-    def _serve(self, monkeypatch):
+    def _serve(self, monkeypatch, args=None, env=None):
         seen = self._stub(monkeypatch)
-        args = types.SimpleNamespace(
-            redis_url="redis://cache:6379/0", namespace="ns", concurrency=2
-        )
+        # Hermetic: none of the worker's variables may leak in from the machine.
+        for _flag, env_name, _default in mm_processor._MM_SETTING_SPECS.values():
+            monkeypatch.delenv(env_name, raising=False)
+        for name, value in (env or {}).items():
+            monkeypatch.setenv(name, value)
+        if args is None:
+            args = types.SimpleNamespace(
+                redis_url="redis://cache:6379/0", namespace="ns", concurrency=2
+            )
         run(mm_sidecar.serve(args))
         return seen
+
+    def test_flags_reach_the_client_and_the_sidecar(self, monkeypatch):
+        seen = self._serve(
+            monkeypatch,
+            env={
+                "SMG_VLLM_MM_REDIS_URL": "redis://env:6379/3",
+                "SMG_VLLM_MM_SIDECAR_NAMESPACE": "ns-env",
+                # Worker-only, unreadable: the sidecar never reads it.
+                "SMG_VLLM_MM_MAX_INFLIGHT": "sixty-four",
+            },
+        )
+        assert seen["url"] == "redis://cache:6379/0"
+        assert seen["sidecar_kwargs"]["namespace"] == "ns"
+        assert seen["sidecar_kwargs"]["settings"].sources == {
+            "redis_url": "flag",
+            "sidecar_namespace": "flag",
+        }
+
+    def test_the_startup_log_hides_redis_credentials(self, monkeypatch, caplog):
+        args = types.SimpleNamespace(
+            redis_url="redis://user:s3cret@cache:6379/0", namespace=None, concurrency=1
+        )
+        with caplog.at_level("INFO", logger="smg_grpc_servicer.vllm.mm_sidecar"):
+            seen = self._serve(monkeypatch, args=args)
+        assert seen["url"] == "redis://user:s3cret@cache:6379/0", "the client gets the real url"
+        settings_lines = [
+            r.getMessage() for r in caplog.records if "sidecar settings" in r.getMessage()
+        ]
+        assert settings_lines and "s3cret" not in settings_lines[0]
+        assert "redis_url=redis://***@cache:6379/0" in settings_lines[0]
+        assert mm_sidecar.redacted_url("redis://cache:6379/0") == "redis://cache:6379/0"
+        # redis-py also reads credentials from the query string.
+        assert (
+            mm_sidecar.redacted_url("redis://cache:6379/0?password=s3cret&db=1")
+            == "redis://cache:6379/0"
+        )
+        assert mm_sidecar.redacted_url("rediss://u:p@cache:6380/2#x") == "rediss://***@cache:6380/2"
+
+    def test_env_fills_in_for_absent_flags(self, monkeypatch):
+        args = types.SimpleNamespace(redis_url=None, namespace=None, concurrency=1)
+        seen = self._serve(
+            monkeypatch,
+            args=args,
+            env={
+                "SMG_VLLM_MM_REDIS_URL": "redis://env:6379/3",
+                "SMG_VLLM_MM_SIDECAR_NAMESPACE": "ns-env",
+            },
+        )
+        assert seen["url"] == "redis://env:6379/3"
+        assert seen["sidecar_kwargs"]["namespace"] == "ns-env"
+        settings = seen["sidecar_kwargs"]["settings"]
+        assert settings.sources["redis_url"] == "env"
+        # The worker's timeout reaches the sidecar as each job's deadline, so
+        # the sidecar resolves no timeout setting of its own.
+        assert settings.sidecar_timeout_ms is None
+        assert "sidecar_timeout_ms" not in settings.sources
+
+    def test_the_parser_has_no_timeout_flag(self, monkeypatch):
+        parser = mm_sidecar.build_parser(lambda parser: parser)
+        args = parser.parse_args([])
+        assert not hasattr(args, "mm_sidecar_timeout_ms")
+        assert args.redis_url is None and args.namespace is None
 
     def test_waiting_for_a_job_has_no_read_deadline(self, monkeypatch):
         # The wait for the next job is meant to sit on the socket for JOB_WAIT_S.

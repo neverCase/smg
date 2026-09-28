@@ -24,7 +24,7 @@ use openai_protocol::{
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
-    messages::CreateMessageRequest,
+    messages::{CountMessageTokensRequest, CreateMessageRequest},
     profile::ProviderProfile,
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
@@ -2500,9 +2500,23 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
         .unwrap_or_else(|| "unknown".to_string());
     let message = format!("{e}. URL: {url}");
 
-    // TODO improve error status code
+    // reqwest files a request timeout under `Kind::Request` (with a `TimedOut`
+    // source), so `is_request()` is true for it as well: the timeout and
+    // connect arms have to be consulted before the generic request arm, or a
+    // timed-out upstream reads as a plain 500 and the 504 path is unreachable.
+    // The same holds for the client's total timeout expiring while a
+    // non-streaming body is still being read: reqwest files that under
+    // `Kind::Body` with the same `TimedOut` source, so it is a 504 too rather
+    // than the body-error 500.
     let (status, code) = if let Some(upstream_status) = e.status() {
         (upstream_status, "call_upstream_status_error")
+    } else if e.is_timeout() {
+        (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
+    } else if e.is_connect() {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "call_upstream_connection_failed",
+        )
     } else if e.is_builder() {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2527,13 +2541,6 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "call_upstream_decode_error",
-        )
-    } else if e.is_timeout() {
-        (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
-    } else if e.is_connect() {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "call_upstream_connection_failed",
         )
     } else {
         (
@@ -2861,6 +2868,17 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_messages_count_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: CountMessageTokensRequest,
+        model_id: &str,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/messages/count_tokens", model_id)
+            .await
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
@@ -3153,6 +3171,7 @@ mod tests {
 
     use axum::http::header::{CONTENT_LENGTH, RETRY_AFTER};
     use openai_protocol::worker::HealthCheckConfig;
+    use serde_json::{json, Value};
 
     use super::*;
     use crate::{
@@ -4136,6 +4155,99 @@ mod tests {
         );
     }
 
+    /// `/v1/messages/count_tokens` goes through worker selection to the
+    /// worker's own endpoint, carrying the Anthropic protocol headers.
+    #[tokio::test]
+    async fn messages_count_tokens_forwards_to_the_selected_worker() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<(HeaderMap, Value)>();
+        let app = axum::Router::new().route(
+            "/v1/messages/count_tokens",
+            axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                let tx = tx.clone();
+                async move {
+                    let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let _ = tx.send((headers, body));
+                    (
+                        [(CONTENT_TYPE, "application/json")],
+                        r#"{"input_tokens":42}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker(&format!("http://{addr}"))],
+        );
+        let body: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m",
+            "system": "be brief",
+            "messages": [{"role": "user", "content": "hello"}],
+            "context_management": {"edits": []},
+            "mcp_servers": [{"type": "url", "name": "tools", "url": "https://example.com"}],
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("token-counting-2024-11-01"),
+        );
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+
+        let response = router
+            .route_messages_count_tokens(
+                Some(&headers),
+                &tenant,
+                body,
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], br#"{"input_tokens":42}"#);
+        let (seen_headers, seen_body) = rx.recv().await.unwrap();
+        assert_eq!(seen_headers["anthropic-version"], "2023-06-01");
+        assert_eq!(seen_headers["anthropic-beta"], "token-counting-2024-11-01");
+        assert_eq!(seen_body["system"], "be brief");
+        assert_eq!(seen_body["context_management"], json!({"edits": []}));
+        assert_eq!(
+            seen_body["mcp_servers"],
+            json!([
+                {"type": "url", "name": "tools", "url": "https://example.com"}
+            ])
+        );
+        assert!(seen_body.get("max_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn messages_count_tokens_without_workers_is_not_forwarded() {
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
+        let body: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        .unwrap();
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant, body, "m")
+            .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     /// With retries enabled the request must survive for replay: a 503 on the
     /// first attempt is retried with an identical body.
     #[tokio::test]
@@ -4212,5 +4324,57 @@ mod tests {
     async fn missing_worker_falls_back_to_buffered() {
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
         assert_falls_back_with_body_intact(&router).await;
+    }
+
+    /// reqwest reports a request timeout as `Kind::Request` with a `TimedOut`
+    /// source, so `is_request()` is true for it too; the converter has to
+    /// consult the timeout arm first or a timed-out upstream is a 500.
+    #[tokio::test]
+    async fn upstream_timeout_is_a_gateway_timeout() {
+        // Never accepted: the connect completes into the backlog and the
+        // request then waits for an answer that never comes, so the client
+        // timeout fires.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let err = client
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap_err();
+        drop(listener);
+        assert!(err.is_timeout());
+        assert!(err.is_request(), "the kind reqwest gives a timeout");
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_connection_failure_keeps_its_own_code() {
+        // Bind, then drop: the port is free, so the connect is refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let err = reqwest::Client::new()
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_connect());
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_connection_failed"
+        );
     }
 }

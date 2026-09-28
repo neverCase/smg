@@ -280,6 +280,20 @@ mod tests {
     }
 
     #[test]
+    /// vLLM's `kimi_k3` prompt updates target `<|kimi_image_placeholder|>`
+    /// (id 163838), not the gateway's `<|media_pad|>` anchor (id 163605), so
+    /// a forwarded reference fails the engine's prompt replacement: media
+    /// stay router-side.
+    fn media_are_processed_router_side() {
+        use crate::registry::ModelProcessorSpec;
+
+        let spec = super::KimiK3VisionSpec;
+        assert!(!spec.worker_expandable(Modality::Image));
+        assert!(!spec.worker_expandable(Modality::Video));
+        assert!(!spec.worker_expandable(Modality::Audio));
+    }
+
+    #[test]
     fn kimi_k3_dimensions_are_per_image() {
         let tokenizer = k3_tokenizer();
         let config = k3_config();

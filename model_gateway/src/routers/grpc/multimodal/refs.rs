@@ -211,7 +211,8 @@ pub(crate) fn resolve_mm_processing(
 
 /// Post-selection check: every leg must accept references, and every URL
 /// scheme in the plan must be one every leg that advertised schemes fetches
-/// (both PD legs process the same references).
+/// (the prefill leg processes them; the decode leg does too whenever the
+/// identity relay does not apply, as with n>1).
 pub(crate) fn ensure_selection_supports_media_refs(
     workers: &WorkerSelection,
     plan: &MediaPlan,
@@ -366,7 +367,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        routers::grpc::multimodal::config::MultimodalConfigRegistry,
+        routers::grpc::multimodal::{
+            config::MultimodalConfigRegistry, settings::MultimodalSettings,
+        },
         worker::{BasicWorkerBuilder, ModelCard, WorkerType},
     };
 
@@ -393,9 +396,13 @@ mod tests {
     }
 
     fn components(mode: MmProcessingMode) -> MultimodalComponents {
-        let mut components =
-            MultimodalComponents::new(Arc::new(MultimodalConfigRegistry::new()), None, None)
-                .expect("components");
+        let mut components = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &MultimodalSettings::default(),
+        )
+        .expect("components");
         components.processing = mode;
         components
     }

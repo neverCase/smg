@@ -16,15 +16,19 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Awaitable, Mapping, Sequence
+from collections.abc import Awaitable, Iterable, Mapping, Sequence
 from typing import Any
 
 from smg_grpc_servicer.mm_sidecar_protocol import (
     CLIENT_ERROR_CODES,
+    CODE_RESULT_PUSH_FAILED,
+    CODE_RESULT_TOO_LARGE,
     DEFAULT_MAX_QUEUE,
+    DEFAULT_MAX_VIDEO_FRAMES,
     DEFAULT_REDIS_URL,
     DEFAULT_TIMEOUT_MS,
     ENV_MAX_QUEUE,
+    ENV_MAX_VIDEO_FRAMES,
     ENV_NAMESPACE,
     ENV_REDIS_URL,
     ENV_TIMEOUT_MS,
@@ -50,6 +54,7 @@ from smg_grpc_servicer.vllm.media_refs import (
 logger = logging.getLogger(__name__)
 
 ENV_PROCESSOR = "SMG_VLLM_MM_PROCESSOR"
+PROCESSOR_FLAG = "--mm-processor"
 ENV_MAX_INFLIGHT = "SMG_VLLM_MM_MAX_INFLIGHT"
 ENV_MAX_ITEM_BYTES = "SMG_VLLM_MM_MAX_ITEM_BYTES"
 ENV_MAX_ITEMS = "SMG_VLLM_MM_MAX_ITEMS"
@@ -75,11 +80,13 @@ class MmProcessorUnavailable(Exception):
 def resolve_mm_processor_mode(env: Mapping[str, str] = os.environ) -> str:
     raw = (env.get(ENV_PROCESSOR) or MODE_OFF).strip().lower()
     if raw not in VALID_MODES:
-        raise ValueError(f"{ENV_PROCESSOR}={raw!r} is not one of {'|'.join(VALID_MODES)}")
+        raise ValueError(
+            f"{PROCESSOR_FLAG} / {ENV_PROCESSOR}={raw!r} is not one of {'|'.join(VALID_MODES)}"
+        )
     return raw
 
 
-def env_int(env: Mapping[str, str], key: str, default: int) -> int:
+def env_int(env: Mapping[str, str], key: str, default: int, *, minimum: int = 1) -> int:
     raw = env.get(key)
     if raw is None or not raw.strip():
         return default
@@ -87,8 +94,9 @@ def env_int(env: Mapping[str, str], key: str, default: int) -> int:
         value = int(raw)
     except ValueError as e:
         raise ValueError(f"{key}={raw!r} is not an integer") from e
-    if value <= 0:
-        raise ValueError(f"{key}={raw!r} must be positive")
+    if value < minimum:
+        bound = "positive" if minimum == 1 else f"at least {minimum}"
+        raise ValueError(f"{key}={raw!r} must be {bound}")
     return value
 
 
@@ -118,6 +126,48 @@ def enforce_item_bytes(items: Sequence[Any], max_bytes: int) -> None:
                 f"media_refs[{index}]: inline payload is {size} bytes, above the "
                 f"{max_bytes}-byte cap ({ENV_MAX_ITEM_BYTES})"
             )
+
+
+def clamp_video_frames(
+    media_io_kwargs: Mapping[str, Any] | None, max_frames: int, default_frames: int | None = None
+) -> Mapping[str, Any] | None:
+    """vLLM's media kwargs with the video frame count capped at `max_frames`.
+
+    A copy: the engine config keeps its own value. `default_frames` is what vLLM
+    samples when the kwargs set nothing; unknown, and nothing set, sampling is
+    left alone, since a maximum must never raise it. A non-positive count means
+    every frame to vLLM, so it is capped as well.
+    """
+    if max_frames <= 0:
+        return media_io_kwargs
+    kwargs = dict(media_io_kwargs or {})
+    video = dict(kwargs.get("video") or {})
+    current = video.get("num_frames", default_frames)
+    if current is None:
+        logger.warning(
+            "%s=%d not applied: vLLM's default video frame count is unknown and "
+            "media_io_kwargs sets none; sampling is left as vLLM decides",
+            ENV_MAX_VIDEO_FRAMES,
+            max_frames,
+        )
+        return media_io_kwargs
+    unbounded = int(current) <= 0
+    video["num_frames"] = max_frames if unbounded else min(int(current), max_frames)
+    kwargs["video"] = video
+    return kwargs
+
+
+def vllm_default_video_frames() -> int | None:
+    """The frame count vLLM's video loader falls back to."""
+    try:
+        # Re-exported from vllm.multimodal.media.video; vllm.multimodal.video
+        # is not a module on the vLLM this servicer targets.
+        from vllm.multimodal.media import VideoMediaIO
+
+        default = inspect.signature(VideoMediaIO.__init__).parameters["num_frames"].default
+    except Exception:  # noqa: BLE001 - an unknown default leaves sampling untouched
+        return None
+    return default if isinstance(default, int) else None
 
 
 def item_limits(mm_config, override: int | None = None) -> dict[str, int]:
@@ -171,11 +221,11 @@ def _require_inprocess_apis(engine) -> None:
             get_video_processor_cls_name,
         )
     except ImportError as e:
-        raise ValueError(f"{ENV_PROCESSOR}=inprocess needs vllm>={MIN_VLLM_VERSION} ({e})") from e
+        raise ValueError(f"{PROCESSOR_FLAG}=inprocess needs vllm>={MIN_VLLM_VERSION} ({e})") from e
     process = getattr(getattr(engine, "renderer", None), "process_for_engine_async", None)
     if process is None or "skip_mm_cache" not in inspect.signature(process).parameters:
         raise ValueError(
-            f"{ENV_PROCESSOR}=inprocess needs vllm>={MIN_VLLM_VERSION} "
+            f"{PROCESSOR_FLAG}=inprocess needs vllm>={MIN_VLLM_VERSION} "
             f"(installed {vllm.__version__}: renderer.process_for_engine_async lacks skip_mm_cache)"
         )
 
@@ -192,6 +242,7 @@ class InProcessMediaProcessor:
         max_item_bytes: int = DEFAULT_MAX_ITEM_BYTES,
         max_inflight: int = DEFAULT_MAX_INFLIGHT,
         max_items: int | None = None,
+        max_video_frames: int = DEFAULT_MAX_VIDEO_FRAMES,
     ) -> None:
         _require_inprocess_apis(engine)
         from vllm import envs
@@ -211,7 +262,9 @@ class InProcessMediaProcessor:
         # allowlists and media_io_kwargs apply to refs fetched here.
         self._connector = MEDIA_CONNECTOR_REGISTRY.load(
             envs.VLLM_MEDIA_CONNECTOR,
-            media_io_kwargs=mm_config.media_io_kwargs,
+            media_io_kwargs=clamp_video_frames(
+                mm_config.media_io_kwargs, max_video_frames, vllm_default_video_frames()
+            ),
             allowed_local_media_path=model_config.allowed_local_media_path,
             allowed_media_domains=model_config.allowed_media_domains,
         )
@@ -222,7 +275,7 @@ class InProcessMediaProcessor:
             logger.warning(
                 "%s=inprocess with no --allowed-media-domains: this worker will fetch media "
                 "from any host the router forwards",
-                ENV_PROCESSOR,
+                PROCESSOR_FLAG,
             )
 
     async def probe(self) -> bool:
@@ -513,6 +566,10 @@ class RedisMediaProcessor:
                 f"sidecar_protocol: result for job {result.job_id} on key of {job.job_id}"
             )
         if not result.ok:
+            if result.code == CODE_RESULT_TOO_LARGE:
+                raise ValueError(f"media_too_large: {result.message}")
+            if result.code == CODE_RESULT_PUSH_FAILED:
+                raise MmProcessorUnavailable(f"sidecar_push_failed: {result.message}")
             if result.code in CLIENT_ERROR_CODES:
                 raise ValueError(f"media processing failed ({result.code}): {result.message}")
             raise MmProcessorUnavailable(f"{result.code or 'processor_error'}: {result.message}")
@@ -572,7 +629,7 @@ def _redis_client(redis_url: str):
         import redis.asyncio as redis_asyncio
     except ImportError as e:
         raise ValueError(
-            f"{ENV_PROCESSOR}=redis requires the redis client: "
+            f"{PROCESSOR_FLAG}=redis requires the redis client: "
             "pip install smg-grpc-servicer[vllm,vllm-redis]"
         ) from e
 
@@ -587,30 +644,165 @@ def _redis_client(redis_url: str):
     )
 
 
-def build_mm_processor(engine, *, env: Mapping[str, str] = os.environ):
-    """Construct the configured backend, or None when worker-side processing is off."""
-    mode = resolve_mm_processor_mode(env)
+SOURCE_FLAG = "flag"
+SOURCE_ENV = "env"
+SOURCE_DEFAULT = "default"
+
+# Setting name -> (launcher flag, env var, default). `None` defaults are
+# settings that may legitimately stay unset.
+_MM_SETTING_SPECS: dict[str, tuple[str, str, Any]] = {
+    "processor": ("--mm-processor", ENV_PROCESSOR, MODE_OFF),
+    "max_inflight": ("--mm-max-inflight", ENV_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT),
+    "max_item_bytes": ("--mm-max-item-bytes", ENV_MAX_ITEM_BYTES, DEFAULT_MAX_ITEM_BYTES),
+    "max_items": ("--mm-max-items", ENV_MAX_ITEMS, None),
+    "redis_url": ("--mm-redis-url", ENV_REDIS_URL, DEFAULT_REDIS_URL),
+    "sidecar_timeout_ms": ("--mm-sidecar-timeout-ms", ENV_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
+    "sidecar_max_queue": ("--mm-sidecar-max-queue", ENV_MAX_QUEUE, DEFAULT_MAX_QUEUE),
+    "sidecar_namespace": ("--mm-sidecar-namespace", ENV_NAMESPACE, None),
+}
+_MM_INT_SETTINGS = frozenset(
+    {"max_inflight", "max_item_bytes", "max_items", "sidecar_timeout_ms", "sidecar_max_queue"}
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class MmSettings:
+    """The engine-side media settings, as requested or as resolved.
+
+    A field left `None` was not asked for; `resolve` fills it as flag > env >
+    default and records each value's source. `sources` is empty until then.
+    """
+
+    processor: str | None = None
+    max_inflight: int | None = None
+    max_item_bytes: int | None = None
+    max_items: int | None = None
+    redis_url: str | None = None
+    sidecar_timeout_ms: int | None = None
+    sidecar_max_queue: int | None = None
+    sidecar_namespace: str | None = None
+    sources: Mapping[str, str] = dataclasses.field(default_factory=dict, compare=False)
+
+    @classmethod
+    def from_args(cls, args) -> MmSettings:
+        """The `--mm-*` values of a launcher namespace; absent flags ask for nothing."""
+        return cls(**{name: getattr(args, f"mm_{name}", None) for name in _MM_SETTING_SPECS})
+
+    @property
+    def resolved(self) -> bool:
+        """Resolved at least once; `sources` names which settings, so a
+        subset-resolved object is not a full one (see `build_mm_processor`)."""
+        return bool(self.sources)
+
+    @property
+    def source(self) -> str:
+        """Where the processor mode came from."""
+        return self.sources.get("processor", SOURCE_DEFAULT)
+
+    def resolve(
+        self,
+        env: Mapping[str, str] = os.environ,
+        *,
+        only: Iterable[str] | None = None,
+        flags: Mapping[str, str] | None = None,
+    ) -> MmSettings:
+        """Flag > env > default; already resolved settings come back unchanged.
+
+        `only` limits resolution to the named settings (the rest stay unset
+        and unvalidated), for a process that uses a subset; `flags` renames
+        the flag a deprecation line points at, for a parser with its own.
+        """
+        if self.resolved:
+            return self
+        values: dict[str, Any] = {}
+        sources: dict[str, str] = {}
+        wanted = set(_MM_SETTING_SPECS if only is None else only)
+        if unknown := wanted - _MM_SETTING_SPECS.keys():
+            raise ValueError(f"unknown mm settings: {sorted(unknown)}")
+        for name, (flag, env_name, default) in _MM_SETTING_SPECS.items():
+            if name not in wanted:
+                continue
+            flag = (flags or {}).get(name, flag)
+            requested = getattr(self, name)
+            if requested is not None:
+                values[name] = _validate_flag(name, flag, requested)
+                sources[name] = SOURCE_FLAG
+                continue
+            from_env = _read_env(name, env, env_name)
+            if from_env is not None:
+                logger.warning(
+                    "%s is deprecated in favour of %s; env support ends in the next minor release",
+                    env_name,
+                    flag,
+                )
+                values[name] = from_env
+                sources[name] = SOURCE_ENV
+                continue
+            values[name] = default
+            sources[name] = SOURCE_DEFAULT
+        return MmSettings(**values, sources=sources)
+
+
+def _validate_flag(name: str, flag: str, value: Any) -> Any:
+    if name == "processor":
+        mode = str(value).strip().lower()
+        if mode not in VALID_MODES:
+            raise ValueError(f"{flag}={value!r} is not one of {'|'.join(VALID_MODES)}")
+        return mode
+    if name in _MM_INT_SETTINGS:
+        if int(value) <= 0:
+            raise ValueError(f"{flag}={value} must be positive")
+        return int(value)
+    return value
+
+
+def _read_env(name: str, env: Mapping[str, str], env_name: str) -> Any:
+    """The env's value for `name`, validated as before; `None` when unset."""
+    if name == "processor":
+        raw = env.get(env_name)
+        return resolve_mm_processor_mode(env) if raw is not None and raw.strip() else None
+    if name in _MM_INT_SETTINGS:
+        return env_int_opt(env, env_name)
+    raw = env.get(env_name)
+    return raw if raw else None
+
+
+def build_mm_processor(
+    engine, *, env: Mapping[str, str] = os.environ, settings: MmSettings | None = None
+):
+    """Construct the configured backend, or None when worker-side processing is off.
+
+    `settings` are the launcher's flags (already resolved or not); without them
+    everything comes from the env, as before.
+    """
+    resolved = (settings or MmSettings()).resolve(env)
+    if missing := _MM_SETTING_SPECS.keys() - resolved.sources.keys():
+        raise ValueError(f"mm settings resolved without {sorted(missing)}")
+    mode = resolved.processor
     if mode == MODE_OFF:
         return None
     model_config = getattr(engine, "model_config", None)
     if model_config is None or not getattr(model_config, "is_multimodal_model", False):
-        logger.warning("%s=%s ignored: the served model is not multimodal", ENV_PROCESSOR, mode)
+        logger.warning("mm_processor=%s ignored: the served model is not multimodal", mode)
         return None
-    max_item_bytes = env_int(env, ENV_MAX_ITEM_BYTES, DEFAULT_MAX_ITEM_BYTES)
-    max_inflight = env_int(env, ENV_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT)
-    max_items = env_int_opt(env, ENV_MAX_ITEMS)
+    # The frame budget is not one of the eight launcher flags yet: env only.
+    max_video_frames = env_int(env, ENV_MAX_VIDEO_FRAMES, DEFAULT_MAX_VIDEO_FRAMES, minimum=0)
     if mode == MODE_INPROCESS:
         return InProcessMediaProcessor(
-            engine, max_item_bytes=max_item_bytes, max_inflight=max_inflight, max_items=max_items
+            engine,
+            max_item_bytes=resolved.max_item_bytes,
+            max_inflight=resolved.max_inflight,
+            max_items=resolved.max_items,
+            max_video_frames=max_video_frames,
         )
     return RedisMediaProcessor(
         engine,
         engine_fingerprint(engine),
-        redis_url=env.get(ENV_REDIS_URL) or DEFAULT_REDIS_URL,
-        timeout_ms=env_int(env, ENV_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
-        max_queue=env_int(env, ENV_MAX_QUEUE, DEFAULT_MAX_QUEUE),
-        namespace=env.get(ENV_NAMESPACE),
-        max_item_bytes=max_item_bytes,
-        max_inflight=max_inflight,
-        max_items=max_items,
+        redis_url=resolved.redis_url,
+        timeout_ms=resolved.sidecar_timeout_ms,
+        max_queue=resolved.sidecar_max_queue,
+        namespace=resolved.sidecar_namespace,
+        max_item_bytes=resolved.max_item_bytes,
+        max_inflight=resolved.max_inflight,
+        max_items=resolved.max_items,
     )

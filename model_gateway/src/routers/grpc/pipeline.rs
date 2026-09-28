@@ -439,6 +439,10 @@ impl RequestPipeline {
             "ContextLength",
             enforce_context_length(prep, workers, &ctx.input.model_id)
         )?;
+        step!(
+            "OutputBudget",
+            enforce_output_budget(&ctx.input.request_type, workers, &ctx.input.model_id)
+        )?;
         ctx.state.clients = Some(step!(
             "ClientAcquisition",
             acquire_clients(workers, &ctx.input.model_id).await
@@ -1451,7 +1455,9 @@ mod request_release_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        routers::grpc::multimodal::{MultimodalComponents, MultimodalConfigRegistry},
+        routers::grpc::multimodal::{
+            MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
+        },
         worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
     };
 
@@ -2192,8 +2198,13 @@ mod request_release_tests {
             .expect("register the DeepSeek-V4.1 tokenizer");
         let multimodal = with_multimodal.then(|| {
             Arc::new(
-                MultimodalComponents::new(Arc::new(MultimodalConfigRegistry::new()), None, None)
-                    .expect("multimodal components"),
+                MultimodalComponents::new(
+                    Arc::new(MultimodalConfigRegistry::new()),
+                    None,
+                    None,
+                    &MultimodalSettings::default(),
+                )
+                .expect("multimodal components"),
             )
         });
         Arc::new(SharedComponents {

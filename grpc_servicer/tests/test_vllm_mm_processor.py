@@ -5,6 +5,7 @@ Run with: pytest grpc_servicer/tests/test_vllm_mm_processor.py
 
 import asyncio
 import importlib.util
+import logging
 import sys
 import types
 from dataclasses import dataclass
@@ -38,7 +39,8 @@ class TestResolveMode:
         )
 
     def test_rejects_unknown_mode(self):
-        with pytest.raises(ValueError, match="SMG_VLLM_MM_PROCESSOR='sidecar'"):
+        # The flag is the interface now; the message names it first.
+        with pytest.raises(ValueError, match="--mm-processor / SMG_VLLM_MM_PROCESSOR='sidecar'"):
             mm_processor.resolve_mm_processor_mode({"SMG_VLLM_MM_PROCESSOR": "sidecar"})
 
 
@@ -54,6 +56,70 @@ class TestEnvInt:
     def test_rejects_invalid(self, raw):
         with pytest.raises(ValueError, match="K="):
             mm_processor.env_int({"K": raw}, "K", 7)
+
+    def test_zero_is_allowed_only_when_asked_for(self):
+        assert mm_processor.env_int({"K": "0"}, "K", 7, minimum=0) == 0
+        with pytest.raises(ValueError, match="K='-1' must be at least 0"):
+            mm_processor.env_int({"K": "-1"}, "K", 7, minimum=0)
+
+
+class TestVideoFrameBudget:
+    def test_no_budget_leaves_the_kwargs_alone(self):
+        kwargs = {"video": {"num_frames": 40, "fps": 2}}
+        assert mm_processor.clamp_video_frames(kwargs, 0) is kwargs
+        assert mm_processor.clamp_video_frames(None, 0) is None
+
+    def test_a_budget_caps_an_explicit_frame_count(self):
+        kwargs = {"video": {"num_frames": 40, "fps": 2}, "image": {"x": 1}}
+        assert mm_processor.clamp_video_frames(kwargs, 16) == {
+            "video": {"num_frames": 16, "fps": 2},
+            "image": {"x": 1},
+        }
+        assert kwargs["video"]["num_frames"] == 40, "the engine config is not mutated"
+
+    def test_a_budget_never_raises_the_frame_count(self):
+        kwargs = {"video": {"num_frames": 8}}
+        assert mm_processor.clamp_video_frames(kwargs, 16) == {"video": {"num_frames": 8}}
+        assert mm_processor.clamp_video_frames({}, 16, default_frames=32) == {
+            "video": {"num_frames": 16}
+        }
+        assert mm_processor.clamp_video_frames({}, 64, default_frames=32) == {
+            "video": {"num_frames": 32}
+        }
+
+    def test_an_explicit_every_frame_setting_is_capped_too(self):
+        # vLLM reads num_frames <= 0 as "every frame": the very case the budget is for.
+        for every in (-1, 0):
+            assert mm_processor.clamp_video_frames({"video": {"num_frames": every}}, 16) == {
+                "video": {"num_frames": 16}
+            }
+
+    def test_an_unknown_default_leaves_sampling_untouched(self, caplog):
+        # A budget caps sampling and never raises it: with vLLM's default
+        # unknown and no explicit count, writing the budget could do just that.
+        assert mm_processor.clamp_video_frames(None, 16) is None
+        kwargs = {"image": {}}
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            assert mm_processor.clamp_video_frames(kwargs, 16, default_frames=None) is kwargs
+        assert sum("SMG_VLLM_MM_MAX_VIDEO_FRAMES" in r.getMessage() for r in caplog.records) == 1
+
+    def test_vllms_default_is_read_from_the_media_package(self, monkeypatch):
+        # vllm.multimodal.media re-exports VideoMediaIO; vllm.multimodal.video
+        # does not exist on the vLLM this servicer targets.
+        class _VideoMediaIO:
+            def __init__(self, image_io, num_frames: int = 24, **kwargs):
+                pass
+
+        media = types.ModuleType("vllm.multimodal.media")
+        media.VideoMediaIO = _VideoMediaIO
+        monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+        monkeypatch.setitem(sys.modules, "vllm.multimodal", types.ModuleType("vllm.multimodal"))
+        monkeypatch.setitem(sys.modules, "vllm.multimodal.media", media)
+        monkeypatch.delitem(sys.modules, "vllm.multimodal.video", raising=False)
+        assert mm_processor.vllm_default_video_frames() == 24
+        del media.VideoMediaIO
+        assert mm_processor.vllm_default_video_frames() is None
 
 
 class TestItemBytes:
@@ -130,9 +196,11 @@ class TestBuildProcessor:
         with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEM_BYTES"):
             mm_processor.build_mm_processor(self._Engine(), env=env)
 
-    def test_inflight_knob_is_ignored_while_off(self):
+    def test_invalid_inflight_is_rejected_even_while_off(self):
+        # The cap also bounds router-preprocessed media, so it is read either way.
         env = {"SMG_VLLM_MM_MAX_INFLIGHT": "sixty-four"}
-        assert mm_processor.build_mm_processor(self._Engine(), env=env) is None
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_INFLIGHT"):
+            mm_processor.build_mm_processor(self._Engine(), env=env)
 
     def test_invalid_inflight_is_rejected_when_on(self):
         env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_INFLIGHT": "0"}
@@ -143,6 +211,236 @@ class TestBuildProcessor:
         env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_ITEMS": "-1"}
         with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEMS"):
             mm_processor.build_mm_processor(self._Engine(), env=env)
+
+    def test_flag_settings_beat_the_env(self):
+        # --mm-processor off keeps the processor unset even with the env asking for one.
+        env = {"SMG_VLLM_MM_PROCESSOR": "inprocess"}
+        settings = mm_processor.MmSettings(processor="off")
+        assert mm_processor.build_mm_processor(self._Engine(), env=env, settings=settings) is None
+
+    def test_invalid_frame_budget_is_rejected_when_on(self):
+        env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_VIDEO_FRAMES": "-4"}
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_VIDEO_FRAMES"):
+            mm_processor.build_mm_processor(self._Engine(), env=env)
+
+
+class TestMmSettings:
+    """Flag > env > default, each value remembering where it came from."""
+
+    LOGGER = "mm_processor"
+
+    def test_defaults_when_nothing_is_set(self):
+        resolved = mm_processor.MmSettings().resolve(env={})
+        assert resolved.processor == "off"
+        assert resolved.max_inflight == mm_processor.DEFAULT_MAX_INFLIGHT
+        assert resolved.max_item_bytes == mm_processor.DEFAULT_MAX_ITEM_BYTES
+        assert resolved.max_items is None
+        assert resolved.redis_url == "redis://127.0.0.1:6379/0"
+        assert resolved.sidecar_timeout_ms == 30_000
+        assert resolved.sidecar_max_queue == 256
+        assert resolved.sidecar_namespace is None
+        assert resolved.source == "default"
+        assert set(resolved.sources.values()) == {"default"}
+        assert resolved.resolved
+
+    def test_env_fills_what_the_flags_left_unset(self, caplog):
+        env = {
+            "SMG_VLLM_MM_PROCESSOR": " Redis ",
+            "SMG_VLLM_MM_MAX_ITEM_BYTES": "4096",
+            "SMG_VLLM_MM_SIDECAR_TIMEOUT_MS": "1000",
+            "SMG_VLLM_MM_MAX_ITEMS": "3",
+        }
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            resolved = mm_processor.MmSettings().resolve(env=env)
+        assert resolved.processor == "redis"
+        assert resolved.max_item_bytes == 4096
+        assert resolved.sidecar_timeout_ms == 1000
+        assert resolved.max_items == 3
+        assert resolved.sources["processor"] == "env"
+        assert resolved.sources["max_item_bytes"] == "env"
+        assert resolved.sources["max_inflight"] == "default"
+        assert resolved.source == "env"
+        messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert (
+            "SMG_VLLM_MM_PROCESSOR is deprecated in favour of --mm-processor; env support ends"
+            " in the next minor release"
+        ) in messages
+        assert sum("SMG_VLLM_MM_PROCESSOR is deprecated" in m for m in messages) == 1
+        assert sum("is deprecated in favour of" in m for m in messages) == 4
+
+    def test_flags_win_over_env_and_log_no_deprecation(self, caplog):
+        requested = mm_processor.MmSettings(
+            processor="inprocess", max_item_bytes=64, sidecar_timeout_ms=5
+        )
+        env = {
+            "SMG_VLLM_MM_PROCESSOR": "redis",
+            "SMG_VLLM_MM_MAX_ITEM_BYTES": "4096",
+            "SMG_VLLM_MM_SIDECAR_TIMEOUT_MS": "1000",
+        }
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            resolved = requested.resolve(env=env)
+        assert resolved.processor == "inprocess"
+        assert resolved.max_item_bytes == 64
+        assert resolved.sidecar_timeout_ms == 5
+        assert resolved.sources["processor"] == "flag"
+        assert resolved.sources["sidecar_timeout_ms"] == "flag"
+        assert resolved.source == "flag"
+        assert not [r for r in caplog.records if "deprecated" in r.getMessage()]
+
+    def test_from_args_reads_the_launcher_namespace(self):
+        args = types.SimpleNamespace(
+            mm_processor="redis",
+            mm_max_inflight=None,
+            mm_max_item_bytes=None,
+            mm_max_items=None,
+            mm_redis_url="redis://cache:6379/1",
+            mm_sidecar_timeout_ms=None,
+            mm_sidecar_max_queue=None,
+            mm_sidecar_namespace="ns",
+            model="m",
+        )
+        settings = mm_processor.MmSettings.from_args(args)
+        assert settings == mm_processor.MmSettings(
+            processor="redis", redis_url="redis://cache:6379/1", sidecar_namespace="ns"
+        )
+        # An older launcher namespace without the flags asks for nothing.
+        assert mm_processor.MmSettings.from_args(types.SimpleNamespace(model="m")) == (
+            mm_processor.MmSettings()
+        )
+
+    def test_flag_values_are_validated_like_env_values(self):
+        with pytest.raises(ValueError, match="--mm-processor='sidecar' is not one of"):
+            mm_processor.MmSettings(processor="sidecar").resolve(env={})
+        with pytest.raises(ValueError, match="--mm-max-item-bytes=0 must be positive"):
+            mm_processor.MmSettings(max_item_bytes=0).resolve(env={})
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_INFLIGHT"):
+            mm_processor.MmSettings().resolve(env={"SMG_VLLM_MM_MAX_INFLIGHT": "0"})
+
+    def test_a_subset_resolves_only_itself_under_its_own_flag_names(self, caplog):
+        env = {
+            "SMG_VLLM_MM_REDIS_URL": "redis://env:6379/3",
+            "SMG_VLLM_MM_MAX_INFLIGHT": "not-a-number",  # worker-only, must not be read
+            "SMG_VLLM_MM_PROCESSOR": "redis",  # worker-only, must not warn
+        }
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            resolved = mm_processor.MmSettings(sidecar_namespace="ns").resolve(
+                env=env,
+                only=("redis_url", "sidecar_namespace", "sidecar_timeout_ms"),
+                flags={"redis_url": "--redis-url", "sidecar_namespace": "--namespace"},
+            )
+        assert resolved.redis_url == "redis://env:6379/3"
+        assert resolved.sidecar_namespace == "ns"
+        assert resolved.sidecar_timeout_ms == 30_000
+        assert resolved.max_inflight is None and resolved.processor is None
+        assert resolved.sources == {
+            "redis_url": "env",
+            "sidecar_namespace": "flag",
+            "sidecar_timeout_ms": "default",
+        }
+        messages = [r.getMessage() for r in caplog.records]
+        assert messages == [
+            "SMG_VLLM_MM_REDIS_URL is deprecated in favour of --redis-url; env support ends"
+            " in the next minor release"
+        ]
+
+    def test_an_unknown_subset_name_fails_loudly(self):
+        with pytest.raises(ValueError, match="unknown mm settings: \\['redis-url'\\]"):
+            mm_processor.MmSettings().resolve(env={}, only=("redis-url",))
+
+    def test_a_subset_resolved_object_cannot_build_a_processor(self):
+        subset = mm_processor.MmSettings(processor="redis").resolve(env={}, only=("processor",))
+        with pytest.raises(ValueError, match="resolved without"):
+            mm_processor.build_mm_processor(
+                types.SimpleNamespace(model_config=None), env={}, settings=subset
+            )
+
+    def test_resolving_twice_is_stable_and_quiet(self, caplog):
+        env = {"SMG_VLLM_MM_PROCESSOR": "redis"}
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            once = mm_processor.MmSettings().resolve(env=env)
+            again = once.resolve(env={})
+        assert again == once
+        assert sum("deprecated" in r.getMessage() for r in caplog.records) == 1
+
+
+class TestInProcessConstruction:
+    """The frame budget reaches the connector the in-process processor fetches with."""
+
+    @staticmethod
+    def _stub_vllm(monkeypatch, loaded, video_io=True):
+        def module(name, **attrs):
+            mod = types.ModuleType(name)
+            mod.__dict__.update(attrs)
+            monkeypatch.setitem(sys.modules, name, mod)
+            return mod
+
+        class _Registry:
+            @staticmethod
+            def load(name, **kwargs):
+                loaded.update(kwargs)
+                return object()
+
+        class _VideoMediaIO:
+            def __init__(self, image_io, num_frames: int = 32, **kwargs):
+                pass
+
+        module(
+            "vllm", __version__="0.29.0", envs=types.SimpleNamespace(VLLM_MEDIA_CONNECTOR="http")
+        )
+        module("vllm.exceptions", VLLMClientError=ValueError)
+        module("vllm.multimodal")
+        media = module("vllm.multimodal.media")
+        if video_io:
+            media.VideoMediaIO = _VideoMediaIO
+            module("vllm.multimodal.media.video", VideoMediaIO=_VideoMediaIO)
+        module("vllm.multimodal.media.connector", MEDIA_CONNECTOR_REGISTRY=_Registry)
+        module("vllm.transformers_utils")
+        module("vllm.transformers_utils.processor", get_video_processor_cls_name=lambda cfg: "vp")
+
+    @staticmethod
+    def _engine(media_io_kwargs):
+        mm_config = types.SimpleNamespace(
+            media_io_kwargs=media_io_kwargs, get_limit_per_prompt=lambda modality: 4
+        )
+        model_config = types.SimpleNamespace(
+            get_multimodal_config=lambda: mm_config,
+            allowed_local_media_path="",
+            allowed_media_domains=["example.com"],
+        )
+
+        class _Renderer:
+            async def process_for_engine_async(self, prompt, *, arrival_time, skip_mm_cache):
+                return prompt
+
+        return types.SimpleNamespace(model_config=model_config, renderer=_Renderer())
+
+    def test_budget_caps_the_connectors_video_frames(self, monkeypatch):
+        loaded = {}
+        self._stub_vllm(monkeypatch, loaded)
+        engine = self._engine({"video": {"num_frames": 40}})
+        mm_processor.InProcessMediaProcessor(engine, max_video_frames=16)
+        assert loaded["media_io_kwargs"] == {"video": {"num_frames": 16}}
+        assert engine.model_config.get_multimodal_config().media_io_kwargs == {
+            "video": {"num_frames": 40}
+        }
+
+    def test_budget_above_vllms_default_keeps_the_default(self, monkeypatch):
+        loaded = {}
+        self._stub_vllm(monkeypatch, loaded)
+        mm_processor.InProcessMediaProcessor(self._engine(None), max_video_frames=64)
+        assert loaded["media_io_kwargs"] == {"video": {"num_frames": 32}}
+
+    def test_no_budget_passes_the_engine_kwargs_through(self, monkeypatch):
+        loaded = {}
+        self._stub_vllm(monkeypatch, loaded)
+        mm_processor.InProcessMediaProcessor(self._engine({"video": {"num_frames": 40}}))
+        assert loaded["media_io_kwargs"] == {"video": {"num_frames": 40}}
+
+    def test_unknown_default_leaves_num_frames_absent(self, monkeypatch):
+        loaded = {}
+        self._stub_vllm(monkeypatch, loaded, video_io=False)
+        mm_processor.InProcessMediaProcessor(self._engine({"image": {}}), max_video_frames=64)
+        assert loaded["media_io_kwargs"] == {"image": {}}
 
 
 class TestRedisClient:
@@ -356,3 +654,26 @@ class TestServicerWiring:
 
         servicer = VllmEngineServicer(_Engine(), start_time=0.0)
         assert servicer._mm_processor is None
+        assert servicer._mm_settings.source == "default"
+
+    def test_launcher_settings_take_precedence_and_name_their_source(self, monkeypatch, caplog):
+        pytest.importorskip("vllm")
+        from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
+
+        monkeypatch.setenv("SMG_VLLM_MM_PROCESSOR", "inprocess")
+        monkeypatch.setenv("SMG_VLLM_MM_MAX_INFLIGHT", "3")
+
+        class _Engine:
+            vllm_config = type("VC", (), {"kv_events_config": None})()
+            model_config = type("MC", (), {"is_multimodal_model": False})()
+
+        settings = mm_processor.MmSettings(processor="off")
+        with caplog.at_level("INFO", logger="smg_grpc_servicer.vllm.servicer"):
+            servicer = VllmEngineServicer(_Engine(), start_time=0.0, mm_settings=settings)
+        assert servicer._mm_processor is None
+        assert servicer._mm_settings.source == "flag"
+        assert servicer._mm_limit == 3, "an env-supplied cap still applies when the flag is silent"
+        assert any(
+            "VllmEngineServicer initialized (mm_processor=off, source=flag)" in r.getMessage()
+            for r in caplog.records
+        )
