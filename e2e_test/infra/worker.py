@@ -19,13 +19,20 @@ from .constants import (
     DEFAULT_HOST,
     DEFAULT_STARTUP_TIMEOUT,
     ENV_SHOW_WORKER_LOGS,
+    ENV_VLLM_SERVICER_IMPL,
     HEALTH_CHECK_INTERVAL,
     LAUNCH_STAGGER_DELAY,
     MM_PROCESSING_WORKER,
     ConnectionMode,
     WorkerType,
+    effective_startup_timeout,
+    get_gpu_offset,
     get_mm_processing,
     get_runtime,
+    get_sglang_servicer_impl,
+    get_tokenspeed_servicer_impl,
+    get_vllm_mm_processor,
+    get_vllm_servicer_impl,
     get_zmq_engine_count,
     sglang_transfer_backend,
     vllm_kv_backend,
@@ -35,6 +42,7 @@ from .process_utils import (
     detect_ib_device,
     detect_rdma_fabric_devices,
     get_open_port,
+    gpu_compute_apps,
     gpu_memory_used_mib,
     wait_for_gpu_memory_release,
     wait_for_health,
@@ -228,13 +236,18 @@ class Worker:
             held = wait_for_gpu_memory_release(self.gpu_ids, self._gpu_mem_baseline, timeout=30.0)
             if held:
                 # The wait gives up once the figure stops moving, usually well
-                # inside the 30 s cap; report what was actually waited.
+                # inside the 30 s cap; report what was actually waited, and
+                # the compute processes nvidia-smi lists on those GPUs. An empty
+                # list is not evidence of anything from inside a container (see
+                # gpu_compute_apps).
                 logger.warning(
-                    "Worker %s: GPU memory still held %.0fs after stop: used %s MiB, baseline %s MiB",
+                    "Worker %s: GPU memory still held %.0fs after stop: used %s MiB, "
+                    "baseline %s MiB, compute processes nvidia-smi lists there: %s",
                     self.model_id,
                     time.monotonic() - waited,
                     held,
                     self._gpu_mem_baseline,
+                    gpu_compute_apps(sorted(held)),
                 )
 
         # Clean up log file
@@ -282,6 +295,13 @@ class Worker:
         features = spec.get("features", [])
 
         if self.engine == "sglang":
+            if self.mode == ConnectionMode.ZMQ:
+                # The launcher validates the complete engine argument list
+                # (it refuses a DP launch this wire does not carry yet), so
+                # the extras go through it instead of onto its output.
+                return self._build_sglang_zmq_cmd(
+                    model_path, tp_size, spec, list(self.extra_engine_args or [])
+                )
             cmd = self._build_sglang_cmd(model_path, tp_size, features, spec)
         elif self.engine == "vllm":
             if self.mode == ConnectionMode.ZMQ:
@@ -411,10 +431,24 @@ class Worker:
         # PD disaggregation: KV transfer roles (backend via E2E_VLLM_KV_BACKEND)
         if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
             kv_role = "kv_producer" if self.worker_type == WorkerType.PREFILL else "kv_consumer"
+            config: dict[str, Any]
             if self.effective_kv_backend() == "mooncake":
                 config = {"kv_connector": "MooncakeConnector", "kv_role": kv_role}
             else:
-                config = {"kv_connector": "NixlConnector", "kv_role": kv_role}
+                config = {
+                    "kv_connector": "NixlConnector",
+                    "kv_role": kv_role,
+                    # A decode keeps a dead prefill's KV region mapped until it
+                    # forgets that peer, and the connector forgets idle peers
+                    # only after engine_ttl seconds (an hour by default). A
+                    # prefill restarted on the same GPU inside that window
+                    # fails its startup free-memory check: on 0.29.0, 53 GiB
+                    # of the dead worker stayed resident with the UCX IPC
+                    # cache already off (see _build_env). Forget idle peers
+                    # after a few seconds instead; the next request to one
+                    # re-runs the handshake, which is cheap at this scale.
+                    "kv_connector_extra_config": {"engine_ttl": 3},
+                }
             cmd.extend(["--kv-transfer-config", json.dumps(config)])
 
         extra = spec.get("vllm_args", [])
@@ -441,6 +475,29 @@ class Worker:
         if extra:
             cmd.extend(extra)
         return cmd
+
+    def _build_sglang_zmq_cmd(
+        self,
+        model_path: str,
+        tp_size: int,
+        spec: dict,
+        extra_engine_args: list[str] | None = None,
+    ) -> list[str]:
+        """Build the headless SGLang command for the ZMQ direct backend.
+
+        Delegates to the ``smg serve`` launcher so the engine flags and the
+        FNV-1a handshake port stay identical to the production launch path,
+        and so the launcher sees every engine argument, extras included.
+        """
+        from smg.serve import SglangWorkerLauncher
+
+        args = argparse.Namespace(
+            connection_mode="zmq", model_path=model_path, tensor_parallel_size=tp_size
+        )
+        backend_args = list(spec.get("sglang_args", [])) + list(extra_engine_args or [])
+        if tp_size > 1:
+            backend_args += ["--tp-size", str(tp_size)]
+        return SglangWorkerLauncher().build_command(args, backend_args, DEFAULT_HOST, self.port)
 
     def _build_tokenspeed_zmq_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
         """Build the headless TokenSpeed command for the ZMQ direct backend.
@@ -547,6 +604,46 @@ class Worker:
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpu_ids))
+        if self.engine == "vllm":
+            # vLLM 0.31.0 runs tensor-parallel all-reduces through FlashInfer,
+            # whose auto backend picks the MNNVL kernel wherever NVLink
+            # multicast exists, H100 included. FlashInfer 0.7.0 ships its
+            # jit-cache as per-architecture wheels, and the Hopper wheel does
+            # not carry that kernel (its AOT list builds it for sm100/sm103
+            # only, where the 0.6.x single wheel carried it for every arch),
+            # so the worker JIT-compiles it with nvcc, which the pods do not
+            # have, and dies at the first all-reduce of the startup memory
+            # profile. The TRT-LLM backend is the same fused all-reduce
+            # integration and is prebuilt for Hopper. An explicit choice wins.
+            env.setdefault("VLLM_FLASHINFER_ALLREDUCE_BACKEND", "trtllm")
+
+        # The vLLM gRPC servicer implementation is a flag inside the smg
+        # servicer package, read by upstream's entrypoint; the command stays.
+        if self.engine == "vllm" and self.mode == ConnectionMode.GRPC:
+            if get_vllm_servicer_impl() == "rust":
+                # A vLLM without the hook would run Python while the lane
+                # reports Rust coverage; refuse to start such a worker.
+                _require_rust_servicer_hook()
+                env["SMG_VLLM_SERVICER_IMPL"] = "rust"
+            else:
+                # The lane setting is authoritative over an inherited value.
+                env.pop("SMG_VLLM_SERVICER_IMPL", None)
+
+        # The TokenSpeed servicer implementation is likewise a flag inside the
+        # smg servicer package, read by its own entrypoint; the command stays.
+        if self.engine == "tokenspeed" and self.mode == ConnectionMode.GRPC:
+            if get_tokenspeed_servicer_impl() == "rust":
+                env["SMG_TOKENSPEED_SERVICER_IMPL"] = "rust"
+            else:
+                env.pop("SMG_TOKENSPEED_SERVICER_IMPL", None)
+
+        # The SGLang servicer implementation is a flag inside the smg servicer
+        # package too, read at the entry SGLang's --grpc-mode calls.
+        if self.engine == "sglang" and self.mode == ConnectionMode.GRPC:
+            if get_sglang_servicer_impl() == "rust":
+                env["SMG_SGLANG_SERVICER_IMPL"] = "rust"
+            else:
+                env.pop("SMG_SGLANG_SERVICER_IMPL", None)
 
         if (
             self.engine == "vllm"
@@ -555,7 +652,7 @@ class Worker:
         ):
             # The worker advertises mm_processor and the gateway, left in auto
             # mode, forwards media references instead of preprocessed tensors.
-            env["SMG_VLLM_MM_PROCESSOR"] = "inprocess"
+            env["SMG_VLLM_MM_PROCESSOR"] = get_vllm_mm_processor()
 
         if self.engine == "tokenspeed" and self.worker_type in (
             WorkerType.ENCODE,
@@ -608,6 +705,8 @@ class Worker:
                 # allocated 60 s after every prefill process had exited), and
                 # the prefill restarted on that GPU fails its free-memory
                 # check. Drop the cache so a mapping ends with its transfer.
+                # From vLLM 0.29.0 the reader keeps a mapping per peer anyway,
+                # so the engine_ttl in _build_vllm_base_cmd carries the rest.
                 env.setdefault("UCX_CUDA_IPC_CACHE", "n")
 
         if self.engine == "trtllm":
@@ -717,6 +816,17 @@ class Worker:
         )
 
 
+def _require_rust_servicer_hook() -> None:
+    """Fail the Rust lane up front when the installed vLLM cannot select it."""
+    try:
+        from smg_grpc_servicer.vllm.rust import require_upstream_hook
+    except ImportError as error:
+        raise RuntimeError(
+            f"{ENV_VLLM_SERVICER_IMPL}=rust needs the smg-grpc-servicer package"
+        ) from error
+    require_upstream_hook()
+
+
 def start_workers(
     model_id: str,
     engine: str | None = None,
@@ -757,6 +867,8 @@ def start_workers(
     Returns:
         List of started Worker instances.
     """
+    # The lane's GPU slice: every worker shifts by E2E_GPU_OFFSET.
+    gpu_offset += get_gpu_offset()
     if log_dir is None:
         log_dir = os.environ.get("E2E_LOG_DIR")
 
@@ -778,7 +890,7 @@ def start_workers(
                 f"launcher (vllm or tokenspeed); got engine={engine!r}"
             )
         gpus_per_worker *= zmq_engine_count
-    timeout = spec.get("startup_timeout", timeout)
+    timeout = effective_startup_timeout(spec.get("startup_timeout", timeout))
 
     # Detect IB device for PD workers
     has_pd = worker_type in (WorkerType.PREFILL, WorkerType.DECODE)

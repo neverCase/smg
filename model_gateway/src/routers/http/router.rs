@@ -22,6 +22,7 @@ use openai_protocol::{
     classify::ClassifyRequest,
     common::GenerationRequest,
     completion::CompletionRequest,
+    decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
@@ -32,6 +33,7 @@ use openai_protocol::{
     },
     rerank::{RerankDocument, RerankRequest, RerankResponse, RerankResult},
     responses::ResponsesRequest,
+    systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
     images::{ImageGenerationRequest, ImageEditRequest, ImageFile, ImageVariationRequest},
     speech::SpeechRequest,
@@ -63,6 +65,7 @@ use crate::{
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
                 REASON_WORKER_MUTATES_BODY,REASON_CHAT_OBSERVABILITY,
             },
+            decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload,
             placement::{self, PlacementFailure, PlacementInputs},
             realtime::{
@@ -80,7 +83,9 @@ use crate::{
         gateway::Gateway,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         http::{
-            request_body::{serialize_request_body, RequestBodyError},
+            request_body::{
+                serialize_request_body, serialize_request_body_preserving_fields, RequestBodyError,
+            },
             request_stream::{CappedBodyStream, StreamProgress},
             chat_metrics::{
                 ChatMetricsContext, ChatStreamTtftRecorder, ChatTokenUsage,
@@ -92,8 +97,8 @@ use crate::{
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
-        AttachedBody, ConnectionMode, RoutingPool, Worker, WorkerLoadGuard, WorkerRegistry,
-        WorkerType,
+        AttachedBody, ConnectionMode, RoutingPool, RuntimeType, Worker, WorkerLoadGuard,
+        WorkerRegistry, WorkerType,
     },
     service_discovery::{
         POD_NAME_LABEL,
@@ -615,7 +620,8 @@ impl Router {
                     PlacementFailure::AllOverloaded(shed) => shed,
                     PlacementFailure::Unavailable
                     | PlacementFailure::PolicyDeclined(_)
-                    | PlacementFailure::NoCompatiblePair { .. } => error::service_unavailable(
+                    | PlacementFailure::NoCompatiblePair { .. }
+                    | PlacementFailure::PrefillAtCapacity => error::service_unavailable(
                         "no_available_workers",
                         "All workers are unavailable (circuit breaker open or unhealthy)",
                     ),
@@ -646,17 +652,48 @@ impl Router {
         // Dispatch-time re-check of the one chosen worker: O(1), and the only
         // thing that closes the window between selection and dispatch in which
         // a load report can flip the veto.
-        if let Some(shed) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
+        if let Some(shed) = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
             return shed;
         }
 
-        // Keyed-load accounting uses the same effective key as selection:
-        // rid-derived first, header fallback.
+        // Select the adapter for the chosen worker. Native Decisions workers
+        // keep the original typed serialization path, including extensions.
+        let mut decision_adapter = if route == "/v1/decisions"
+            && worker.metadata().spec.runtime_type == RuntimeType::Sglang
+        {
+            let adapter = lease.with_view(|view| {
+                let request = serde_json::to_value(view.request)
+                    .and_then(serde_json::from_value::<DecisionsRequest>)
+                    .map_err(|error| {
+                        error::bad_request(
+                            "serialization_failed",
+                            format!("Failed to serialize Decisions request: {error}"),
+                        )
+                    })?;
+                SglangDecisionAdapter::new(&request)
+                    .map_err(|message| error::bad_request("unsupported_decisions_request", message))
+            });
+            match adapter {
+                Ok(adapter) => Some(adapter),
+                Err(response) => return response,
+            }
+        } else {
+            None
+        };
+        let upstream_route = if decision_adapter.is_some() {
+            UPSTREAM_ROUTE
+        } else {
+            route
+        };
+
         let load_guard = lease.with_view(|view| {
             WorkerLoadGuard::with_key(
                 worker.clone(),
-                view.rid_key
-                    .or_else(|| self.policy_registry.sticky_header_key(headers)),
+                self.policy_registry.sticky_key(headers, view.rid_key),
             )
         });
 
@@ -677,7 +714,23 @@ impl Router {
                 })
             });
         let response = match lease.serialize_with(|view| {
-            serialize_request_body(view.request, canonical_model, worker.as_ref(), raw_body_len)
+            if let Some(adapter) = &decision_adapter {
+                serialize_request_body(
+                    adapter.request(),
+                    canonical_model,
+                    worker.as_ref(),
+                    raw_body_len,
+                )
+            } else if matches!(route, "/v1/decisions" | "/v1/systemone") {
+                serialize_request_body_preserving_fields(
+                    view.request,
+                    canonical_model,
+                    worker.as_ref(),
+                    raw_body_len,
+                )
+            } else {
+                serialize_request_body(view.request, canonical_model, worker.as_ref(), raw_body_len)
+            }
         }) {
             Ok(body) => {
                 // Past this point dispatch needs only the serialized bytes;
@@ -692,11 +745,14 @@ impl Router {
                         is_stream,
                     );
                 }
+                if let Some(adapter) = decision_adapter.as_mut() {
+                    adapter.release_request();
+                }
                 let mode = StreamRelayMode { is_stream, rechunk };
                 self.send_serialized_request(
                     headers,
                     body,
-                    route,
+                    upstream_route,
                     worker.as_ref(),
                     mode,
                     load_guard,
@@ -713,6 +769,16 @@ impl Router {
                 "request_preparation_failed",
                 format!("Failed to prepare request: {e}"),
             ),
+        };
+
+        // Judge the converted result so malformed successes become backend
+        // failures and follow the same outcome accounting and retry policy.
+        let response = if let Some(adapter) = decision_adapter {
+            adapter
+                .convert_response(response, self.max_payload_size)
+                .await
+        } else {
+            response
         };
 
         events::RequestReceivedEvent {}.emit();
@@ -957,12 +1023,17 @@ impl Router {
             // Judged from the same candidates whether the pre-filter emptied
             // or a self-filtering policy missed on an all-overloaded pool, so
             // a shed keeps its Retry-After, retryability and metric.
-            let resp = match placement::failure_from(&non_dp_workers, model_id) {
+            let resp = match placement::failure_from(
+                &non_dp_workers,
+                model_id,
+                self.worker_registry.overload_shed_enabled(),
+            ) {
                 PlacementFailure::AllOverloaded(shed) => shed,
                 PlacementFailure::NoCandidates
                 | PlacementFailure::Unavailable
                 | PlacementFailure::PolicyDeclined(_)
-                | PlacementFailure::NoCompatiblePair { .. } => {
+                | PlacementFailure::NoCompatiblePair { .. }
+                | PlacementFailure::PrefillAtCapacity => {
                     // The verdict cannot tell a policy miss from a drained
                     // pool; the pool can.
                     let message = if non_dp_workers.iter().any(|w| w.is_available()) {
@@ -981,7 +1052,11 @@ impl Router {
         // occupies its worker for far longer than a chat completion, so a
         // report landing in the selection→dispatch window is the one case where
         // dispatching anyway is measurably worse.
-        if let Some(resp) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
+        if let Some(resp) = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
             record_pre_send_error(&resp);
             return resp;
         }
@@ -1018,6 +1093,7 @@ impl Router {
             worker.api_key(),
         );
 
+        Metrics::record_worker_request(worker.url(), worker.model_id());
         let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
             Err(e) => {
@@ -1352,12 +1428,17 @@ impl Router {
             // Judged from the same candidates whether the pre-filter emptied
             // or a self-filtering policy missed on an all-overloaded pool, so
             // a shed keeps its Retry-After, retryability and metric.
-            let resp = match placement::failure_from(&non_dp_workers, model_id) {
+            let resp = match placement::failure_from(
+                &non_dp_workers,
+                model_id,
+                self.worker_registry.overload_shed_enabled(),
+            ) {
                 PlacementFailure::AllOverloaded(shed) => shed,
                 PlacementFailure::NoCandidates
                 | PlacementFailure::Unavailable
                 | PlacementFailure::PolicyDeclined(_)
-                | PlacementFailure::NoCompatiblePair { .. } => {
+                | PlacementFailure::NoCompatiblePair { .. }
+                | PlacementFailure::PrefillAtCapacity => {
                     // The verdict cannot tell a policy miss from a drained
                     // pool; the pool can.
                     let message = if non_dp_workers.iter().any(|w| w.is_available()) {
@@ -1376,7 +1457,11 @@ impl Router {
         // occupies its worker for far longer than a chat completion, so a
         // report landing in the selection→dispatch window is the one case where
         // dispatching anyway is measurably worse.
-        if let Some(resp) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
+        if let Some(resp) = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
             record_pre_send_error(&resp);
             return resp;
         }
@@ -1761,6 +1846,7 @@ impl Router {
             api_key.as_ref(),
         );
 
+        Metrics::record_worker_request(worker.url(), worker.model_id());
         let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
             Err(e) => {
@@ -2026,6 +2112,7 @@ impl Router {
             api_key.as_ref(),
         );
 
+        Metrics::record_worker_request(worker.url(), worker.model_id());
         let send = send_with_stale_conn_retry(request_builder);
         tokio::pin!(send);
         let sent = tokio::select! {
@@ -2975,6 +3062,39 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_decisions(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: DecisionsRequest,
+        model_id: &str,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/decisions", model_id)
+            .await
+    }
+
+    async fn route_systemone(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: SystemOneRequest,
+        model_id: &str,
+    ) -> Response {
+        // Direct HTTP routers must enforce the same explicit-model contract
+        // as Gateway before shared routing can interpret its wildcard.
+        if model_id == crate::worker::UNKNOWN_MODEL_ID
+            || self
+                .worker_registry
+                .resolve_model_alias(model_id)
+                .as_deref()
+                == Some(crate::worker::UNKNOWN_MODEL_ID)
+        {
+            return error::model_not_found(model_id);
+        }
+        self.route_typed_request(headers, body, "/v1/systemone", model_id)
+            .await
+    }
+
     async fn route_audio_transcriptions(
         &self,
         headers: Option<&HeaderMap>,
@@ -3564,6 +3684,8 @@ mod tests {
             cache_index: Default::default(),
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         }
     }
 

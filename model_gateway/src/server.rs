@@ -19,6 +19,7 @@ use openai_protocol::{
     common::StreamOptions,
     classify::ClassifyRequest,
     completion::CompletionRequest,
+    decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     interactions::InteractionsRequest,
@@ -31,6 +32,7 @@ use openai_protocol::{
     },
     rerank::{RerankRequest, V1RerankReqInput},
     responses::ResponsesRequest,
+    systemone::SystemOneRequest,
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
     validated::ValidatedJson,
     worker::{
@@ -66,7 +68,7 @@ use crate::{
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         RouterTrait,
     },
-    service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
+    service_discovery::{start_service_discovery, RuntimeDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
         manager::{WorkerManager, WorkerManagerConfig},
@@ -438,6 +440,40 @@ async fn v1_interactions(
             body,
             model_id.as_deref(),
         ))
+        .await
+}
+
+async fn v1_decisions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
+    ValidatedJson(body): ValidatedJson<DecisionsRequest>,
+) -> Response {
+    let model = body.model.clone();
+    cancel
+        .guard(
+            state
+                .router
+                .route_decisions(Some(&headers), &tenant_meta, body, &model),
+        )
+        .await
+}
+
+async fn v1_systemone(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    cancel: middleware::scheduler::PreemptionGuard,
+    ValidatedJson(body): ValidatedJson<SystemOneRequest>,
+) -> Response {
+    let model = body.model.clone();
+    cancel
+        .guard(
+            state
+                .router
+                .route_systemone(Some(&headers), &tenant_meta, body, &model),
+        )
         .await
 }
 
@@ -1038,7 +1074,7 @@ pub struct ServerConfig {
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub log_json: bool,
-    pub service_discovery_config: Option<ServiceDiscoveryConfig>,
+    pub service_discovery_config: Option<RuntimeDiscoveryConfig>,
     /// Kubernetes discovery of SMG mesh router peers. Independent of the
     /// worker discovery provider: either may run without the other.
     pub mesh_discovery_config: Option<MeshDiscoveryConfig>,
@@ -1162,6 +1198,15 @@ pub fn build_app(
             .route("/v1/messages/count_tokens", post(v1_messages_count_tokens))
             .route("/v1/interactions", post(v1_interactions))
             .route("/v1/classify", post(v1_classify))
+            .route("/v1/decisions", post(v1_decisions))
+            .route("/v1/systemone", post(v1_systemone))
+            // Bound the buffered body read: inside admission, so a stalled
+            // upload releases its permit, and inside the stream-vs-buffer
+            // decision, since the streamed relay has its own watchdog.
+            .route_layer(axum::middleware::from_fn_with_state(
+                middleware::RequestBodyTimeouts::from_config(&app_state.context.router_config),
+                middleware::request_body_timeout_middleware,
+            ))
             // Per-request buffer-vs-stream decision for typed-JSON bodies;
             // declined requests pass to the handlers untouched.
             .route_layer(axum::middleware::from_fn_with_state(
@@ -1363,8 +1408,8 @@ pub fn build_app(
     .with_state(app_state))
 }
 
-/// The middleware every request crosses, matched or not: body limits, access
-/// logging, HTTP metrics, request ids and CORS.
+/// The middleware every request crosses, matched or not: body limits, the
+/// trace-context echo, access logging, HTTP metrics, request ids and CORS.
 ///
 /// `Router::layer` wraps only what the router holds when it is called, so the
 /// not-found fallback goes in first. Registered after the layers, unknown
@@ -1384,6 +1429,9 @@ where
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
+        ))
+        .layer(axum::middleware::from_fn(
+            middleware::trace_context_response,
         ))
         .layer(middleware::create_logging_layer())
         .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
@@ -1496,6 +1544,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // port conflicts or bad addresses.
     if let Some(prometheus_config) = &config.prometheus_config {
         let handle = metrics::start_prometheus(prometheus_config.clone());
+        metrics::init_startup_series();
         let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
             handle,
             prometheus_config.host.clone(),
@@ -1737,11 +1786,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         };
 
     if app_context.rate_limiter.is_none() {
-        info!("Rate limiting is disabled (max_concurrent_requests = -1)");
+        info!("Admission control is disabled (max_concurrent_requests = 0)");
     } else if admission_queue.is_none() {
         debug!(
-            "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
-            config.router_config.max_concurrent_requests
+            "Admission queue disabled (queue_size = 0): requests past the in-flight bound are rejected at once"
         );
     }
 
@@ -1790,19 +1838,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let mut discovery_tasks = DiscoveryTasks::default();
 
     if let Some(service_discovery_config) = config.service_discovery_config {
-        if service_discovery_config.enabled {
-            let app_context_arc = Arc::clone(&app_state.context);
-            match start_service_discovery(service_discovery_config, app_context_arc).await {
-                Ok(handle) => {
-                    info!("Service discovery started");
-                    discovery_tasks
-                        .0
-                        .push(supervise_discovery("Worker discovery", handle));
-                }
-                Err(e) => {
-                    error!("Failed to start service discovery: {e}");
-                    warn!("Continuing without service discovery");
-                }
+        let app_context_arc = Arc::clone(&app_state.context);
+        match start_service_discovery(service_discovery_config, app_context_arc).await {
+            Ok(handle) => {
+                info!("Service discovery started");
+                discovery_tasks
+                    .0
+                    .push(supervise_discovery("Worker discovery", handle));
+            }
+            Err(e) => {
+                error!("Failed to start service discovery: {e}");
+                warn!("Continuing without service discovery");
             }
         }
     }
@@ -2096,6 +2142,93 @@ mod tests {
                 "{path} skipped the edge middleware"
             );
         }
+    }
+
+    /// An over-limit body answers 413 whatever its framing: a declared
+    /// Content-Length over the limit is refused by the limit layer before the
+    /// body, and a chunked upload is refused the moment it crosses the limit,
+    /// with the same status, the JSON error envelope (not 400
+    /// json_parse_error) and no further frame pulled from the client.
+    #[tokio::test]
+    async fn over_limit_bodies_answer_413_whatever_the_framing() {
+        use std::sync::atomic::AtomicUsize;
+
+        use axum::{
+            body::{to_bytes, Body},
+            http::header::{CONTENT_LENGTH, CONTENT_TYPE},
+        };
+        use bytes::Bytes;
+        use futures::StreamExt;
+        use tower::ServiceExt;
+
+        let app = attach_edge_layers(
+            Router::new().route(
+                "/v1/chat/completions",
+                post(
+                    |ValidatedJson(_): ValidatedJson<ChatCompletionRequest>| async {
+                        StatusCode::OK
+                    },
+                ),
+            ),
+            1024,
+            InFlightRequestTracker::new(),
+            vec![],
+            vec![],
+        );
+        let oversized = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(2048)
+        );
+
+        // Chunked: 256-byte frames and no Content-Length, so only the body
+        // read can discover the overrun; four frames fit, the fifth crosses.
+        let frames: Vec<Result<Bytes, Infallible>> = oversized
+            .as_bytes()
+            .chunks(256)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let total_frames = frames.len();
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        let body = Body::from_stream(futures::stream::iter(frames).inspect(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "request_body_too_large");
+        let pulled = pulled.load(Ordering::SeqCst);
+        assert!(
+            pulled <= 5 && pulled < total_frames,
+            "reading must stop at the limit: {pulled} of {total_frames} frames pulled"
+        );
+
+        // Declared length: refused by the limit layer before the body.
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(CONTENT_LENGTH, oversized.len())
+                    .body(Body::from(oversized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

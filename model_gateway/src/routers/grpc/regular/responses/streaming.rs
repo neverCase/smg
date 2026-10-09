@@ -11,11 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use axum::{
-    body::Body,
-    http::{header, StatusCode},
-    response::Response,
-};
+use axum::{body::Body, response::Response};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use openai_protocol::{
@@ -36,15 +32,14 @@ use smg_data_connector::{
     ResponseStorage,
 };
 use smg_mcp::{McpServerBinding, McpToolSession, ToolExecutionInput};
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
 use super::{
     common::{
         apply_mcp_tool_call_limit, build_next_request, convert_mcp_tools_to_chat_tools,
-        extract_all_tool_calls_from_chat, prepare_chat_tools_and_choice, ExtractedToolCall,
-        McpToolCallLimit, ResponsesCallContext, ToolLoopState,
+        extract_all_tool_calls_from_chat, has_unfinished_mcp_call, prepare_chat_tools_and_choice,
+        ExtractedToolCall, McpToolCallLimit, ResponsesCallContext, ToolLoopState,
     },
     conversions,
 };
@@ -56,10 +51,14 @@ use crate::{
             openai_bridge::{self, ResponseFormat},
             sse::{sse_channel, SseSender},
         },
+        error,
         grpc::{
             common::responses::{
-                build_sse_response, persist_response_if_needed,
-                streaming::{attach_mcp_server_label, ResponseStreamEventEmitter},
+                await_stream_startup, build_sse_response, persist_response_if_needed,
+                signal_stream_startup, stream_startup_channel,
+                streaming::{
+                    attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
+                },
                 utils::{
                     function_call_status, generation_failure_error, resolve_function_identity,
                 },
@@ -105,8 +104,15 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             None,
             // Tool-loop iterations are not retried.
             None,
+            // No startup barrier: the status is checked below before the
+            // stream is forwarded.
+            None,
         )
         .await;
+
+    if !chat_response.status().is_success() {
+        return chat_response;
+    }
 
     // Extract body from chat response
     let (_parts, body) = chat_response.into_parts();
@@ -508,7 +514,7 @@ impl StreamingResponseAccumulator {
 /// This streams each iteration's response to the client while accumulating
 /// to check for tool calls. If tool calls are found, executes them and
 /// continues with the next streaming iteration.
-pub(super) fn execute_tool_loop_streaming(
+pub(super) async fn execute_tool_loop_streaming(
     ctx: &ResponsesContext,
     current_request: ResponsesRequest,
     original_request: &ResponsesRequest,
@@ -517,6 +523,7 @@ pub(super) fn execute_tool_loop_streaming(
 ) -> Response {
     // Create SSE channel for client
     let (tx, rx) = sse_channel();
+    let (startup_tx, startup_rx) = stream_startup_channel();
 
     // Clone data for background task
     let ctx_clone = ctx.clone();
@@ -535,6 +542,7 @@ pub(super) fn execute_tool_loop_streaming(
             params,
             mcp_servers,
             tx.clone(),
+            Some(startup_tx),
         )
         .await;
 
@@ -544,33 +552,7 @@ pub(super) fn execute_tool_loop_streaming(
         }
     });
 
-    // Build SSE response
-    let stream = ReceiverStream::new(rx);
-    let body = Body::from_stream(stream);
-
-    #[expect(
-        clippy::expect_used,
-        reason = "Response::builder with valid status and no invalid headers is infallible"
-    )]
-    let mut response = Response::builder()
-        .status(StatusCode::OK)
-        .body(body)
-        .expect("infallible: valid status code, no invalid headers");
-
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("text/event-stream"),
-    );
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        header::HeaderValue::from_static("no-cache"),
-    );
-    response.headers_mut().insert(
-        header::CONNECTION,
-        header::HeaderValue::from_static("keep-alive"),
-    );
-
-    response
+    await_stream_startup(startup_rx, rx).await
 }
 
 /// Internal streaming tool loop implementation
@@ -581,6 +563,7 @@ async fn execute_tool_loop_streaming_internal(
     params: ResponsesCallContext,
     mcp_servers: Vec<McpServerBinding>,
     tx: SseSender,
+    mut startup: Option<StreamStartupSender>,
 ) -> Result<(), String> {
     let mut state = ToolLoopState::new(original_request);
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
@@ -632,8 +615,18 @@ async fn execute_tool_loop_streaming_internal(
         }
 
         // Convert to chat request
-        let mut chat_request = conversions::responses_to_chat(&current_request)
-            .map_err(|e| format!("Failed to convert request: {e}"))?;
+        let mut chat_request = match conversions::responses_to_chat(&current_request) {
+            Ok(request) => request,
+            Err(e) => {
+                let message = format!("Failed to convert request: {e}");
+                if startup.is_some() {
+                    let response = error::bad_request("convert_request_failed", message.clone());
+                    let _ = signal_stream_startup(&mut startup, Err(response));
+                    return Ok(());
+                }
+                return Err(message);
+            }
+        };
 
         // Prepare tools and tool_choice for this iteration (same logic as non-streaming)
         prepare_chat_tools_and_choice(&mut chat_request, &mcp_chat_tools, state.iteration);
@@ -641,6 +634,7 @@ async fn execute_tool_loop_streaming_internal(
         Metrics::record_mcp_tool_iteration(&current_request.model);
 
         // Execute chat streaming
+        let startup_pending = startup.is_some();
         let response = ctx
             .pipeline
             .execute_chat(
@@ -653,8 +647,19 @@ async fn execute_tool_loop_streaming_internal(
                 None,
                 // Tool-loop iterations are not retried.
                 None,
+                startup.take(),
             )
             .await;
+
+        if !response.status().is_success() {
+            if startup_pending {
+                return Ok(());
+            }
+            return Err(format!(
+                "Pipeline execution failed with status {}",
+                response.status()
+            ));
+        }
 
         // Convert chat stream to Responses API events while accumulating for tool call detection
         // Stream text naturally - it only appears on final iteration (tool iterations have empty content)
@@ -680,6 +685,10 @@ async fn execute_tool_loop_streaming_internal(
 
         // Check for tool calls (extract all of them for parallel execution)
         let tool_calls = extract_all_tool_calls_from_chat(&accumulated_response);
+        // Neither can a server call the generation did not finish.
+        if has_unfinished_mcp_call(&tool_calls, &session) {
+            break None;
+        }
 
         if !tool_calls.is_empty() {
             trace!(

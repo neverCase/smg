@@ -18,17 +18,24 @@ use openai_protocol::{
 };
 use serde_json::json;
 use smg_mcp::{self as mcp};
+use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 use uuid::Uuid;
 
 use super::utils::generation_failure_error;
-use crate::routers::{
-    common::{
-        openai_bridge::{self, descriptor, ResponseFormat},
-        sse::{SseReceiver, SseSender},
+#[cfg(test)]
+use crate::routers::common::sse::sse_channel;
+use crate::{
+    observability::metrics::Metrics,
+    routers::{
+        common::{
+            openai_bridge::{self, descriptor, ResponseFormat},
+            sse::{SseReceiver, SseSender},
+        },
+        error,
+        grpc::harmony::responses::ToolResult,
     },
-    grpc::harmony::responses::ToolResult,
 };
 
 /// Item-id-prefix discriminator for non-format kinds. Format-driven items
@@ -78,6 +85,21 @@ struct ToolCallStreamItem {
     name: String,
     arguments: String,
     added_emitted: bool,
+}
+
+/// The bounded `reason` label for the stream-failure counter.
+///
+/// The gateway emits two error codes on this path: `stream_error` when the
+/// backend stream could not be read, and `server_error` when the engine
+/// reported a failed generation (also the case when the finish reason alone
+/// says so and no error object was built). Anything else counts as `other`
+/// so a client-visible code can never widen the label set.
+fn failure_reason(error: Option<&serde_json::Value>) -> &'static str {
+    match error.and_then(|e| e.get("code")).and_then(|c| c.as_str()) {
+        Some("stream_error") => "stream_error",
+        Some("server_error") | None => "server_error",
+        Some(_) => "other",
+    }
 }
 
 /// OpenAI-compatible event emitter for /v1/responses streaming
@@ -409,7 +431,7 @@ impl ResponseStreamEventEmitter {
 
         json!({
             "type": if failed {
-                "response.failed"
+                ResponseEvent::FAILED
             } else if truncated {
                 ResponseEvent::INCOMPLETE
             } else {
@@ -436,14 +458,22 @@ impl ResponseStreamEventEmitter {
         self.close_tool_call_items(tx).await?;
         let mut event = self.emit_completed(usage);
         if let Some(error) = error {
-            event["type"] = json!("response.failed");
+            event["type"] = json!(ResponseEvent::FAILED);
             event["response"]["status"] = json!("failed");
             event["response"]["error"] = error.clone();
             if let Some(response) = event["response"].as_object_mut() {
                 response.remove("incomplete_details");
             }
         }
-        self.send_event(&event, tx).await
+        let failed = event["type"] == ResponseEvent::FAILED;
+        self.send_event(&event, tx).await?;
+        if failed {
+            // Counted only once the terminal reached the client: a stream that
+            // dies before its terminal is not a delivered failure, and the
+            // completed/incomplete terminals never count here.
+            Metrics::record_responses_stream_failure(&self.model, failure_reason(error));
+        }
+        Ok(())
     }
 
     /// Convert tool entries to JSON values using the shared bridge builder.
@@ -1375,6 +1405,41 @@ impl ResponseStreamEventEmitter {
     }
 }
 
+/// One-shot signal used by streaming `/v1/responses` handlers to avoid
+/// returning HTTP 200 until the first backend request has actually started.
+pub(crate) type StreamStartupSender = oneshot::Sender<Result<(), Response>>;
+pub(crate) type StreamStartupReceiver = oneshot::Receiver<Result<(), Response>>;
+
+pub(crate) fn stream_startup_channel() -> (StreamStartupSender, StreamStartupReceiver) {
+    oneshot::channel()
+}
+
+#[must_use]
+pub(crate) fn signal_stream_startup(
+    startup: &mut Option<StreamStartupSender>,
+    result: Result<(), Response>,
+) -> bool {
+    let Some(startup) = startup.take() else {
+        return true;
+    };
+
+    startup.send(result).is_ok()
+}
+
+pub(crate) async fn await_stream_startup(
+    startup: StreamStartupReceiver,
+    rx: SseReceiver,
+) -> Response {
+    match startup.await {
+        Ok(Ok(())) => build_sse_response(rx),
+        Ok(Err(response)) => response,
+        Err(_) => error::internal_error(
+            "responses_stream_startup_failed",
+            "Streaming response failed before backend request startup",
+        ),
+    }
+}
+
 /// Build a Server-Sent Events (SSE) response
 ///
 /// Creates a Response with proper SSE headers and streaming body.
@@ -1448,6 +1513,40 @@ mod tests {
         );
         assert!(usage.get("prompt_tokens").is_none());
         assert!(usage.get("completion_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn await_stream_startup_returns_backend_error_response() {
+        let (startup_tx, startup_rx) = stream_startup_channel();
+        let (_sse_tx, sse_rx) = sse_channel();
+        let response = Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::empty())
+            .expect("test response should build");
+
+        assert!(startup_tx.send(Err(response)).is_ok());
+
+        let response = await_stream_startup(startup_rx, sse_rx).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn signal_stream_startup_returns_sse_after_success() {
+        let (startup_tx, startup_rx) = stream_startup_channel();
+        let (_sse_tx, sse_rx) = sse_channel();
+        let mut startup = Some(startup_tx);
+
+        assert!(signal_stream_startup(&mut startup, Ok(())));
+        assert!(startup.is_none());
+
+        let response = await_stream_startup(startup_rx, sse_rx).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE),
+            Some(&HeaderValue::from_static(
+                "text/event-stream; charset=utf-8"
+            ))
+        );
     }
 }
 

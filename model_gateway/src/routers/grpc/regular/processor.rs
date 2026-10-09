@@ -206,7 +206,11 @@ impl ResponseProcessor {
 
         // Step 4: Convert output logprobs if present
         let logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
-            utils::convert_proto_to_openai_logprobs(proto_logprobs, tokenizer)
+            utils::convert_proto_to_openai_logprobs(
+                proto_logprobs,
+                tokenizer,
+                original_request.top_logprobs,
+            )
         });
 
         // Step 5: Build ChatCompletionMessage (proper response message type)
@@ -467,10 +471,11 @@ impl ResponseProcessor {
                 id: dispatch.request_id.clone(),
                 finish_reason,
                 prompt_tokens: complete.prompt_tokens(),
-                weight_version: dispatch
-                    .weight_version
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string()),
+                weight_version: response_formatting::effective_weight_version(
+                    complete.weight_version(),
+                    dispatch.weight_version.as_deref(),
+                )
+                .to_string(),
                 input_token_logprobs,
                 output_token_logprobs,
                 completion_tokens: complete.completion_tokens(),
@@ -755,12 +760,13 @@ impl ResponseProcessor {
                 .and_then(|v| v.as_str().map(String::from))
         });
 
-        let stop_reason = if tool_calls.is_some() || finish_reason_str == "tool_calls" {
+        // Parsed calls do not override a truncation, as in Chat.
+        let stop_reason = if finish_reason_str == "length" {
+            Some(messages::StopReason::MaxTokens)
+        } else if tool_calls.is_some() || finish_reason_str == "tool_calls" {
             Some(messages::StopReason::ToolUse)
         } else if stop_sequence.is_some() {
             Some(messages::StopReason::StopSequence)
-        } else if finish_reason_str == "length" {
-            Some(messages::StopReason::MaxTokens)
         } else {
             Some(messages::StopReason::EndTurn)
         };

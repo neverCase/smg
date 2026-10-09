@@ -939,6 +939,12 @@ pub struct WorkerInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pd_pairing: Option<String>,
 
+    /// Why the gateway's liveness tracker currently keeps the worker out of
+    /// routing (`unreachable` or `wedged`) while its health status stands;
+    /// absent when it is routable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled: Option<String>,
+
     /// The worker's last polled engine load, as published by the load
     /// monitor. `None` when load monitoring has produced nothing for this
     /// worker yet. Unrelated to `load` above, which counts in-flight
@@ -962,6 +968,7 @@ impl WorkerInfo {
             load: 0,
             http2: false,
             pd_pairing: None,
+            stalled: None,
             engine_load: None,
             job_status,
         }
@@ -1358,6 +1365,10 @@ pub struct SchedulerLoadSnapshot {
     pub max_total_num_tokens: i32,
     /// Token usage ratio (0.0–1.0).
     pub token_usage: f64,
+    /// Non-evictable KV occupancy, excluding retained, reclaimable prefix cache.
+    /// Older backends omit this; pressure then uses their legacy token usage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_token_usage: Option<f64>,
     pub gen_throughput: f64,
     pub cache_hit_rate: f64,
     pub utilization: f64,
@@ -1455,6 +1466,14 @@ pub struct WorkerLoadResponse {
     pub loads: Vec<SchedulerLoadSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<EngineAggregateMetricsSnapshot>,
+    /// When the engine's state behind this report was sampled, on the
+    /// gateway's clock: the poll's receipt, or a pushed record's receipt
+    /// less its age and the one-way latency. A policy that books in-flight
+    /// work locally releases only what it dispatched before this instant.
+    /// Not serialized: it is meaningful only in the process that set it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub sampled_at: Option<std::time::Instant>,
 }
 
 impl WorkerLoadResponse {
@@ -1464,6 +1483,18 @@ impl WorkerLoadResponse {
             return 0.0;
         }
         self.loads.iter().map(|l| l.token_usage).sum::<f64>() / self.loads.len() as f64
+    }
+
+    /// Average non-evictable KV pressure, with the legacy fallback per rank.
+    pub fn effective_kv_pressure(&self) -> f64 {
+        if self.loads.is_empty() {
+            return 0.0;
+        }
+        self.loads
+            .iter()
+            .map(|load| load.active_token_usage.unwrap_or(load.token_usage))
+            .sum::<f64>()
+            / self.loads.len() as f64
     }
 
     /// Total used tokens summed across all DP ranks.

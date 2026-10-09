@@ -8,9 +8,7 @@ use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    worker::{
-        overload::OverloadThresholds, BasicWorker, BasicWorkerBuilder, ConnectionMode, Worker,
-    },
+    worker::{overload::OverloadThresholds, BasicWorker, BasicWorkerBuilder, Worker},
     workflow::data::WorkerUpdateWorkflowData,
 };
 
@@ -132,10 +130,8 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
 
             // The spec retains the ZMQ address and engine count. The connect
             // signal still has to come from the registry.
-            if *worker.connection_mode() == ConnectionMode::Zmq {
-                builder =
-                    builder.connect_signal_tx(app_context.worker_registry.connect_signal_sender());
-            }
+            builder =
+                builder.connect_signal_tx(app_context.worker_registry.connect_signal_sender());
 
             let mut new_worker = builder.build();
             if let Some(previous) = worker.as_any().downcast_ref::<BasicWorker>() {
@@ -208,7 +204,7 @@ mod tests {
         },
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
-            BasicWorker, RuntimeType,
+            BasicWorker, ConnectionMode, RuntimeType,
         },
     };
 
@@ -240,6 +236,7 @@ mod tests {
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
             worker_registry: Arc::clone(&registry),
+            prefill_admission: None,
             policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
                 router_config.policy.clone(),
             )),
@@ -288,7 +285,6 @@ mod tests {
                 health: None,
             },
             worker_url: worker.url().to_string(),
-            dp_aware: false,
             app_context: Some(app_context),
             workers_to_update: Some(vec![worker]),
             updated_workers: None,
