@@ -12,7 +12,7 @@
 //! - a call begins with its `id`, `type: "function"` and `name` and no arguments; every later
 //!   fragment carries the call's `index` and `arguments` only;
 //! - the finishing choice has an empty delta without a role;
-//! - the whole message has `content` only when it is not whitespace, `reasoning_content` only when
+//! - the whole message has `content` null when it is only whitespace, `reasoning_content` only when
 //!   there was reasoning, and `tool_calls` only when a call was made, each call with its id, name
 //!   and its argument fragments joined.
 //!
@@ -186,6 +186,8 @@ pub fn message<'a>(choice: u32, events: impl IntoIterator<Item = &'a Event>) -> 
         message: ChatCompletionMessage {
             role: "assistant".to_string(),
             content: (!content.trim().is_empty()).then_some(content),
+            refusal: None,
+            annotations: Vec::new(),
             tool_calls: (!calls.is_empty())
                 .then(|| calls.into_iter().map(|(_, call)| call).collect()),
             reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
@@ -237,7 +239,7 @@ mod tests {
             wire(delta(0, &Event::Content(Text::uncounted("Hello")))),
             json!({
                 "index": 0,
-                "delta": {"role": "assistant", "content": "Hello", "reasoning_content": null},
+                "delta": {"role": "assistant", "content": "Hello"},
                 "logprobs": null,
                 "finish_reason": null,
             })
@@ -277,7 +279,6 @@ mod tests {
                         "type": "function",
                         "function": {"name": "get_weather"},
                     }],
-                    "reasoning_content": null,
                 },
                 "logprobs": null,
                 "finish_reason": null,
@@ -299,7 +300,6 @@ mod tests {
                 "delta": {
                     "role": "assistant",
                     "tool_calls": [{"index": 1, "function": {"arguments": "{\"city\":"}}],
-                    "reasoning_content": null,
                 },
                 "logprobs": null,
                 "finish_reason": null,
@@ -318,7 +318,7 @@ mod tests {
             wire(delta(3, &finish)),
             json!({
                 "index": 3,
-                "delta": {"reasoning_content": null},
+                "delta": {},
                 "logprobs": null,
                 "finish_reason": "length",
             })
@@ -439,6 +439,8 @@ mod tests {
                 "message": {
                     "role": "assistant",
                     "content": "Let me check.",
+                    "refusal": null,
+                    "annotations": [],
                     "tool_calls": [{
                         "id": "call_0",
                         "type": "function",
@@ -446,6 +448,7 @@ mod tests {
                     }],
                     "reasoning_content": "plan more",
                 },
+                "logprobs": null,
                 "finish_reason": "tool_calls",
             })
         );
@@ -461,7 +464,8 @@ mod tests {
             serde_json::to_value(message(0, &events)).expect("serializable"),
             json!({
                 "index": 0,
-                "message": {"role": "assistant", "reasoning_content": null},
+                "message": {"role": "assistant", "content": null, "refusal": null, "annotations": [], "reasoning_content": null},
+                "logprobs": null,
                 "finish_reason": "stop",
             })
         );

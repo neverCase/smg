@@ -17,12 +17,15 @@ struct MetricsState {
 
 async fn prometheus_handler(State(state): State<MetricsState>) -> impl IntoResponse {
     super::metrics::record_tokenizer_cache_activity();
+    super::metrics::record_detokenize_activity();
+    let mut body = state.handle.render();
+    super::worker_metrics::render_into(&mut body);
     (
         [(
             http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        state.handle.render(),
+        body,
     )
 }
 
@@ -63,6 +66,7 @@ pub async fn start_metrics_server(
         loop {
             tokio::time::sleep(Duration::from_secs(UPKEEP_INTERVAL_SECS)).await;
             upkeep_handle.run_upkeep();
+            super::worker_metrics::run_upkeep();
         }
     });
 
@@ -103,7 +107,9 @@ mod tests {
                 .await
                 .unwrap();
             assert!(addr.ip().is_ipv6(), "host {host} bound {addr}");
-            let resp = reqwest::get(format!("http://{addr}/metrics"))
+            let resp = crate::http_client::client()
+                .get(format!("http://{addr}/metrics"))
+                .send()
                 .await
                 .unwrap();
             assert!(resp.status().is_success(), "host {host}");
@@ -146,7 +152,9 @@ mod tests {
             .unwrap();
         assert_ne!(addr.port(), 0);
 
-        let resp = reqwest::get(format!("http://{addr}/metrics"))
+        let resp = crate::http_client::client()
+            .get(format!("http://{addr}/metrics"))
+            .send()
             .await
             .unwrap();
         assert!(resp.status().is_success());

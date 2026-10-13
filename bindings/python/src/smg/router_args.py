@@ -25,7 +25,7 @@ COMMON_POLICY_CHOICES = [
 PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 # Worker discovery providers --discovery-provider accepts.
-DISCOVERY_PROVIDER_CHOICES = ["kubernetes"]
+DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file"]
 
 
 def _parse_int_csv(value: str) -> list[int]:
@@ -166,7 +166,6 @@ class RouterArgs:
     # Tokenizer cache configuration
     tokenizer_cache_enable_l0: bool = False
     tokenizer_cache_l0_max_entries: int = 10000
-    tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
     tokenizer_cache_enable_l1: bool = False
     tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
     # Parser configuration
@@ -305,6 +304,9 @@ class RouterArgs:
     # worker is vetoed; seconds without progress before a loaded one is wedged
     worker_stall_secs: int = 2
     worker_wedge_secs: int = 3
+    # Liveness: seconds without any contact from a worker whose KV-event
+    # stream pushes load records before it is vetoed as unreachable (0 = off)
+    worker_stale_secs: int = 15
     # Warm-up slice for cache-aware routing (see the --worker-warmup-* flags)
     worker_warmup_secs: int = 60
     worker_warmup_share: float = 0.25
@@ -327,6 +329,25 @@ class RouterArgs:
     # Per-tenant token/request rate limiting
     tenant_rate_limit_enabled: bool = False
     tenant_rate_limit_config: str | None = None
+    # Heap profiles of the router process (a jemalloc-profiling build); appended
+    # last: positional callers bind the fields by position
+    jemalloc_prof_dir: str | None = None
+    # Mesh mTLS: the CA, this node's certificate and key (PEM paths); all three or none.
+    mesh_tls_ca_cert: str | None = None
+    mesh_tls_cert: str | None = None
+    mesh_tls_key: str | None = None
+    # Byte budget of the L0 tokenizer cache (--tokenizer-cache-l0-max-memory);
+    # appended last for the same reason
+    tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
+    # File discovery (discovery_provider="file"): the JSON manifest, and how
+    # often to reread it (None = 30s).
+    discovery_file: str | None = None
+    discovery_check_interval_secs: int | None = None
+    # Most Responses API requests with background: true in flight at once;
+    # one beyond answers 429. 0 = background mode off (such requests run in
+    # the foreground); appended last for the same reason
+    max_background_responses: int = 1024
+    power_of_two_load_metric: str = "expected_wait"
 
     @staticmethod
     def add_cli_args(
@@ -360,9 +381,15 @@ class RouterArgs:
         k8s_group = parser.add_argument_group(
             "Service Discovery (Kubernetes)", "Kubernetes-based worker discovery"
         )
+        file_discovery_group = parser.add_argument_group(
+            "Service Discovery (File)", "Workers listed in a JSON manifest"
+        )
         logging_group = parser.add_argument_group("Logging", "Log output configuration")
         prometheus_group = parser.add_argument_group(
             "Prometheus Metrics", "Metrics export configuration"
+        )
+        profiling_group = parser.add_argument_group(
+            "Profiling", "Heap profiles of the router process"
         )
         request_group = parser.add_argument_group(
             "Request Handling", "Request timeout and ID configuration"
@@ -604,6 +631,13 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
+            f"--{prefix}power-of-two-load-metric",
+            type=str,
+            choices=["expected_wait", "requests", "least_requests"],
+            default=RouterArgs.power_of_two_load_metric,
+            help="What power_of_two compares: expected_wait, requests or least_requests",
+        )
+        routing_group.add_argument(
             f"--{prefix}balance-abs-threshold",
             f"--{prefix}spill-abs-threshold",
             type=int,
@@ -744,6 +778,19 @@ class RouterArgs:
                 " until it makes progress; the bound stretches to the time its"
                 " in-flight prompts may still need in prefill, up to 120 seconds."
                 " Defaults to 3."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-stale-secs",
+            type=int,
+            default=RouterArgs.worker_stale_secs,
+            help=(
+                "Seconds without any contact (a load record, a poll answer, a probe,"
+                " a token) from a worker whose KV-event stream pushes load records,"
+                " after which it is excluded from routing as unreachable until it is"
+                " heard from again; workers that never pushed a record are not"
+                " judged by it. Keep it above the load-monitor interval. 0 disables."
+                " Defaults to 15."
             ),
         )
         routing_group.add_argument(
@@ -1267,6 +1314,21 @@ class RouterArgs:
             default=None,
             help="Worker discovery provider. Give this or --service-discovery, not both",
         )
+        file_discovery_group.add_argument(
+            f"--{prefix}discovery-file",
+            type=str,
+            default=None,
+            help=(
+                "JSON manifest listing the workers, for --discovery-provider file."
+                " It may be created after startup"
+            ),
+        )
+        file_discovery_group.add_argument(
+            f"--{prefix}discovery-check-interval-secs",
+            type=int,
+            default=None,
+            help="Seconds between rereads of the --discovery-file manifest (default: 30)",
+        )
         k8s_group.add_argument(
             f"--{prefix}selector",
             type=str,
@@ -1361,7 +1423,9 @@ class RouterArgs:
             help=(
                 "Accept an extra client-facing model name for a served model."
                 " Format: <alias>=<canonical>. Repeat for multiple aliases."
-                " Matching is case-sensitive."
+                " Matching is case-sensitive. A vendor-named alias (kimi-*,"
+                " minimax-*, ...) also gives the served model that vendor's"
+                " contract profile under both names."
             ),
         )
         # Prometheus configuration
@@ -1377,10 +1441,11 @@ class RouterArgs:
         prometheus_group.add_argument(
             f"--{prefix}prometheus-host",
             type=str,
-            default="0.0.0.0",
+            default=None,
             help=(
                 "Host address to bind the Prometheus metrics server. Supports IPv4, IPv6"
-                " (e.g., ::, ::1), or 0.0.0.0 for all interfaces"
+                " (e.g., ::, ::1), or 0.0.0.0 for all interfaces. Default: the unspecified"
+                " address of --host's family (:: for an IPv6 host, 0.0.0.0 otherwise)"
             ),
         )
         prometheus_group.add_argument(
@@ -1389,6 +1454,17 @@ class RouterArgs:
             nargs="+",
             action="extend",
             help="Buckets for Prometheus duration metrics",
+        )
+        profiling_group.add_argument(
+            f"--{prefix}jemalloc-prof-dir",
+            type=str,
+            default=None,
+            help=(
+                "Directory where POST /heap_profile (an admin route) writes a jemalloc heap"
+                " profile of the router. Needs a build with the jemalloc-profiling feature,"
+                " started with _RJEM_MALLOC_CONF=prof:true,prof_active:true; unset, the route"
+                " answers 404"
+            ),
         )
 
         # Request handling configuration
@@ -1483,6 +1559,16 @@ class RouterArgs:
                 " concurrency. Unset or 0 = no rate limit."
             ),
         )
+        rate_limit_group.add_argument(
+            f"--{prefix}max-background-responses",
+            type=int,
+            default=RouterArgs.max_background_responses,
+            help=(
+                "Most Responses API requests with background: true in flight"
+                " at once; one beyond answers 429. 0 switches background mode"
+                " off: such requests then run in the foreground."
+            ),
+        )
 
         # Priority scheduler configuration
         scheduler_group.add_argument(
@@ -1507,7 +1593,12 @@ class RouterArgs:
             f"--{prefix}priority-scheduler-config",
             type=str,
             default=None,
-            help="Optional path to the priority-scheduler YAML config.",
+            help=(
+                "Optional path to the priority-scheduler YAML config. With "
+                "--priority-scheduler-enabled, a file that cannot be read, parsed "
+                "or validated is a start-up error; without a path the built-in "
+                "class defaults apply."
+            ),
         )
         scheduler_group.add_argument(
             f"--{prefix}priority-scheduler-tenant-metric-top-n",
@@ -1708,7 +1799,7 @@ class RouterArgs:
             default=RouterArgs.tokenizer_cache_l0_max_memory,
             help="Maximum memory for L0 tokenizer cache in bytes: texts, ids and per-entry overhead (default: 256MB)",
         )
-        parser.add_argument(
+        tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-l1-max-memory",
             type=int,
             default=RouterArgs.tokenizer_cache_l1_max_memory,
@@ -2054,6 +2145,28 @@ class RouterArgs:
             action="extend",
             default=[],
             help="Peer mesh server addresses to join (format: host:port)",
+        )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-tls-ca-cert",
+            type=str,
+            default=None,
+            help=(
+                "CA certificate (PEM) the mesh peers' certificates chain to. With"
+                " --mesh-tls-cert and --mesh-tls-key the mesh listener serves TLS and requires"
+                " peer certificates, and every dial presents this node's."
+            ),
+        )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-tls-cert",
+            type=str,
+            default=None,
+            help="This mesh node's certificate (PEM), with the node's IP as a SAN",
+        )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-tls-key",
+            type=str,
+            default=None,
+            help="This mesh node's private key (PKCS#8 PEM)",
         )
 
     @classmethod

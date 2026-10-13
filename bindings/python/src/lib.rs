@@ -21,7 +21,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
     reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
 )]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8; 61] = observability::metrics::SERVER_MALLOC_CONF;
+pub static MALLOC_CONF: &[u8; 72] = observability::metrics::SERVER_MALLOC_CONF;
 use smg::*;
 use smg_auth as auth;
 
@@ -441,6 +441,7 @@ struct Router {
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
     prometheus_duration_buckets: Option<Vec<f64>>,
+    jemalloc_prof_dir: Option<String>,
     request_timeout_secs: u64,
     shutdown_grace_period_secs: u64,
     request_id_headers: Option<Vec<String>>,
@@ -477,6 +478,7 @@ struct Router {
     queue_size: usize,
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<i32>,
+    max_background_responses: usize,
     connection_mode: worker::ConnectionMode,
     model_path: Option<String>,
     tokenizer_path: Option<String>,
@@ -567,6 +569,7 @@ struct Router {
     kv_index: String,
     worker_stall_secs: u64,
     worker_wedge_secs: u64,
+    worker_stale_secs: u64,
     worker_warmup_secs: u64,
     worker_warmup_share: f32,
     worker_warmup_blocks: usize,
@@ -586,6 +589,12 @@ struct Router {
     /// The keyword-only `discovery` mapping, read by the same rules as
     /// `RouterConfig.discovery`.
     discovery: Option<config::DiscoveryConfig>,
+    /// Keyword-only: the mesh CA, this node's certificate and key (PEM
+    /// paths); all three or none.
+    mesh_tls_ca_cert: Option<String>,
+    mesh_tls_cert: Option<String>,
+    mesh_tls_key: Option<String>,
+    power_of_two_load_metric: String,
 }
 
 /// Read the keyword-only `discovery` mapping by the same rules as
@@ -614,6 +623,50 @@ impl Router {
                 _ => None,
             })
             .unwrap_or(ConnectionMode::Http)
+    }
+
+    /// The metrics bind host: `prometheus_host`, or the unspecified address
+    /// of `host`'s family when it is not given.
+    fn metrics_host(&self) -> String {
+        self.prometheus_host
+            .clone()
+            .unwrap_or_else(|| config::MetricsConfig::default_host_for(&self.host))
+    }
+
+    /// The mesh mTLS configuration from `mesh_tls_ca_cert`, `mesh_tls_cert`
+    /// and `mesh_tls_key`: all three or none, each a readable file.
+    fn mesh_mtls_config(&self) -> PyResult<Option<smg_mesh::MTLSConfig>> {
+        let (ca, cert, key) = match (
+            &self.mesh_tls_ca_cert,
+            &self.mesh_tls_cert,
+            &self.mesh_tls_key,
+        ) {
+            (None, None, None) => return Ok(None),
+            (Some(ca), Some(cert), Some(key)) => (ca, cert, key),
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "mesh_tls_ca_cert, mesh_tls_cert and mesh_tls_key come together: give all \
+                     three or none",
+                ))
+            }
+        };
+        for (field, path) in [
+            ("mesh_tls_ca_cert", ca),
+            ("mesh_tls_cert", cert),
+            ("mesh_tls_key", key),
+        ] {
+            std::fs::metadata(path).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid value for {field}='{path}': cannot read the file: {e}"
+                ))
+            })?;
+        }
+        Ok(Some(smg_mesh::MTLSConfig {
+            ca_cert_path: ca.into(),
+            server_cert_path: cert.into(),
+            server_key_path: key.into(),
+            ..smg_mesh::MTLSConfig::default()
+        }))
     }
 
     fn parse_mesh_socket_addr(
@@ -704,6 +757,15 @@ impl Router {
             }
         })?;
 
+        let power_of_two_load_metric = config::PowerOfTwoLoadMetric::parse(
+            &self.power_of_two_load_metric,
+        )
+        .ok_or_else(|| config::ConfigError::InvalidValue {
+            field: "power_of_two_load_metric".to_string(),
+            value: self.power_of_two_load_metric.clone(),
+            reason: "expected expected_wait, requests or least_requests".to_string(),
+        })?;
+
         let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {
             Ok(match policy {
                 PolicyType::Random => ConfigPolicyConfig::Random,
@@ -729,6 +791,7 @@ impl Router {
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: self.load_monitor_interval,
+                    load_metric: power_of_two_load_metric,
                 },
                 PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad {
                     load_check_interval_secs: self.load_monitor_interval,
@@ -838,13 +901,10 @@ impl Router {
         };
         let has_discovery = discovery.is_some();
 
-        let metrics = match (self.prometheus_port, self.prometheus_host.as_ref()) {
-            (Some(port), Some(host)) => Some(MetricsConfig {
-                port,
-                host: host.clone(),
-            }),
-            _ => None,
-        };
+        let metrics = self.prometheus_port.map(|port| MetricsConfig {
+            port,
+            host: self.metrics_host(),
+        });
 
         let trace_config = Some(config::TraceConfig {
             enable_trace: self.enable_trace,
@@ -946,6 +1006,7 @@ impl Router {
             .worker_overload_shed(self.worker_overload_shed)
             .worker_stall_secs(self.worker_stall_secs)
             .worker_wedge_secs(self.worker_wedge_secs)
+            .worker_stale_secs(self.worker_stale_secs)
             .worker_warmup(
                 self.worker_warmup_secs,
                 self.worker_warmup_share,
@@ -1021,6 +1082,7 @@ impl Router {
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
             .maybe_log_dir(self.log_dir.as_ref())
+            .maybe_jemalloc_prof_dir(self.jemalloc_prof_dir.as_ref())
             .maybe_log_level(self.log_level.as_ref())
             .maybe_request_id_headers(self.request_id_headers.clone())
             .trust_tenant_header(self.trust_tenant_header)
@@ -1030,6 +1092,7 @@ impl Router {
                     .then(|| self.storage_context_headers.clone()),
             )
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
+            .max_background_responses(self.max_background_responses)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
@@ -1171,7 +1234,6 @@ impl Router {
         chat_template = None,
         tokenizer_cache_enable_l0 = false,
         tokenizer_cache_l0_max_entries = 10000,
-        tokenizer_cache_l0_max_memory = 268435456,
         tokenizer_cache_enable_l1 = false,
         tokenizer_cache_l1_max_memory = 52428800,
         reasoning_parser = None,
@@ -1260,6 +1322,7 @@ impl Router {
         kv_index = String::from("positional"),
         worker_stall_secs = 2,
         worker_wedge_secs = 3,
+        worker_stale_secs = 15,
         worker_warmup_secs = 60,
         worker_warmup_share = 0.25,
         worker_warmup_blocks = 1024,
@@ -1274,8 +1337,15 @@ impl Router {
         priority_scheduler_tenant_metric_top_n = 32,
         tenant_rate_limit_enabled = false,
         tenant_rate_limit_config = None,
+        jemalloc_prof_dir = None,
+        tokenizer_cache_l0_max_memory = 268435456,
+        max_background_responses = 1024,
         // Keyword-only, so it never takes a positional slot.
         *,
+        mesh_tls_ca_cert = None,
+        mesh_tls_cert = None,
+        mesh_tls_key = None,
+        power_of_two_load_metric = String::from("expected_wait"),
         discovery = None,
     ))]
     #[expect(clippy::too_many_arguments)]
@@ -1360,7 +1430,6 @@ impl Router {
         chat_template: Option<String>,
         tokenizer_cache_enable_l0: bool,
         tokenizer_cache_l0_max_entries: usize,
-        tokenizer_cache_l0_max_memory: usize,
         tokenizer_cache_enable_l1: bool,
         tokenizer_cache_l1_max_memory: usize,
         reasoning_parser: Option<String>,
@@ -1447,6 +1516,7 @@ impl Router {
         kv_index: String,
         worker_stall_secs: u64,
         worker_wedge_secs: u64,
+        worker_stale_secs: u64,
         worker_warmup_secs: u64,
         worker_warmup_share: f32,
         worker_warmup_blocks: usize,
@@ -1461,6 +1531,13 @@ impl Router {
         priority_scheduler_tenant_metric_top_n: u32,
         tenant_rate_limit_enabled: bool,
         tenant_rate_limit_config: Option<String>,
+        jemalloc_prof_dir: Option<String>,
+        tokenizer_cache_l0_max_memory: usize,
+        max_background_responses: usize,
+        mesh_tls_ca_cert: Option<String>,
+        mesh_tls_cert: Option<String>,
+        mesh_tls_key: Option<String>,
+        power_of_two_load_metric: String,
         discovery: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
@@ -1541,6 +1618,7 @@ impl Router {
             prometheus_port,
             prometheus_host,
             prometheus_duration_buckets,
+            jemalloc_prof_dir,
             request_timeout_secs,
             shutdown_grace_period_secs,
             request_id_headers,
@@ -1577,6 +1655,7 @@ impl Router {
             queue_size,
             queue_timeout_secs,
             rate_limit_tokens_per_second,
+            max_background_responses,
             connection_mode,
             model_path,
             tokenizer_path,
@@ -1660,6 +1739,7 @@ impl Router {
             kv_index,
             worker_stall_secs,
             worker_wedge_secs,
+            worker_stale_secs,
             worker_warmup_secs,
             worker_warmup_share,
             worker_warmup_blocks,
@@ -1675,6 +1755,10 @@ impl Router {
             tenant_rate_limit_enabled,
             tenant_rate_limit_config,
             discovery,
+            mesh_tls_ca_cert,
+            mesh_tls_cert,
+            mesh_tls_key,
+            power_of_two_load_metric,
         })
     }
 
@@ -1709,10 +1793,7 @@ impl Router {
 
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port.unwrap_or(29000),
-            host: self
-                .prometheus_host
-                .clone()
-                .unwrap_or_else(|| "127.0.0.1".to_string()),
+            host: self.metrics_host(),
             duration_buckets: self.prometheus_duration_buckets.clone(),
         });
 
@@ -1794,7 +1875,7 @@ impl Router {
                         bind_addr,
                         advertise_addr,
                         init_peer: peer,
-                        mtls_config: None,
+                        mtls_config: self.mesh_mtls_config()?,
                     })
                 } else {
                     None
@@ -1854,6 +1935,10 @@ fn get_available_reasoning_parsers() -> Vec<String> {
 #[pymodule]
 fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     observability::metrics::register_jemalloc_as_global_allocator();
+    // The process-level TLS crypto provider, installed once when the module
+    // is imported: every HTTP client a binding builds takes it, whether or
+    // not a router is started in this process.
+    tls::install_crypto_provider();
 
     m.add_class::<PolicyType>()?;
     m.add_class::<BackendType>()?;

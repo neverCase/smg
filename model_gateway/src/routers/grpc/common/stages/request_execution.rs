@@ -18,6 +18,7 @@ use crate::{
     },
     routers::{
         common::{
+            attempt_ledger::{mark_upstream_answer, AttemptLedger},
             kv_transfer::{
                 connector_mode_for_worker, is_moriio_worker, mooncake_decode_params,
                 mooncake_prefill_params, KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
@@ -37,7 +38,10 @@ use crate::{
                 FanoutStream, ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest,
                 ProtoResponseVariant, ProtoStream,
             },
-            utils::tonic_ext::{TonicResultExt, TonicStatusExt},
+            utils::{
+                account_pd_leg_failure,
+                tonic_ext::{TonicResultExt, TonicStatusExt},
+            },
         },
     },
     worker::{ConnectionModeExt, PrefillLoadGuard, Worker},
@@ -339,6 +343,10 @@ pub(crate) async fn execute_plan(
             "Worker selection not completed",
         )
     })?;
+    // Every breaker sample of this attempt goes through the request's
+    // ledger, which charges a worker once per request however often the
+    // request retried on it.
+    let ledger = &ctx.ledger;
 
     ctx.load_guards = Some(LoadGuards::admitted(
         admission,
@@ -369,7 +377,10 @@ pub(crate) async fn execute_plan(
         );
     }
 
-    // Create OTEL span for gRPC request execution
+    // The upstream span: the dispatch, then the response stream (it closes
+    // with the load guards, which the response body holds to its last frame;
+    // see `LoadGuards::traced`). A failed dispatch sets its status to ERROR;
+    // success is left unset, as the RPC conventions have it.
     let span = info_span!(
         target: "smg::otel-trace",
         "grpc_execute",
@@ -377,17 +388,20 @@ pub(crate) async fn execute_plan(
         request_id = %request_id,
         model = %model,
         mode = %mode,
+        otel.status_code = tracing::field::Empty,
     );
 
     let result = async {
         match execution_plan {
             ExecutionPlan::Single(request) => match request {
-                ProtoRequest::Generate(req) => execute_single(req, clients, workers).await,
-                ProtoRequest::Embed(req) => execute_single_embed(req, clients, workers).await,
+                ProtoRequest::Generate(req) => execute_single(req, clients, workers, ledger).await,
+                ProtoRequest::Embed(req) => {
+                    execute_single_embed(req, clients, workers, ledger).await
+                }
             },
             ExecutionPlan::PrefillDecode(req) => {
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
-                execute_pd_dispatch(req, clients, workers, model, prefill_guard).await
+                execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger).await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
                 // Bootstrap info was injected into the prefill request during
@@ -401,15 +415,25 @@ pub(crate) async fn execute_plan(
                     model,
                     encode_dispatch,
                     prefill_guard,
+                    ledger,
                 )
                 .await
             }
             ExecutionPlan::Batch { kind, requests, .. } => {
-                execute_batch_dispatch(kind, requests, clients, workers, model, prefill_guard).await
+                execute_batch_dispatch(
+                    kind,
+                    requests,
+                    clients,
+                    workers,
+                    model,
+                    prefill_guard,
+                    ledger,
+                )
+                .await
             }
         }
     }
-    .instrument(span)
+    .instrument(span.clone())
     .await;
     // The engines hold the request bodies now. An earlier attempt keeps its
     // share of the budget: the retained plan still owns the same media, and a
@@ -417,7 +441,16 @@ pub(crate) async fn execute_plan(
     if last_attempt {
         ctx.multimodal_inflight.take();
     }
-    let result = result?;
+    let result = match result {
+        Ok(result) => result,
+        Err(response) => {
+            span.record("otel.status_code", "ERROR");
+            return Err(response);
+        }
+    };
+    if let Some(guards) = ctx.load_guards.take() {
+        ctx.load_guards = Some(LoadGuards::traced(span, guards));
+    }
 
     // Store result in context for response processing
     ctx.response.execution_result = Some(result);
@@ -445,6 +478,7 @@ async fn execute_pd_dispatch(
     workers: &WorkerSelection,
     model: &str,
     prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -473,14 +507,39 @@ async fn execute_pd_dispatch(
     // carried in the request.
     match protocol.dispatch {
         PdDispatch::Sequential => {
-            execute_sequential_pd(proto_request, clients, workers, model, prefill_guard).await
+            execute_sequential_pd(
+                proto_request,
+                clients,
+                workers,
+                model,
+                prefill_guard,
+                ledger,
+            )
+            .await
         }
         PdDispatch::Parallel => match pd_fanout_width(&proto_request, protocol) {
             Some(n) => {
-                execute_fanout_pd(proto_request, n, clients, workers, protocol, prefill_guard).await
+                execute_fanout_pd(
+                    proto_request,
+                    n,
+                    clients,
+                    workers,
+                    protocol,
+                    prefill_guard,
+                    ledger,
+                )
+                .await
             }
             None => {
-                execute_parallel_pd(proto_request, clients, workers, protocol, prefill_guard).await
+                execute_parallel_pd(
+                    proto_request,
+                    clients,
+                    workers,
+                    protocol,
+                    prefill_guard,
+                    ledger,
+                )
+                .await
             }
         },
     }
@@ -497,6 +556,7 @@ async fn execute_fanout_pd(
     workers: &WorkerSelection,
     protocol: PdProtocol,
     prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let subs = fan_out_pd_request(&proto_request, n, |sub| {
         maybe_inject_pd_metadata(sub, workers);
@@ -512,7 +572,9 @@ async fn execute_fanout_pd(
     let guards = prefill_guard.replicate_to(subs.len());
     let dispatches = subs.into_iter().zip(guards).map(|(sub, guard)| {
         let mut clients = clients.clone();
-        async move { execute_parallel_pd(sub, &mut clients, workers, protocol, guard).await }
+        async move {
+            execute_parallel_pd(sub, &mut clients, workers, protocol, guard, ledger).await
+        }
     });
     let results = try_join_all(dispatches).await?;
 
@@ -571,12 +633,21 @@ async fn execute_epd_dispatch(
     model: &str,
     encode_dispatch: Option<EncodeDispatchPlan>,
     prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     if let Some(encode_dispatch) = encode_dispatch {
         spawn_encode_dispatch(encode_dispatch);
     }
     proto_request.clear_mm_pixel_values();
-    execute_pd_dispatch(proto_request, clients, workers, model, prefill_guard).await
+    execute_pd_dispatch(
+        proto_request,
+        clients,
+        workers,
+        model,
+        prefill_guard,
+        ledger,
+    )
+    .await
 }
 
 #[expect(
@@ -633,6 +704,7 @@ async fn execute_batch_dispatch(
     workers: &WorkerSelection,
     model: &str,
     prefill_guard: Option<PrefillLoadGuard>,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
@@ -653,13 +725,20 @@ async fn execute_batch_dispatch(
             async move {
                 match kind {
                     ExecutionPlanKind::Single => {
-                        execute_single(request, &mut clients, workers).await
+                        execute_single(request, &mut clients, workers, ledger).await
                     }
                     // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
                     ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
                         let prefill_guard = require_prefill_guard(prefill_guard)?;
-                        execute_pd_dispatch(request, &mut clients, workers, model, prefill_guard)
-                            .await
+                        execute_pd_dispatch(
+                            request,
+                            &mut clients,
+                            workers,
+                            model,
+                            prefill_guard,
+                            ledger,
+                        )
+                        .await
                     }
                 }
             }
@@ -673,6 +752,7 @@ async fn execute_single(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let client = clients.single_mut().ok_or_else(|| {
         error!(
@@ -695,7 +775,9 @@ async fn execute_single(
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
     let result = client.generate(proto_request).await;
-    workers.record_outcome(result.cb_status_code());
+    if let Some(status) = result.breaker_status() {
+        workers.record_outcome(ledger, status);
+    }
 
     let stream = result.map_err(|e| {
         start_failure_response(
@@ -727,12 +809,27 @@ fn start_failure_response(
     description: &str,
     code: &str,
 ) -> Response {
+    // The request's media failed, not the worker (see `TonicStatusExt::media_fault`):
+    // the answer is for the media, and another worker fetching the same URL
+    // would meet the same host, so the request is not replayed.
+    if let Some(fault) = e.media_fault() {
+        warn!(function = function, error = %e, ?fault, "{}: the request's media failed", description);
+        let mut response = e.to_http_error("media_fetch_failed", e.message().to_string());
+        mark_non_retryable(&mut response);
+        return response;
+    }
     if e.http_status().is_client_error() {
         warn!(function = function, error = %e, "{}: engine rejected the request", description);
     } else {
         error!(function = function, error = %e, "{}", description);
     }
     let mut response = e.to_http_error(code, format!("{description}: {}", e.message()));
+    // INTERNAL is the servicers' code for a request the engine took and failed
+    // on: the worker's own answer for this payload, which the retry layer does
+    // not replay on it (see `routers::common::attempt_ledger`).
+    if e.code() == tonic::Code::Internal {
+        mark_upstream_answer(&mut response);
+    }
     // The worker already spent its whole media-sidecar budget on this input;
     // another attempt costs the same again. Other sidecar failures fail fast.
     if e.code() == tonic::Code::Unavailable && e.message().starts_with("sidecar_timeout") {
@@ -745,6 +842,7 @@ async fn execute_single_embed(
     proto_request: ProtoEmbedRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let client = clients.single_mut().ok_or_else(|| {
         error!(
@@ -761,7 +859,9 @@ async fn execute_single_embed(
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
     let result = client.embed(proto_request).await;
-    workers.record_outcome(result.cb_status_code());
+    if let Some(status) = result.breaker_status() {
+        workers.record_outcome(ledger, status);
+    }
 
     let complete = result.map_err(|e| {
         start_failure_response(
@@ -781,6 +881,7 @@ async fn execute_parallel_pd(
     workers: &WorkerSelection,
     protocol: PdProtocol,
     prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -843,8 +944,9 @@ async fn execute_parallel_pd(
         PdDispatchOutcome::Both(prefill_result, decode_result) => {
             // Record circuit breaker outcomes (client errors don't count as failures)
             workers.record_prefill_decode_outcomes(
-                prefill_result.cb_status_code(),
-                decode_result.cb_status_code(),
+                ledger,
+                prefill_result.breaker_status(),
+                decode_result.breaker_status(),
             );
 
             // Both legs are translated before either is propagated: a
@@ -874,8 +976,11 @@ async fn execute_parallel_pd(
                 prefill: prefill_stream,
                 decode: Box::new(decode_stream),
                 prefill_guards: vec![Some(prefill_guard)],
+                // Both legs were dispatched together, so the decode leg's
+                // time to first token is the end-to-end one.
                 pd_timing: PdTiming {
                     prefill_start,
+                    decode_sent: prefill_start,
                     runtime,
                 },
                 // The streaming layer drains the live prefill stream itself.
@@ -887,17 +992,21 @@ async fn execute_parallel_pd(
             error,
             partner,
         } => {
-            let status = error.http_status().as_u16();
+            let status = error.breaker_status();
             // Only the leg that answered is recorded: the abandoned one has
             // said nothing about its worker yet, and `retire_pd_leg` records
             // it when it finally does.
             let (label, partner_label, partner_worker) = match leg {
                 PdLeg::Prefill => {
-                    workers.record_outcome_prefill(status);
+                    if let Some(status) = status {
+                        workers.record_outcome_prefill(ledger, status);
+                    }
                     (prefill_label, decode_label, workers.decode_worker())
                 }
                 PdLeg::Decode => {
-                    workers.record_outcome_decode(status);
+                    if let Some(status) = status {
+                        workers.record_outcome_decode(ledger, status);
+                    }
                     (decode_label, prefill_label, workers.prefill_worker())
                 }
             };
@@ -977,8 +1086,10 @@ async fn dispatch_pd_legs(
 }
 
 /// Log, count and translate one leg's dispatch failure into the client answer.
+/// A failure that names the rendezvous counts under the rendezvous family too.
 fn pd_leg_error(leg: PdLeg, connection: &'static str, error: &tonic::Status) -> Response {
     Metrics::record_worker_error(leg.name(), connection, metrics_labels::ERROR_BACKEND);
+    account_pd_leg_failure(leg.name(), error);
     start_failure_response(
         error,
         "execute_parallel_pd",
@@ -1008,7 +1119,9 @@ fn retire_pd_leg(
 ) {
     tokio::spawn(async move {
         let result = dispatch.await;
-        worker.record_outcome(result.cb_status_code());
+        if let Some(status) = result.breaker_status() {
+            worker.record_outcome(status);
+        }
         match result {
             Ok(stream) => {
                 debug!(
@@ -1050,6 +1163,9 @@ enum SequentialPdDecodeForm {
 
 /// Pick the decode-leg form, failing fast when the selected decode worker is
 /// language-model-only and the request is one that pairing cannot serve.
+/// Worker selection keeps such a request off such workers while the model
+/// pairs a decode worker with the vision encoder (`decode_needs_vision`), so
+/// a refusal here means none is paired.
 fn sequential_pd_decode_form(
     request: &ProtoGenerateRequest,
     decode_language_model_only: bool,
@@ -1069,9 +1185,10 @@ fn sequential_pd_decode_form(
         // this pairing cannot serve the request.
         let mut response = error::bad_request(
             "pd_decode_language_model_only_mrope",
-            "the selected decode worker runs with --language-model-only, but this \
-             model's decode leg needs its M-RoPE grid tensors; run the decode pool \
-             with the vision encoder enabled for this model"
+            "no decode worker with a vision encoder is paired for this model, and its \
+             decode leg needs the M-RoPE grid tensors a decode worker running with \
+             --language-model-only cannot take; add a decode worker with the vision \
+             encoder enabled for this model"
                 .to_string(),
         );
         mark_non_retryable(&mut response);
@@ -1082,9 +1199,10 @@ fn sequential_pd_decode_form(
         // expands itself; a language-model-only decode worker cannot.
         let mut response = error::bad_request(
             "pd_decode_language_model_only_media_refs",
-            "the selected decode worker runs with --language-model-only and cannot \
-             expand media references; use router-side multimodal processing \
-             (--mm-processing=router) for this pool"
+            "no decode worker with a vision encoder is paired for this model, and a \
+             decode worker running with --language-model-only cannot expand media \
+             references; add such a decode worker or use router-side multimodal \
+             processing (--mm-processing=router) for this pool"
                 .to_string(),
         );
         mark_non_retryable(&mut response);
@@ -1095,9 +1213,10 @@ fn sequential_pd_decode_form(
         // a pixel-less decode worker cannot do.
         let mut response = error::bad_request(
             "pd_decode_language_model_only_n_samples",
-            "the selected decode worker runs with --language-model-only and cannot \
-             recompute a multimodal prompt; n>1 parallel sampling needs decode \
-             workers with the vision encoder enabled"
+            "no decode worker with a vision encoder is paired for this model, and n>1 \
+             parallel sampling of a multimodal prompt recomputes it on the decode \
+             leg, which a decode worker running with --language-model-only cannot \
+             do; add a decode worker with the vision encoder enabled"
                 .to_string(),
         );
         mark_non_retryable(&mut response);
@@ -1118,6 +1237,7 @@ async fn execute_sequential_pd(
     workers: &WorkerSelection,
     model: &str,
     prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -1272,12 +1392,15 @@ async fn execute_sequential_pd(
         .generate(prefill_request)
         .await
         .map_err(|e| {
-            workers.record_outcome_prefill(e.http_status().as_u16());
+            if let Some(status) = e.breaker_status() {
+                workers.record_outcome_prefill(ledger, status);
+            }
             Metrics::record_worker_error(
                 metrics_labels::WORKER_PREFILL,
                 prefill_label,
                 metrics_labels::ERROR_BACKEND,
             );
+            account_pd_leg_failure(metrics_labels::WORKER_PREFILL, &e);
             start_failure_response(
                 &e,
                 "execute_sequential_pd",
@@ -1307,12 +1430,15 @@ async fn execute_sequential_pd(
                 }
             }
             Err(e) => {
-                workers.record_outcome_prefill(e.http_status().as_u16());
+                if let Some(status) = e.breaker_status() {
+                    workers.record_outcome_prefill(ledger, status);
+                }
                 Metrics::record_worker_error(
                     metrics_labels::WORKER_PREFILL,
                     prefill_label,
                     metrics_labels::ERROR_BACKEND,
                 );
+                account_pd_leg_failure(metrics_labels::WORKER_PREFILL, &e);
                 error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
                 return Err(e.to_http_error(
                     "prefill_stream_error",
@@ -1324,12 +1450,10 @@ async fn execute_sequential_pd(
     prefill_stream.mark_completed();
     // Prefill is drained: its admission slot is free while decode runs.
     drop(prefill_guard);
-    workers.record_outcome_prefill(200);
-    // Captured at drain; recorded below only once decode is established.
-    let prefill_duration = prefill_start.elapsed();
-
-    // KV-transfer window: prefill drain complete to decode send complete.
-    let kv_window_start = Instant::now();
+    workers.record_outcome_prefill(ledger, 200);
+    // The prefill phase ends at the drain; recorded below only once decode is
+    // established.
+    let prefill_done = Instant::now();
 
     debug!("vLLM PD: prefill completed, sending decode request");
 
@@ -1429,13 +1553,22 @@ async fn execute_sequential_pd(
     if let Some(decode) = workers.decode_worker() {
         Metrics::record_worker_request(decode.url(), decode.model_id());
     }
+    // The relay phase ends at the decode dispatch. Everything after this
+    // instant, including the engines' KV transfer and the decode scheduling,
+    // is the decode leg's time to first token; the instant is taken before the
+    // call so a worker that holds its response headers until the first token
+    // still lands in the decode phase.
+    let decode_sent = Instant::now();
     let decode_stream = decode_client.generate(decode_request).await.map_err(|e| {
-        workers.record_outcome_decode(e.http_status().as_u16());
+        if let Some(status) = e.breaker_status() {
+            workers.record_outcome_decode(ledger, status);
+        }
         Metrics::record_worker_error(
             metrics_labels::WORKER_DECODE,
             decode_label,
             metrics_labels::ERROR_BACKEND,
         );
+        account_pd_leg_failure(metrics_labels::WORKER_DECODE, &e);
         start_failure_response(
             &e,
             "execute_sequential_pd",
@@ -1444,20 +1577,20 @@ async fn execute_sequential_pd(
         )
     })?;
 
-    workers.record_outcome_decode(200);
+    workers.record_outcome_decode(ledger, 200);
     // Decode established: record the success-only PD metrics here.
     Metrics::record_pd_kv_connector_mode(kv_connector_label);
     Metrics::record_pd_prefill_duration(
         metrics_labels::BACKEND_PD,
         model,
         runtime,
-        prefill_duration,
+        prefill_done.duration_since(prefill_start),
     );
     Metrics::record_pd_kv_transfer_duration(
         metrics_labels::BACKEND_PD,
         model,
         runtime,
-        kv_window_start.elapsed(),
+        decode_sent.duration_since(prefill_done),
     );
 
     // Prefill has completed and its KV blocks are held pending decode's
@@ -1480,6 +1613,7 @@ async fn execute_sequential_pd(
         prefill_guards: vec![None],
         pd_timing: PdTiming {
             prefill_start,
+            decode_sent,
             runtime,
         },
         prefill_input_logprobs,
@@ -1523,6 +1657,43 @@ mod tests {
             decode: leg("grpc://decode:30000", WorkerType::Decode),
             runtime_type: RuntimeType::TokenSpeed,
         }
+    }
+
+    /// A leg whose dispatch fails with the engine's rendezvous verdict is
+    /// counted under the rendezvous family, by leg and phase; any other
+    /// dispatch failure of a leg is not.
+    #[test]
+    fn a_leg_that_fails_its_rendezvous_at_dispatch_is_counted() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            pd_leg_error(
+                PdLeg::Prefill,
+                metrics_labels::CONNECTION_GRPC,
+                &tonic::Status::internal(
+                    "Prefill bootstrap failed for request rank=0 req.rid='r1' \
+                     req.bootstrap_room=41 with exception KVTransferError(bootstrap_room=41): \
+                     Request 41 timed out after 120.0s in KVPoll.Bootstrapping",
+                ),
+            );
+            pd_leg_error(
+                PdLeg::Decode,
+                metrics_labels::CONNECTION_GRPC,
+                &tonic::Status::unavailable("connection reset"),
+            );
+        });
+        let rendered = handle.render();
+        let counted: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
+            .collect();
+        assert_eq!(counted.len(), 1, "{rendered}");
+        assert!(
+            counted[0].contains(r#"leg="prefill""#)
+                && counted[0].contains(r#"phase="bootstrap""#)
+                && counted[0].ends_with(" 1"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -2414,14 +2585,32 @@ mod tests {
         assert!(!tokenspeed_request(1, None).has_kv_transfer_params());
     }
 
+    /// The refusals of a pool with no vision-capable decode worker (worker
+    /// selection pairs one when the model has it): each names its code and
+    /// says that none is paired.
     #[tokio::test]
     async fn sequential_pd_decode_form_rejects_incompatible_pairings() {
+        async fn refusal(response: Response) -> String {
+            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let text = String::from_utf8(body.to_vec()).expect("utf-8 body");
+            assert!(
+                text.contains("no decode worker with a vision encoder is paired"),
+                "{text}"
+            );
+            text
+        }
+
         // M-RoPE grids + language-model-only decode: cannot strip (positions
         // would be wrong), cannot send (encoder-cache budget 0).
         let gridded = vllm_pd_mm_request();
         let response = sequential_pd_decode_form(&gridded, true, true)
             .expect_err("mRoPE grids need a vision-capable decode worker");
-        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+        assert!(refusal(response)
+            .await
+            .contains("pd_decode_language_model_only_mrope"));
 
         // Media references + language-model-only decode: the leg would have
         // to expand the anchors itself.
@@ -2433,7 +2622,9 @@ mod tests {
         req.extra_mm_inputs.clear();
         let response = sequential_pd_decode_form(&refs_only, true, true)
             .expect_err("media refs need a processing decode worker");
-        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+        assert!(refusal(response)
+            .await
+            .contains("pd_decode_language_model_only_media_refs"));
 
         // n>1 + mm + language-model-only decode: no KV handoff, no local
         // recompute either.
@@ -2449,7 +2640,9 @@ mod tests {
             .clear();
         let response = sequential_pd_decode_form(&fanout, true, false)
             .expect_err("n>1 cannot recompute on a pixel-less decode worker");
-        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+        assert!(refusal(response)
+            .await
+            .contains("pd_decode_language_model_only_n_samples"));
     }
 
     #[test]

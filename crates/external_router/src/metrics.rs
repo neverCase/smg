@@ -181,6 +181,7 @@ pub mod metrics_labels {
     // Discovery sources
     pub const DISCOVERY_STATIC: &str = "static";
     pub const DISCOVERY_KUBERNETES: &str = "kubernetes";
+    pub const DISCOVERY_FILE: &str = "file";
     pub const DISCOVERY_CONSUL: &str = "consul";
     pub const DISCOVERY_MANUAL: &str = "manual";
 
@@ -189,6 +190,11 @@ pub mod metrics_labels {
     pub const REGISTRATION_FAILED: &str = "failed";
     pub const DEREGISTRATION_RECONCILED: &str = "reconciled";
 
+    // Discovery snapshot errors: the source could not be read, or was read
+    // and rejected as invalid
+    pub const SNAPSHOT_ERROR_UNREADABLE: &str = "unreadable";
+    pub const SNAPSHOT_ERROR_INVALID: &str = "invalid";
+
     // Rate limit results
     pub const RATE_LIMIT_ALLOWED: &str = "allowed";
     pub const RATE_LIMIT_REJECTED: &str = "rejected";
@@ -196,6 +202,9 @@ pub mod metrics_labels {
     // Admission rejection reasons
     pub const ADMISSION_REJECTED_FULL: &str = "full";
     pub const ADMISSION_REJECTED_TIMEOUT: &str = "timeout";
+    /// Admitted, then held inside the gateway ahead of worker selection for
+    /// longer than the queue timeout.
+    pub const ADMISSION_REJECTED_SELECTION_TIMEOUT: &str = "selection_timeout";
 
     // Circuit breaker states
     pub const CB_CLOSED: &str = "closed";
@@ -211,7 +220,14 @@ pub mod metrics_labels {
     pub const ERROR_TIMEOUT: &str = "timeout";
     pub const ERROR_BACKEND: &str = "backend_error";
     pub const ERROR_VALIDATION: &str = "validation_error";
+    /// Capacity pushback (a 429): the worker, or the gateway's own admission,
+    /// turned the request away for now. Named as the client reads it in the
+    /// error body's `type`.
+    pub const ERROR_RATE_LIMIT: &str = "rate_limit_error";
     pub const ERROR_INTERNAL: &str = "internal_error";
+    /// The engine itself reported that the request failed (its finish
+    /// reason was `error`), as opposed to a failed call to the worker.
+    pub const ERROR_ENGINE: &str = "engine_error";
 }
 
 /// Recorders for the metrics a router emits.

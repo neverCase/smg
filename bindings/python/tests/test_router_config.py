@@ -458,6 +458,16 @@ class TestDiscoveryMapping:
     def test_untagged_mapping_reads_as_kubernetes(self):
         _Router(worker_urls=[], discovery=self.kubernetes_fields())
 
+    def test_file_mapping_is_accepted(self):
+        _Router(
+            worker_urls=[],
+            discovery={"provider": "file", "path": "/run/smg/workers.json"},
+        )
+
+    def test_file_mapping_needs_a_path(self):
+        with pytest.raises(ValueError, match="path"):
+            _Router(worker_urls=[], discovery={"provider": "file"})
+
     def test_mapping_and_service_discovery_conflict(self):
         with pytest.raises(ValueError, match="not both"):
             _Router(
@@ -494,6 +504,7 @@ class TestRouterPositionalSignature:
             "kv_index",
             "worker_stall_secs",
             "worker_wedge_secs",
+            "worker_stale_secs",
             "worker_warmup_secs",
             "worker_warmup_share",
             "worker_warmup_blocks",
@@ -508,4 +519,7 @@ class TestRouterPositionalSignature:
             "priority_scheduler_tenant_metric_top_n",
             "tenant_rate_limit_enabled",
             "tenant_rate_limit_config",
+            "jemalloc_prof_dir",
+            "tokenizer_cache_l0_max_memory",
+            "max_background_responses",
         ]

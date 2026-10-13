@@ -49,7 +49,7 @@ pub(crate) enum MmRefsError {
     ModelNotOptedIn(Modality),
     /// vLLM does not accept this modality at all.
     ModalityUnsupported(Modality),
-    /// A part kind with no reference form (inline bytes, embeddings, audio).
+    /// A part kind with no reference form (inline bytes or embeddings).
     UnsupportedPart(&'static str),
     /// An inline `data:` payload above the router's byte cap.
     RefTooLarge {
@@ -63,6 +63,9 @@ pub(crate) enum MmRefsError {
     EncodeNotSupported,
     /// A selected leg does not advertise worker-side processing.
     WorkerNotCapable,
+    /// The model has no registry spec, so the router cannot process its media
+    /// itself, and the placement did not give it a worker that does.
+    RouterSpecMissing,
 }
 
 impl MmRefsError {
@@ -74,7 +77,9 @@ impl MmRefsError {
             Self::ModalityUnsupported(_) | Self::UnsupportedPart(_) => "multimodal_not_supported",
             Self::RefTooLarge { .. } => "media_ref_too_large",
             Self::SchemeNotAccepted { .. } => "media_ref_scheme_not_accepted",
-            Self::EncodeNotSupported | Self::WorkerNotCapable => "multimodal_not_supported",
+            Self::EncodeNotSupported | Self::WorkerNotCapable | Self::RouterSpecMissing => {
+                "multimodal_not_supported"
+            }
         }
     }
 }
@@ -114,6 +119,11 @@ impl std::fmt::Display for MmRefsError {
             Self::WorkerNotCapable => f.write_str(
                 "the selected worker does not advertise worker-side multimodal processing",
             ),
+            Self::RouterSpecMissing => f.write_str(
+                "the router has no media spec for this model's family and cannot process its \
+                 media itself; a vLLM worker with --mm-processor inprocess|redis processes it \
+                 under --mm-processing worker (or auto, when every worker of the model does)",
+            ),
         }
     }
 }
@@ -151,7 +161,9 @@ fn ensure_worker_expandable(
     placeholders: &PlaceholderTokens,
 ) -> Result<(), MmRefsError> {
     for &modality in plan.modalities() {
-        if !runtime_supports_modality(RuntimeType::Vllm, modality) {
+        // Audio uses the native worker processor; preprocessed audio tensors
+        // remain unsupported on vLLM's separate router-processing path.
+        if modality != Modality::Audio && !runtime_supports_modality(RuntimeType::Vllm, modality) {
             return Err(MmRefsError::ModalityUnsupported(modality));
         }
         if !placeholders.worker_expandable(modality) {
@@ -201,6 +213,11 @@ pub(crate) fn resolve_mm_processing(
             }
         }
     };
+
+    if resolved == MmProcessing::Router && placeholders.is_worker_only() {
+        // No spec: the router has nothing to process the media with.
+        return Err(MmRefsError::RouterSpecMissing);
+    }
 
     // Where a model's media is processed is worker configuration, reported in
     // the worker's labels and countable on this metric. It is not a per-request
@@ -320,8 +337,11 @@ fn forwardable_ref(
         MediaContentPart::VideoData { .. } => {
             Err(MmRefsError::UnsupportedPart("inline video bytes"))
         }
-        MediaContentPart::AudioUrl { .. } | MediaContentPart::AudioData { .. } => {
-            Err(MmRefsError::UnsupportedPart("audio"))
+        MediaContentPart::AudioUrl { url, .. } => {
+            Ok((common::Modality::Audio, url, media::audio_max_input_bytes()))
+        }
+        MediaContentPart::AudioData { .. } => {
+            Err(MmRefsError::UnsupportedPart("inline audio bytes"))
         }
         MediaContentPart::ImageEmbeds { .. } => {
             Err(MmRefsError::UnsupportedPart("image embeddings"))
@@ -506,6 +526,54 @@ mod tests {
         let schemes = worker_media_ref_schemes(w.as_ref());
         assert_eq!(schemes.len(), 3);
         assert!(schemes.contains("http") && schemes.contains("https") && schemes.contains("data"));
+    }
+
+    /// A model without a registry spec: worker placement forwards it, auto
+    /// forwards it when every worker of the model processes media itself and
+    /// refuses it otherwise, router placement refuses it; the refusal names
+    /// the router's missing spec, not the model.
+    #[test]
+    fn a_model_without_a_spec_goes_to_a_capable_worker_or_is_refused() {
+        let worker_only = PlaceholderTokens::worker_only();
+        let plan_ok = plan(vec![image_url("https://a/1.png")]);
+        assert!(worker_only.worker_expandable(Modality::Image));
+
+        assert_eq!(
+            resolve_mm_processing(
+                &components(MmProcessingMode::Worker),
+                &registry_with(vec![]),
+                MODEL,
+                &plan_ok,
+                &worker_only
+            )
+            .expect("worker placement forwards"),
+            MmProcessing::Worker
+        );
+        let auto = components(MmProcessingMode::Auto);
+        assert_eq!(
+            resolve_mm_processing(
+                &auto,
+                &registry_with(vec![capable("grpc://127.0.0.1:9450")]),
+                MODEL,
+                &plan_ok,
+                &worker_only
+            )
+            .expect("a uniform capable fleet forwards"),
+            MmProcessing::Worker
+        );
+        for (registry, placement) in [
+            (registry_with(vec![]), &auto),
+            (
+                registry_with(vec![capable("grpc://127.0.0.1:9451")]),
+                &components(MmProcessingMode::Router),
+            ),
+        ] {
+            let err = resolve_mm_processing(placement, &registry, MODEL, &plan_ok, &worker_only)
+                .expect_err("nothing processes the media");
+            assert_eq!(err, MmRefsError::RouterSpecMissing);
+            assert_eq!(err.code(), "multimodal_not_supported");
+            assert!(err.to_string().contains("no media spec"), "{err}");
+        }
     }
 
     #[test]
@@ -779,13 +847,37 @@ mod tests {
     }
 
     #[test]
+    fn audio_refs_require_an_expandable_model_and_stay_in_prompt_order() {
+        let plan = plan(vec![
+            MediaContentPart::AudioUrl {
+                url: "data:audio/wav;base64,AAAA".to_string(),
+                uuid: None,
+            },
+            image_url("https://a/1.png"),
+        ]);
+        assert!(plan.is_forwardable());
+        let mut placeholders = expandable_placeholders();
+        assert_eq!(
+            ensure_worker_expandable(&plan, &placeholders),
+            Err(MmRefsError::ModelNotOptedIn(Modality::Audio))
+        );
+        placeholders.set_worker_expandable(Modality::Audio, true);
+        ensure_worker_expandable(&plan, &placeholders).unwrap();
+        let refs = assemble_media_refs(plan).unwrap();
+        assert_eq!(refs.items[0].modality, common::Modality::Audio as i32);
+        assert_eq!(refs.items[0].url, "data:audio/wav;base64,AAAA");
+        assert_eq!(refs.items[1].modality, common::Modality::Image as i32);
+    }
+
+    #[test]
     fn assemble_rejects_unsupported_parts_and_oversized_data_urls() {
-        let err = assemble_media_refs(plan(vec![MediaContentPart::AudioUrl {
-            url: "https://a/x.wav".to_string(),
+        let err = assemble_media_refs(plan(vec![MediaContentPart::AudioData {
+            data: vec![0; 4],
+            mime_type: Some("audio/wav".to_string()),
             uuid: None,
         }]))
-        .expect_err("audio is not forwardable");
-        assert_eq!(err, MmRefsError::UnsupportedPart("audio"));
+        .expect_err("raw audio bytes have no reference form");
+        assert_eq!(err, MmRefsError::UnsupportedPart("inline audio bytes"));
 
         let oversized = format!(
             "data:image/png;base64,{}",

@@ -1,18 +1,29 @@
 //! Tracing/logging integration for the HTTP layer.
 //!
-//! Wires `tower_http::trace::TraceLayer` with custom span/request/response
-//! handlers that propagate W3C trace context, attach the request ID into
-//! the span, and record HTTP-level metrics via the observability layer.
+//! [`RequestTraceLayer`] opens one `http_request` span per request with the
+//! `tower_http::trace` handlers below (W3C trace context in, the request ID
+//! and trace ID on the span, HTTP-level metrics), runs the handler under it
+//! and logs the response. The span is entered for the request, the handler
+//! and the response log, and once more if the response stream fails; it is
+//! not entered per body frame, so a long SSE stream costs no span bookkeeping
+//! per chunk. The span stays open until the body ends, so an exported trace
+//! still covers the whole stream.
 
-use std::time::Duration;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
 
-use axum::{extract::Request, middleware::Next, response::Response};
+use axum::{body::Body, extract::Request, middleware::Next, response::Response};
 use opentelemetry::trace::TraceContextExt;
+use tower::{Layer, Service};
 use tower_http::{
     classify::ServerErrorsFailureClass,
-    trace::{MakeSpan, OnFailure, OnRequest, OnResponse, TraceLayer},
+    trace::{MakeSpan, OnFailure, OnRequest, OnResponse},
 };
-use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
+use tracing::{debug, error, field::Empty, info, info_span, warn, Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::{metrics::matched_path_label, request_id::RequestId};
@@ -29,6 +40,16 @@ use crate::observability::{
 /// responses at DEBUG instead of flooding ERROR/INFO once per poll.
 #[derive(Clone, Copy, Debug)]
 pub struct ProbeResponse;
+
+/// Response-extension marker for a refusal whose producing stage wrote the
+/// log line for it already (one WARN per refusal, rate-limited under a
+/// sustained condition, with the request id, the model and the pool's
+/// state). [`ResponseLogger`] logs a marked response at DEBUG instead of a
+/// second line at ERROR: a client retrying at once against a model whose
+/// workers are all down turned every refusal into three ERROR lines, and
+/// the log into a storm.
+#[derive(Clone, Copy, Debug)]
+pub struct ReportedRefusal;
 
 /// The probe routes on the main listener. Request-start logging for these is
 /// demoted alongside [`ProbeResponse`] — the paths are the request-side view
@@ -60,6 +81,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             status_code = Empty,
             latency = Empty,
             error = Empty,
+            otel.status_code = Empty,
             module = "smg"
         );
 
@@ -153,6 +175,13 @@ impl<B> OnResponse<B> for ResponseLogger {
         span.record("status_code", status_code);
         // Use microseconds as integer to avoid format! string allocation
         span.record("latency", latency.as_micros() as u64);
+        // The span's status, so the trace backend can filter by outcome: a
+        // 5xx is the server's failure (as is a body that fails later, see
+        // `StreamFailureLogger`); anything else is left unset, as the HTTP
+        // server conventions have it.
+        if status.is_server_error() {
+            span.record("otel.status_code", "ERROR");
+        }
 
         // Log the response completion
         let _enter = span.enter();
@@ -162,6 +191,13 @@ impl<B> OnResponse<B> for ResponseLogger {
             debug!(
                 target: "smg::response",
                 "finished probe request"
+            );
+        } else if response.extensions().get::<ReportedRefusal>().is_some() {
+            // The refusing stage wrote this refusal's line; a second one per
+            // request here, at ERROR, is what made a retry loop a log storm.
+            debug!(
+                target: "smg::response",
+                "request refused; reported by the refusing stage"
             );
         } else if status.is_server_error() {
             error!(
@@ -199,6 +235,7 @@ impl OnFailure<ServerErrorsFailureClass> for StreamFailureLogger {
             // Already logged by ResponseLogger with status + latency.
             ServerErrorsFailureClass::StatusCode(_) => {}
             ServerErrorsFailureClass::Error(error) => {
+                span.record("otel.status_code", "ERROR");
                 let _enter = span.enter();
                 error!(
                     target: "smg::response",
@@ -210,20 +247,231 @@ impl OnFailure<ServerErrorsFailureClass> for StreamFailureLogger {
     }
 }
 
-/// Create a configured TraceLayer for HTTP logging
+/// Create the request-span layer for HTTP logging.
 /// Note: Actual request/response logging with request IDs is done in RequestIdService
-pub fn create_logging_layer() -> TraceLayer<
-    tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
-    RequestSpan,
-    RequestLogger,
-    ResponseLogger,
-    tower_http::trace::DefaultOnBodyChunk,
-    tower_http::trace::DefaultOnEos,
-    StreamFailureLogger,
-> {
-    TraceLayer::new_for_http()
-        .make_span_with(RequestSpan)
-        .on_request(RequestLogger)
-        .on_response(ResponseLogger)
-        .on_failure(StreamFailureLogger)
+pub fn create_logging_layer() -> RequestTraceLayer {
+    RequestTraceLayer
+}
+
+/// Tower layer that runs every request under its `http_request` span: the
+/// [`RequestSpan`] handlers above, applied by [`RequestTraceService`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RequestTraceLayer;
+
+impl<S> Layer<S> for RequestTraceLayer {
+    type Service = RequestTraceService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestTraceService { inner }
+    }
+}
+
+/// Tower service of [`RequestTraceLayer`].
+#[derive(Clone, Debug)]
+pub struct RequestTraceService<S> {
+    inner: S,
+}
+
+impl<S> Service<Request> for RequestTraceService<S>
+where
+    S: Service<Request, Response = Response> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Response, S::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        let span = RequestSpan.make_span(&request);
+        let start = Instant::now();
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            RequestLogger.on_request(&request, &span);
+            // The handler's future is created and polled under the span, as
+            // the trace layer did, so everything it logs carries the span.
+            let future = {
+                let _enter = span.enter();
+                inner.call(request)
+            };
+            let response = future.instrument(span.clone()).await?;
+            ResponseLogger.on_response(&response, start.elapsed(), &span);
+            Ok(response.map(|body| Body::new(SpannedBody { inner: body, span })))
+        })
+    }
+}
+
+/// A response body that keeps its request span alive until the body ends,
+/// without entering it per frame; a failure of the stream is logged under the
+/// span once.
+struct SpannedBody {
+    inner: Body,
+    span: Span,
+}
+
+impl http_body::Body for SpannedBody {
+    type Data = <Body as http_body::Body>::Data;
+    type Error = <Body as http_body::Body>::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_frame(cx);
+        if let Poll::Ready(Some(Err(error))) = &poll {
+            StreamFailureLogger.on_failure(
+                ServerErrorsFailureClass::Error(error.to_string()),
+                Duration::ZERO,
+                &this.span,
+            );
+        }
+        poll
+    }
+
+    fn is_end_stream(&self) -> bool {
+        http_body::Body::is_end_stream(&self.inner)
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::Body::size_hint(&self.inner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::{
+        body::Bytes,
+        http::{Request, StatusCode},
+        routing::get,
+        Router,
+    };
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
+
+    use super::*;
+
+    /// Counts how often any span is entered on this thread's subscriber.
+    struct EnterCounter(Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> Layer<S> for EnterCounter {
+        fn on_enter(
+            &self,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_does_not_enter_the_request_span_per_frame() {
+        let enters = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            Registry::default().with(EnterCounter(enters.clone())),
+        );
+        let frames = 64usize;
+        let app = Router::new()
+            .route(
+                "/stream",
+                get(move || async move {
+                    Body::from_stream(futures::stream::iter(
+                        (0..frames)
+                            .map(|_| Ok::<_, std::io::Error>(Bytes::from_static(b"data: x\n\n"))),
+                    ))
+                }),
+            )
+            .layer(create_logging_layer());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stream")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let before_body = enters.load(Ordering::Relaxed);
+        assert!(before_body >= 1, "the request itself runs under the span");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert_eq!(body.len(), frames * b"data: x\n\n".len());
+        let during_body = enters.load(Ordering::Relaxed) - before_body;
+        assert!(
+            during_body < frames,
+            "the request span was entered {during_body} times while {frames} frames streamed"
+        );
+    }
+
+    /// Counts the events of one level on this thread's subscriber.
+    struct LevelCounter(tracing::Level, Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> Layer<S> for LevelCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == self.0 {
+                self.1.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// A 503 the refusing stage reported itself is not logged again at ERROR
+    /// by the access log; an unmarked 503 still is.
+    #[tokio::test]
+    async fn a_reported_refusal_is_not_logged_again_at_error() {
+        let errors = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            Registry::default().with(LevelCounter(tracing::Level::ERROR, errors.clone())),
+        );
+        let refused = || async {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            response.extensions_mut().insert(ReportedRefusal);
+            response
+        };
+        let failed = || async {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            response
+        };
+        let app = Router::new()
+            .route("/refused", get(refused))
+            .route("/failed", get(failed))
+            .layer(create_logging_layer());
+        for (path, expected_errors) in [("/refused", 0), ("/failed", 1)] {
+            errors.store(0, Ordering::Relaxed);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                errors.load(Ordering::Relaxed),
+                expected_errors,
+                "ERROR lines written for {path}"
+            );
+        }
+    }
 }

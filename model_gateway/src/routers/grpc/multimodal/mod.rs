@@ -23,6 +23,8 @@ use llm_multimodal::{
 };
 use llm_tokenizer::{Encoding, TokenizerTrait};
 
+use crate::routers::grpc::proto_wrapper::VLLM_MROPE_GRID_KEYS;
+
 /// Bridges the gateway's tokenizer to the model registry's local tokenizer
 /// seam: `llm-multimodal` deliberately depends on no tokenizer crate, so the
 /// flattening from [`Encoding`] to plain ids lives here, on the caller side.
@@ -50,6 +52,7 @@ mod capability;
 mod config;
 mod detect;
 mod inflight;
+mod item_limits;
 mod pixel_cache;
 mod plan;
 mod process;
@@ -64,7 +67,8 @@ pub(crate) use assemble::{
     assemble_tokenspeed_for_encode, encode_routing_hashes,
 };
 pub(crate) use capability::{
-    ensure_backend_supports_modalities, worker_language_model_only, SUPPORTS_VISION_LABEL,
+    ensure_backend_supports_modalities, ensure_model_accepts_media, worker_language_model_only,
+    SUPPORTS_VISION_LABEL,
 };
 pub(crate) use config::{
     load_image_preprocessor_config, load_video_preprocessor_config, MultimodalComponents,
@@ -72,6 +76,7 @@ pub(crate) use config::{
 };
 pub(crate) use detect::{media_plan_chat, media_plan_messages};
 pub(crate) use inflight::{reserve_multimodal_inflight, InflightPermit};
+pub(crate) use item_limits::engine_item_limits;
 pub(crate) use plan::{
     prepare_placeholder_tokens, resolve_media_part_order, validate_rendered_media_anchors,
     MediaPlan, PlaceholderTokens,
@@ -87,6 +92,13 @@ pub(crate) use transport::{init_mm_transport_defaults, mm_rdma_exporter};
 /// Whether verbose multimodal timing logs are enabled (`--log-mm-timing` /
 /// `SMG_LOG_MM_TIMING`). Resolved once at startup; called on every multimodal
 /// request.
+/// The client-facing message for a media pipeline failure: the whole error
+/// chain, so the cause (the URL whose fetch ran out of its budget, the clip
+/// the decoder refused) reaches the caller, not only the outermost context.
+pub(crate) fn processing_failed_message(error: &anyhow::Error) -> String {
+    format!("Multimodal processing failed: {error:#}")
+}
+
 pub(crate) fn log_mm_timing_enabled() -> bool {
     mm_settings().log_mm_timing.value
 }
@@ -135,6 +147,19 @@ impl MultimodalIntermediate {
 
     pub(crate) fn batches(&self) -> &[PrecomputedMultimodalIntermediate] {
         &self.batches
+    }
+
+    /// Whether a batch carries the grid tensors a disaggregated decode leg
+    /// derives its positions from ([`VLLM_MROPE_GRID_KEYS`]): such a leg
+    /// cannot be served by a decode worker without a vision encoder.
+    pub(crate) fn has_mrope_grids(&self) -> bool {
+        self.batches.iter().any(|batch| {
+            batch
+                .preprocessed
+                .model_specific
+                .keys()
+                .any(|key| VLLM_MROPE_GRID_KEYS.contains(&key.as_str()))
+        })
     }
 
     pub(crate) fn into_batches(self) -> Vec<PrecomputedMultimodalIntermediate> {
@@ -224,4 +249,29 @@ pub(crate) fn report_jpeg_decoder() {
             );
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use llm_multimodal::{MediaConnectorError, MultiModalError};
+
+    use super::processing_failed_message;
+
+    /// A fetch that ran out of its budget is reported with its URL and the
+    /// budget, not as the bare "failed to finalize" context around it.
+    #[test]
+    fn a_processing_failure_names_its_cause() {
+        let error = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout {
+            url: "https://media.example/clip.mp4".to_string(),
+            budget: Duration::from_secs(30),
+        }))
+        .context("Failed to finalize multimodal tracker");
+        assert_eq!(
+            processing_failed_message(&error),
+            "Multimodal processing failed: Failed to finalize multimodal tracker: media fetch of \
+             https://media.example/clip.mp4 timed out after 30s"
+        );
+    }
 }

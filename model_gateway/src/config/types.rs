@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -81,7 +82,7 @@ pub struct RouterConfig {
     pub stream_body_stall_timeout_secs: u64,
     pub request_timeout_secs: u64,
     /// Idle timeout for pooled upstream connections. Must stay below the
-    /// backend HTTP server's keep-alive timeout (vLLM and SGLang default to
+    /// backend HTTP server's keep-alive timeout (the engines default to
     /// 5s), or the pool hands out connections the server has already closed
     /// and non-idempotent sends fail. `0` keeps idle connections forever.
     #[serde(default = "default_upstream_pool_idle_timeout_secs")]
@@ -112,6 +113,12 @@ pub struct RouterConfig {
     /// new requests stop being routed to it until it makes progress.
     #[serde(default = "default_worker_wedge_secs")]
     pub worker_wedge_secs: u64,
+    /// Seconds without any contact from a worker whose KV-event stream pushes
+    /// load records, after which it is excluded from routing as unreachable
+    /// until it is heard from again; workers that never pushed a record are
+    /// not judged by it. 0 disables the rule.
+    #[serde(default = "default_worker_stale_secs")]
+    pub worker_stale_secs: u64,
     /// Warm-up slice for cache-aware routing: for this many seconds after a
     /// worker becomes routable, until its index has grown by
     /// `worker_warmup_blocks` blocks, one cache miss in `1 / share` goes to it.
@@ -140,7 +147,7 @@ pub struct RouterConfig {
     pub worker_warmup_divert_every: u64,
     /// How long a disaggregated (PD) dispatch waits for a slot in the decode
     /// engine's running window before shedding. Must stay well under the
-    /// engine's bootstrap deadline (120s on TokenSpeed): a request that waits
+    /// engine's bootstrap deadline (120s on one engine): a request that waits
     /// out this budget and then dispatches still has the whole deadline ahead
     /// of it. `0` sheds immediately instead of waiting. Ignored for engines
     /// that report no running window.
@@ -227,7 +234,7 @@ pub struct RouterConfig {
     /// spec's built-in limit; beats `SMG_IMAGE_MAX_COUNT`. Unset keeps spec limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mm_per_request_image_limit: Option<usize>,
-    /// Where media for vLLM gRPC workers is fetched and preprocessed (`auto` |
+    /// Where media for one engine's gRPC workers is fetched and preprocessed (`auto` |
     /// `router` | `worker`); when unset, falls back to `SMG_MM_PROCESSING`,
     /// then `auto`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -271,6 +278,11 @@ pub struct RouterConfig {
     pub trace_config: Option<TraceConfig>,
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
+    /// Directory for the heap profiles `POST /heap_profile` writes, on a
+    /// build with the `jemalloc-profiling` feature; unset, the route
+    /// answers 404.
+    #[serde(default)]
+    pub jemalloc_prof_dir: Option<String>,
     pub request_id_headers: Option<Vec<String>>,
     #[serde(default)]
     pub storage_context_headers: HashMap<String, String>,
@@ -281,6 +293,10 @@ pub struct RouterConfig {
     /// permit is held for the full response, including streaming bodies.
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
+    /// Longest a request may wait inside the gateway: in the admission queue,
+    /// and, in the gRPC router, from its admission (its acceptance without an
+    /// admission layer) to worker selection: a request still ahead of
+    /// selection after this long is refused with a 503, once per request.
     pub queue_timeout_secs: u64,
     /// Maximum in-flight Prefill requests per worker in PD or EPD mode.
     /// A non-positive value disables the limit.
@@ -298,6 +314,11 @@ pub struct RouterConfig {
     /// `max_concurrent_requests`, which keeps bounding standing concurrency.
     /// Unset or 0 = no rate limit.
     pub rate_limit_tokens_per_second: Option<i32>,
+    /// Most Responses API requests with `background: true` in flight at
+    /// once; one beyond answers 429. 0 switches background mode off: such
+    /// requests then run in the foreground, as every other request does.
+    #[serde(default = "default_max_background_responses")]
+    pub max_background_responses: usize,
     /// Enable the priority-aware admission scheduler. When false (default),
     /// the legacy concurrency-limit middleware stays wired — zero behavior
     /// change for existing deployments.
@@ -308,7 +329,10 @@ pub struct RouterConfig {
     #[serde(default = "default_priority_scheduler_max_class")]
     pub priority_scheduler_default_max_class: String,
     /// Optional path to the priority-scheduler YAML (per-class + per-tenant
-    /// overrides). Absent → built-in defaults, empty tenant policy map.
+    /// overrides). Absent → built-in defaults, empty tenant policy map. With
+    /// the scheduler enabled, a file that cannot be read, parsed or validated
+    /// is a configuration error (`ConfigValidator`), not a fallback to the
+    /// legacy admission.
     #[serde(default)]
     pub priority_scheduler_config: Option<String>,
     /// Cap on per-tenant scheduler metric label cardinality (top-N tenants
@@ -489,6 +513,10 @@ fn default_worker_wedge_secs() -> u64 {
     3
 }
 
+fn default_worker_stale_secs() -> u64 {
+    15
+}
+
 fn default_worker_warmup_secs() -> u64 {
     60
 }
@@ -515,6 +543,10 @@ fn default_pd_admission_wait_secs() -> u64 {
 
 const fn default_disabled_limit() -> i32 {
     -1
+}
+
+const fn default_max_background_responses() -> usize {
+    1024
 }
 
 pub const DEFAULT_PREFILL_QUEUE_SIZE: usize = 100;
@@ -870,6 +902,31 @@ pub enum CacheIndexKind {
     Hash,
 }
 
+/// What `power_of_two` compares its candidates by.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerOfTwoLoadMetric {
+    /// Least-load expected wait of two random workers.
+    #[default]
+    ExpectedWait,
+    /// Router in-flight requests of two random workers, then expected wait.
+    Requests,
+    /// Router in-flight requests of every healthy worker, then expected wait.
+    LeastRequests,
+}
+
+impl PowerOfTwoLoadMetric {
+    /// Parse the CLI spelling (`expected_wait` / `requests` / `least_requests`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "expected_wait" => Some(Self::ExpectedWait),
+            "requests" => Some(Self::Requests),
+            "least_requests" => Some(Self::LeastRequests),
+            _ => None,
+        }
+    }
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -954,7 +1011,11 @@ pub enum PolicyConfig {
     /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
     /// future support of different polling cadences per policy.
     #[serde(rename = "power_of_two")]
-    PowerOfTwo { load_check_interval_secs: u64 },
+    PowerOfTwo {
+        load_check_interval_secs: u64,
+        #[serde(default)]
+        load_metric: PowerOfTwoLoadMetric,
+    },
 
     /// Least-(token-)work policy: routes to the worker minimizing the expected
     /// wait `(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`
@@ -1161,13 +1222,24 @@ impl PolicyConfig {
 /// predates the tag; see [`deserialize_discovery`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per router, built at startup; boxing the Kubernetes variant would complicate every construction and match to save a few hundred bytes"
+)]
 pub enum DiscoveryConfig {
     Kubernetes(KubernetesDiscoveryConfig),
+    File(FileDiscoveryConfig),
 }
 
 impl From<KubernetesDiscoveryConfig> for DiscoveryConfig {
     fn from(config: KubernetesDiscoveryConfig) -> Self {
         Self::Kubernetes(config)
+    }
+}
+
+impl From<FileDiscoveryConfig> for DiscoveryConfig {
+    fn from(config: FileDiscoveryConfig) -> Self {
+        Self::File(config)
     }
 }
 
@@ -1284,6 +1356,24 @@ impl Default for KubernetesDiscoveryConfig {
             model_id_source: None,
         }
     }
+}
+
+/// How often the file-discovery manifest is reread when no interval is given.
+pub const DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS: u64 = 30;
+
+fn default_file_discovery_check_interval_secs() -> u64 {
+    DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS
+}
+
+/// File worker discovery: the workers listed in a JSON manifest on disk.
+///
+/// The manifest is reread in full every `check_interval_secs`, and may be
+/// absent at startup: discovery keeps retrying until a writer creates it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileDiscoveryConfig {
+    pub path: PathBuf,
+    #[serde(default = "default_file_discovery_check_interval_secs")]
+    pub check_interval_secs: u64,
 }
 
 pub use smg_external_router::RetryConfig;
@@ -1445,6 +1535,26 @@ impl Default for MetricsConfig {
     }
 }
 
+impl MetricsConfig {
+    /// The metrics host when none is configured: the unspecified address of
+    /// the serving listener's family. A gateway bound to an IPv6 address
+    /// (`[::]`, `::`, `[fd00::1]`) then exposes its metrics over IPv6 too,
+    /// instead of on an IPv4-only `0.0.0.0` that nothing on an IPv6-only
+    /// network can reach; `::` is dual-stack on Linux, so IPv4 scrapers keep
+    /// working. IPv4 hosts (and anything that is not an IP literal) keep the
+    /// IPv4 wildcard they always had.
+    pub fn default_host_for(server_host: &str) -> String {
+        let bare = server_host
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(server_host);
+        match bare.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(_)) => "::".to_string(),
+            _ => "0.0.0.0".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceConfig {
     pub enable_trace: bool,
@@ -1487,6 +1597,7 @@ impl Default for RouterConfig {
             load_monitor_interval_secs: 10,
             worker_stall_secs: default_worker_stall_secs(),
             worker_wedge_secs: default_worker_wedge_secs(),
+            worker_stale_secs: default_worker_stale_secs(),
             worker_warmup_secs: default_worker_warmup_secs(),
             worker_warmup_share: default_worker_warmup_share(),
             worker_warmup_blocks: default_worker_warmup_blocks(),
@@ -1522,6 +1633,7 @@ impl Default for RouterConfig {
             trace_config: None,
             log_dir: None,
             log_level: None,
+            jemalloc_prof_dir: None,
             request_id_headers: None,
             storage_context_headers: HashMap::new(),
             tenant_resolution: TenantResolutionConfig::default(),
@@ -1532,6 +1644,7 @@ impl Default for RouterConfig {
             prefill_queue_size: None,
             prefill_queue_timeout_secs: None,
             rate_limit_tokens_per_second: None,
+            max_background_responses: default_max_background_responses(),
             priority_scheduler_enabled: false,
             priority_scheduler_default_max_class: default_priority_scheduler_max_class(),
             priority_scheduler_config: None,
@@ -2168,6 +2281,7 @@ mod tests {
 
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
+            load_metric: Default::default(),
         };
         assert_eq!(power_of_two.name(), "power_of_two");
     }
@@ -2202,6 +2316,7 @@ mod tests {
 
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
+            load_metric: Default::default(),
         };
         let json = serde_json::to_string(&power_of_two).unwrap();
         assert!(json.contains("\"type\":\"power_of_two\""));
@@ -2356,11 +2471,13 @@ mod tests {
     fn test_power_of_two_parameters() {
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 120,
+            load_metric: Default::default(),
         };
 
         match power_of_two {
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs,
+                ..
             } => {
                 assert_eq!(load_check_interval_secs, 120);
             }
@@ -2562,6 +2679,24 @@ discovery:
         ));
     }
 
+    /// The file provider is the tag plus its path; the interval defaults.
+    #[test]
+    fn tagged_file_discovery_reads_with_the_default_interval() {
+        let discovery = read_discovery(serde_json::json!({
+            "provider": "file",
+            "path": "/run/smg/workers.json",
+        }));
+        assert_eq!(
+            discovery,
+            Some(DiscoveryConfig::File(FileDiscoveryConfig {
+                path: "/run/smg/workers.json".into(),
+                check_interval_secs: DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+            }))
+        );
+        let written = serde_json::to_value(discovery.unwrap()).unwrap();
+        assert_eq!(written["provider"], "file");
+    }
+
     #[test]
     fn unknown_discovery_provider_is_rejected() {
         let mut config = serde_json::to_value(RouterConfig::default()).unwrap();
@@ -2584,6 +2719,28 @@ discovery:
 
         assert_eq!(config.port, 29000);
         assert_eq!(config.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn metrics_host_defaults_to_the_serving_listeners_family() {
+        for (server_host, expected) in [
+            ("[::]", "::"),
+            ("::", "::"),
+            ("[::1]", "::"),
+            ("fd00::1", "::"),
+            ("[fd00::1]", "::"),
+            ("0.0.0.0", "0.0.0.0"),
+            ("127.0.0.1", "0.0.0.0"),
+            ("10.0.0.7", "0.0.0.0"),
+            ("localhost", "0.0.0.0"),
+            ("", "0.0.0.0"),
+        ] {
+            assert_eq!(
+                MetricsConfig::default_host_for(server_host),
+                expected,
+                "server host {server_host:?}"
+            );
+        }
     }
 
     #[test]
@@ -2874,6 +3031,7 @@ discovery:
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
+                load_metric: Default::default(),
             }),
         };
 
@@ -2936,6 +3094,7 @@ discovery:
             prefill_policy: None,
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
+                load_metric: Default::default(),
             }),
         };
 

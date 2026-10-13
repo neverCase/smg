@@ -1,5 +1,5 @@
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, HashMap},
     hash::{Hash, Hasher},
 };
 
@@ -96,9 +96,45 @@ pub trait IncrementalDecoder: Send + Sync {
     fn reset(&mut self);
 }
 
+/// What one incremental decode step, or finishing a sequence, produced.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DecodeStep {
+    /// Newly decoded text; `None` while the step holds an incomplete character.
+    pub text: Option<String>,
+    /// The decoder chain rewrote text that was already emitted (an invalid byte
+    /// collapsed a byte run, a replacement spanned the emitted boundary). `text`
+    /// is then the best-effort remainder: nothing already emitted is retracted.
+    pub prefix_mismatch: bool,
+}
+
+impl DecodeStep {
+    /// The step's text, empty when it held.
+    pub fn into_text(self) -> String {
+        self.text.unwrap_or_default()
+    }
+}
+
 /// Core decoding trait - can be implemented independently
 pub trait Decoder: Send + Sync {
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String>;
+
+    /// Whether the configured decoder contains ByteFallback byte-run buffering.
+    fn uses_byte_fallback(&self) -> bool {
+        false
+    }
+
+    /// Release text buffered by incremental decoding at end of input. A
+    /// decoder whose final text no longer starts with what it emitted reports
+    /// `prefix_mismatch` and returns the remainder instead of failing.
+    fn finish_decode(
+        &self,
+        _ids: &mut Vec<TokenIdType>,
+        _prefix: &mut String,
+        _prefix_index: &mut usize,
+        _skip_special_tokens: bool,
+    ) -> Result<DecodeStep> {
+        Ok(DecodeStep::default())
+    }
 
     /// Incremental decode step — called once per generated token.
     ///
@@ -106,9 +142,11 @@ pub trait Decoder: Send + Sync {
     /// produce incremental text output. The default implementation uses the
     /// double-decode algorithm (decode prefix, decode prefix+new, diff).
     ///
-    /// HuggingFace overrides this with the native `step_decode_stream` from the
-    /// `tokenizers` crate, which uses the same algorithm internally but avoids
-    /// trait-method overhead for the two `decode()` calls.
+    /// HuggingFace overrides this with its own copy of that algorithm run on the
+    /// concrete tokenizer (no trait-method overhead for the two `decode()`
+    /// calls) which, where the decode no longer starts with the emitted text,
+    /// emits the remainder instead of failing (see
+    /// [`decode_step_reporting`](Self::decode_step_reporting) for the report).
     fn decode_step(
         &self,
         token_id: TokenIdType,
@@ -148,6 +186,42 @@ pub trait Decoder: Send + Sync {
         } else {
             Ok(None)
         }
+    }
+
+    /// Eager text observation for engine-side stop matching. Unlike client
+    /// output, this must observe a stop at its original generated-token count.
+    fn decode_step_eager(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        self.decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
+    /// [`decode_step`](Self::decode_step) (or the eager variant) with the
+    /// step's diagnostics: a backend that recovers from a rewritten prefix
+    /// reports it here. The default reports nothing.
+    fn decode_step_reporting(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+        eager: bool,
+    ) -> Result<DecodeStep> {
+        let text = if eager {
+            self.decode_step_eager(token_id, ids, prefix, prefix_index, skip_special_tokens)?
+        } else {
+            self.decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)?
+        };
+        Ok(DecodeStep {
+            text,
+            prefix_mismatch: false,
+        })
     }
 
     /// A dedicated per-stream decoder, when the backend has a cheaper
@@ -240,9 +314,35 @@ pub trait Tokenizer: Encoder + Decoder {
         false
     }
 
+    /// Whether the generation prompt opens a `<think>` block it does not
+    /// close, so a completion starts inside reasoning. Stricter than
+    /// `think_in_prefill`: a template that writes an empty, closed
+    /// `<think></think>` (a non-thinking template) injects the tag but opens
+    /// nothing. Arms the reasoning parser of a template without a thinking
+    /// switch.
+    fn prefill_opens_think_block(&self) -> bool {
+        self.think_in_prefill()
+    }
+
     /// Renderer behaviours the gateway mirrors when it prepares a request.
     fn renderer_capabilities(&self) -> RendererCapabilities {
         RendererCapabilities::default()
+    }
+
+    /// The thinking mode this tokenizer's renderer renders for the template
+    /// kwargs and the request-level toggle it is handed
+    /// ([`ChatTemplateParams::template_kwargs`] and
+    /// [`ChatTemplateParams::thinking`]), for a renderer that resolves the
+    /// mode by its own rule rather than through the template's toggle key.
+    /// The gateway arms its reasoning parser from the same answer, so the
+    /// prompt and the parser never disagree. `None`: the renderer has no
+    /// rule of its own and the gateway's generic resolution applies.
+    fn native_thinking_mode(
+        &self,
+        _template_kwargs: Option<&HashMap<String, serde_json::Value>>,
+        _thinking: Option<bool>,
+    ) -> Option<bool> {
+        None
     }
 
     /// Set or override the chat template.

@@ -26,6 +26,7 @@ use super::{
     MediaBatch, MultimodalIntermediate, MultimodalOutput, PrecomputedMultimodalIntermediate,
     PromptBinding, RegistryTokenizer,
 };
+use crate::observability::metrics::Metrics;
 
 struct PreparedMultimodalPart {
     preprocessed: PreprocessedEncoderInputs,
@@ -76,7 +77,10 @@ pub(crate) async fn process_multimodal_plan(
     let media_started = Instant::now();
     let mut tracker = AsyncMultiModalTracker::new(components.media_connector.clone())
         .with_default_video_sample_fps(spec.default_video_sample_fps())
-        .with_video_frame_sampling(spec.video_frame_sampling());
+        .with_video_frame_sampling(
+            spec.video_frame_sampling()
+                .with_frame_budget(components.video_frame_budget),
+        );
 
     for part in plan.into_parts() {
         tracker
@@ -624,8 +628,10 @@ async fn preprocess_image_cached(
         config_fingerprint: fingerprint,
     };
     if let Some(cached) = cache.get(&key) {
+        Metrics::record_mm_pixel_cache_lookup(&model_id, true);
         return Ok(cached.preprocessed.clone());
     }
+    Metrics::record_mm_pixel_cache_lookup(&model_id, false);
 
     let preprocessed = preprocess_image_batch(
         registry,

@@ -3,18 +3,23 @@
 //! answers with `BatchTokenIDSlimOutput` batches, as the SMG plugin inside a
 //! headless scheduler does.
 
-use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use engine_zmq_client::{
     codec::{decode_msgpack, encode_msgpack, OpaqueValue},
     mock_engine::{
-        connect_to_frontend, default_ready_response, MockEngineInput, MockEngineOutput,
+        connect_to_frontend, default_ready_response, hello, MockEngineInput, MockEngineOutput,
         MOCK_DEADLINE,
     },
     protocol::sglang::{
         output::{BatchEmbeddingSlimOutput, BatchTokenIDSlimOutput, ControlReplySlim, MatchedStop},
-        request::{SglangRequestType, TokenizedEmbeddingReqInput, TokenizedGenerateReqInput},
+        request::{
+            RequestMeta, SglangRequestType, TokenizedEmbeddingReqInput, TokenizedGenerateReqInput,
+        },
     },
     EngineId,
 };
@@ -45,7 +50,7 @@ fn model_info() -> SglangModelInfo {
         pad_token_id: 0,
         bos_token_id: 1,
         default_sampling_params_json: "{\"temperature\":0.7}".to_string(),
-        server_args_json: r#"{"model_path":"org/model","tp_size":2,"dp_size":1,"context_length":4096,"pairing_protocol":"p1"}"#.to_string(),
+        server_args_json: r#"{"model_path":"org/model","tp_size":2,"dp_size":1,"context_length":4096,"pairing_protocol":"p1","engine_reasoning_parser":"qwen3","structured_outputs_start":"after_reasoning"}"#.to_string(),
         scheduler_info_json: r#"{"is_generation":true}"#.to_string(),
         sglang_version: "0.5.20".to_string(),
         max_running_requests: 64,
@@ -63,6 +68,7 @@ fn config(dir: &std::path::Path, handshake: &str, model: SglangModelInfo) -> Sgl
         tokenizer_dir: None,
         model,
         engine_startup_timeout: Duration::from_secs(10),
+        engine_startup_ceiling: None,
     }
 }
 
@@ -224,6 +230,126 @@ fn complete(response: sg::GenerateResponse) -> sg::GenerateComplete {
     }
 }
 
+/// Nothing reaches a mock scheduler that was only handshaken.
+async fn assert_scheduler_idle(engine_in: &mut MockEngineInput) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), engine_in.recv())
+            .await
+            .is_err(),
+        "nothing should have reached the scheduler"
+    );
+}
+
+/// Between HELLO and READY a real scheduler loads its model, and nothing
+/// crosses the wire meanwhile. The lifecycle owner's reports that the
+/// scheduler process is alive keep the link waiting well past the silence
+/// bound, and the start then completes.
+#[tokio::test]
+async fn a_slow_scheduler_stays_linked_while_the_launcher_reports_it_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let silence = Duration::from_millis(300);
+    let server = SglangServicerServer::start(SglangServicerConfig {
+        engine_startup_timeout: silence,
+        ..config(dir.path(), &handshake, model_info())
+    })
+    .unwrap();
+    // The scheduler dials in at once, then "loads" for four silences.
+    let loading = hello(&handshake, EngineId::from_engine_index(0))
+        .bounded()
+        .await
+        .expect("HELLO answered with INIT");
+    let load_time = Instant::now() + 4 * silence;
+    while Instant::now() < load_time {
+        server.note_engine_alive();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        server.last_error().unwrap(),
+        None,
+        "the link gave up on a living scheduler"
+    );
+    assert!(!server.engine_ready());
+
+    let engine = loading
+        .ready(default_ready_response())
+        .bounded()
+        .await
+        .expect("READY and registration accepted");
+    wait_until(|| server.engine_ready()).await;
+    let (mut engine_in, _engine_out) = engine.split();
+    assert_scheduler_idle(&mut engine_in).await;
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// A scheduler that dials in and then falls silent, with nobody reporting it
+/// alive, fails the link at the silence bound as before.
+#[tokio::test]
+async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let silence = Duration::from_millis(300);
+    let server = SglangServicerServer::start(SglangServicerConfig {
+        engine_startup_timeout: silence,
+        ..config(dir.path(), &handshake, model_info())
+    })
+    .unwrap();
+    let _loading = hello(&handshake, EngineId::from_engine_index(0))
+        .bounded()
+        .await
+        .expect("HELLO answered with INIT");
+    let since_hello = Instant::now();
+    let deadline = since_hello + Duration::from_secs(10);
+    let error = loop {
+        if let Some(error) = server.last_error().unwrap() {
+            break error;
+        }
+        assert!(Instant::now() < deadline, "no link failure reported");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(since_hello.elapsed() >= silence);
+    assert!(
+        error.contains("timed out while waiting for READY"),
+        "{error}"
+    );
+    assert!(error.contains("without a sign of life"), "{error}");
+    assert!(!server.engine_ready());
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// The ceiling bounds a start however alive the scheduler is reported.
+#[tokio::test]
+async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let silence = Duration::from_millis(300);
+    let ceiling = Duration::from_millis(900);
+    let server = SglangServicerServer::start(SglangServicerConfig {
+        engine_startup_timeout: silence,
+        engine_startup_ceiling: Some(ceiling),
+        ..config(dir.path(), &handshake, model_info())
+    })
+    .unwrap();
+    let started = Instant::now();
+    let _loading = hello(&handshake, EngineId::from_engine_index(0))
+        .bounded()
+        .await
+        .expect("HELLO answered with INIT");
+    let deadline = started + Duration::from_secs(10);
+    let error = loop {
+        server.note_engine_alive();
+        if let Some(error) = server.last_error().unwrap() {
+            break error;
+        }
+        assert!(Instant::now() < deadline, "no link failure reported");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(started.elapsed() >= ceiling);
+    assert!(error.contains("reached its ceiling"), "{error}");
+    assert!(!server.engine_ready());
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
 #[test]
 fn config_is_validated_before_binding() {
     let dir = tempfile::tempdir().unwrap();
@@ -241,6 +367,22 @@ fn config_is_validated_before_binding() {
     };
     assert!(matches!(
         SglangServicerServer::start(no_engines),
+        Err(ServicerError::InvalidConfig(_))
+    ));
+    let zero_timeout = SglangServicerConfig {
+        engine_startup_timeout: Duration::ZERO,
+        ..config(dir.path(), "tcp://127.0.0.1:1", model_info())
+    };
+    assert!(matches!(
+        SglangServicerServer::start(zero_timeout),
+        Err(ServicerError::InvalidConfig(_))
+    ));
+    let zero_ceiling = SglangServicerConfig {
+        engine_startup_ceiling: Some(Duration::ZERO),
+        ..config(dir.path(), "tcp://127.0.0.1:1", model_info())
+    };
+    assert!(matches!(
+        SglangServicerServer::start(zero_ceiling),
         Err(ServicerError::InvalidConfig(_))
     ));
     let no_model = SglangServicerConfig {
@@ -756,6 +898,17 @@ async fn info_rpcs_report_launcher_facts_and_handshake_figures() {
     assert_eq!(
         args.fields["pairing_protocol"].kind,
         Some(Kind::StringValue("p1".to_string()))
+    );
+    // The launcher's grammar-start facts (the engine's reasoning parser and
+    // where its grammar starts on a thinking prompt) reach the Router's label
+    // source as the launcher wrote them.
+    assert_eq!(
+        args.fields["engine_reasoning_parser"].kind,
+        Some(Kind::StringValue("qwen3".to_string()))
+    );
+    assert_eq!(
+        args.fields["structured_outputs_start"].kind,
+        Some(Kind::StringValue("after_reasoning".to_string()))
     );
     let scheduler_info = server.scheduler_info.expect("scheduler_info");
     assert_eq!(
@@ -1376,4 +1529,69 @@ async fn startup_timeout_keeps_the_server_up_and_reports_the_error() {
         .await;
     assert_eq!(generate.err().map(|s| s.code()), Some(Code::Unavailable));
     server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The Router's W3C trace context (gRPC metadata) rides to the scheduler as
+/// the request's metadata frame beside the positional array, which stays the
+/// scheduler's own struct; a call without the context sends no such frame.
+#[tokio::test]
+async fn trace_context_metadata_reaches_the_scheduler_beside_the_request() {
+    const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let mut h = harness(model_info()).await;
+    let mut request = tonic::Request::new(generate_request("tr1", false, Vec::new()));
+    request
+        .metadata_mut()
+        .insert("traceparent", TRACEPARENT.parse().unwrap());
+    request
+        .metadata_mut()
+        .insert("tracestate", "vendor=a".parse().unwrap());
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let frames = h.engine_in.recv_frames().await.unwrap();
+    assert_eq!(
+        SglangRequestType::from_frame(frames[0].as_ref()),
+        Some(SglangRequestType::Add)
+    );
+    let sent: TokenizedGenerateReqInput = decode_msgpack(frames[1].as_ref()).unwrap();
+    assert_eq!(sent.rid, "tr1");
+    assert_eq!(frames.len(), 3, "the metadata frame follows the request");
+    let meta: RequestMeta = decode_msgpack(frames[2].as_ref()).unwrap();
+    assert_eq!(
+        meta.trace_headers,
+        Some(BTreeMap::from([
+            ("traceparent".to_string(), TRACEPARENT.to_string()),
+            ("tracestate".to_string(), "vendor=a".to_string()),
+        ]))
+    );
+    send(
+        &mut h.engine_out,
+        &batch("tr1", vec![7], 1, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "length"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    let mut stream = h
+        .client
+        .generate(generate_request("tr2", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    let frames = h.engine_in.recv_frames().await.unwrap();
+    assert_eq!(frames.len(), 2, "no metadata frame without a context");
+    send(
+        &mut h.engine_out,
+        &batch("tr2", vec![7], 1, Some("length"), None),
+    )
+    .await;
+    complete(stream.message().bounded().await.unwrap().unwrap());
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

@@ -12,7 +12,7 @@ use llm_tokenizer::{
 };
 use openai_protocol::{
     chat::{ChatChoice, ChatCompletionMessage, ChatCompletionResponse},
-    common::{FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue, Usage},
+    common::{FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue},
     completion::{CompletionChoice, CompletionResponse},
     generate::{GenerateMetaInfo, GenerateResponse},
     messages::{self, Message},
@@ -55,9 +55,13 @@ impl ResponseProcessor {
     }
 
     /// Process a single choice from GenerateComplete response
+    ///
+    /// Returns the choice and the number of output tokens the reasoning
+    /// parser routed to `reasoning_content` (0 when it did not run).
     #[expect(clippy::too_many_arguments)]
     pub async fn process_single_choice(
         &self,
+        request_id: &str,
         complete: &ProtoGenerateComplete,
         index: usize,
         original_request: &ChatResponseSpec,
@@ -72,39 +76,66 @@ impl ResponseProcessor {
         // between availability check and parsing.
         reasoning_parser_name: Option<&str>,
         tool_parser_name: Option<&str>,
-    ) -> Result<ChatChoice, String> {
+    ) -> Result<(ChatChoice, u32), String> {
         stop_decoder.reset();
         // Decode tokens
         let outputs = stop_decoder
             .process_tokens(complete.output_ids())
             .map_err(|e| format!("Failed to process tokens: {e}"))?;
 
-        // Accumulate text with early breaks
+        // Accumulate text with early breaks, noting where each token's text
+        // ends to place the reasoning span in tokens.
         let mut final_text = String::new();
         let mut stopped = false;
+        let mut held = false;
+        let mut token_ends = Vec::with_capacity(outputs.len());
         for output in outputs {
             match output {
                 SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
                 SequenceDecoderOutput::StoppedWithText(t) => {
                     final_text.push_str(&t);
                     stopped = true;
-                    break;
                 }
-                SequenceDecoderOutput::Stopped => {
-                    stopped = true;
-                    break;
-                }
-                SequenceDecoderOutput::Held => {}
+                SequenceDecoderOutput::Stopped => stopped = true,
+                SequenceDecoderOutput::Held => held = true,
+            }
+            token_ends.push(final_text.len());
+            if stopped {
+                break;
             }
         }
 
-        // Flush remaining text
-        if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+        // Complete token decoding, including bytes and a partial stop match.
+        // The last token takes the tail so the token spans reach the text end.
+        let tail = stop_decoder
+            .finish()
+            .map_err(|e| format!("Failed to finish token decoding: {e}"))?;
+        utils::warn_detokenize_recoveries(request_id, index as u32, stop_decoder);
+        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail {
             final_text.push_str(&t);
+            if let Some(last) = token_ends.last_mut() {
+                *last = final_text.len();
+            }
         }
+        if held
+            && tokenizer.uses_byte_fallback()
+            && original_request.separate_reasoning
+            && reasoning_parser_available
+        {
+            if let Some(ends) = eager_token_ends(
+                tokenizer,
+                &complete.output_ids()[..token_ends.len()],
+                stop_decoder.skip_special_tokens(),
+                &final_text,
+            ) {
+                token_ends = ends;
+            }
+        }
+        stopped |= stop_decoder.is_stopped();
 
         // Step 1: Handle reasoning content parsing
         let mut reasoning_text: Option<String> = None;
+        let mut reasoning_tokens = 0;
         let mut processed_text = final_text;
 
         if original_request.separate_reasoning && reasoning_parser_available {
@@ -124,6 +155,12 @@ impl ResponseProcessor {
                 match parser.detect_and_parse_reasoning(&processed_text) {
                     Ok(result) => {
                         if !result.reasoning_text.is_empty() {
+                            reasoning_tokens = reasoning_span_tokens(
+                                &token_ends,
+                                &processed_text,
+                                &result.reasoning_text,
+                                &result.normal_text,
+                            );
                             reasoning_text = Some(result.reasoning_text);
                         }
                         processed_text = result.normal_text;
@@ -144,11 +181,11 @@ impl ResponseProcessor {
 
         if tool_choice_enabled && original_request.tools.is_some() {
             // Check if JSON schema constraint was used (specific function or required mode)
-            let has_structural_tag = self
+            let native_tool_format = self
                 .tool_parser_factory
                 .registry()
-                .has_structural_tag_for_parser(tool_parser_name);
-            let used_json_schema = if has_structural_tag {
+                .uses_native_tool_format(tool_parser_name);
+            let used_json_schema = if native_tool_format {
                 false
             } else {
                 match &original_request.tool_choice {
@@ -219,19 +256,22 @@ impl ResponseProcessor {
             // Whitespace-only residual (e.g. "\n\n" between </think> and <tool_call>)
             // must be None, not Some("\n\n") — see normalize_assistant_content.
             content: normalize_assistant_content(processed_text),
+            refusal: None,
+            annotations: Vec::new(),
             tool_calls,
             reasoning_content: reasoning_text,
         };
 
         // Step 6: Build ChatChoice
-        Ok(ChatChoice {
+        let choice = ChatChoice {
             index: index as u32,
             message: chat_message,
             logprobs,
             finish_reason: Some(final_finish_reason_str.to_string()),
             matched_stop,
             hidden_states: None,
-        })
+        };
+        Ok((choice, reasoning_tokens))
     }
 
     /// Process non-streaming chat response (collects all responses and builds final response)
@@ -287,9 +327,11 @@ impl ResponseProcessor {
 
         // Process all choices
         let mut choices = Vec::new();
+        let mut parsed_reasoning_tokens = 0;
         for (index, complete) in all_responses.iter().enumerate() {
             match self
                 .process_single_choice(
+                    &dispatch.request_id,
                     complete,
                     index,
                     &chat_request,
@@ -304,7 +346,10 @@ impl ResponseProcessor {
                 )
                 .await
             {
-                Ok(choice) => choices.push(choice),
+                Ok((choice, reasoning_tokens)) => {
+                    choices.push(choice);
+                    parsed_reasoning_tokens += reasoning_tokens;
+                }
                 Err(e) => {
                     return Err(error::internal_error(
                         "process_choice_failed",
@@ -314,9 +359,15 @@ impl ResponseProcessor {
             }
         }
 
-        // Build usage from gRPC response counters.
-        let usage = response_formatting::build_usage(&all_responses)
-            .with_unbilled_prompt_tokens(chat_request.unbilled_prompt_tokens);
+        // The usage from the gRPC response counters, built as the streamed
+        // answer builds its usage chunk: with the reasoning tokens the
+        // gateway's parser split off when it ran (zero included) and every
+        // detail counter present as the OpenAI API sends it.
+        let usage = response_formatting::chat_usage(
+            response_formatting::build_usage(&all_responses),
+            reasoning_parser_available.then_some(parsed_reasoning_tokens),
+            chat_request.unbilled_prompt_tokens,
+        );
 
         // Build final ChatCompletionResponse
         Ok(
@@ -434,7 +485,19 @@ impl ResponseProcessor {
             }
 
             // Flush remaining text
-            if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+            let tail = stop_decoder.finish().map_err(|e| {
+                error::internal_error(
+                    "process_tokens_failed",
+                    format!("Failed to finish token decoding: {e}"),
+                )
+            })?;
+            utils::warn_detokenize_recoveries(&dispatch.request_id, 0, stop_decoder);
+            // A stop the decoder found at any token (text streams as soon as its
+            // characters are complete, so a string stop can close mid-run) or
+            // in the tail is the response's finish reason, as on the other paths.
+            let stopped_at_finish = stop_decoder.is_stopped();
+            if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail
+            {
                 decoded_text.push_str(&t);
             }
 
@@ -442,10 +505,22 @@ impl ResponseProcessor {
             let finish_reason_str = complete.finish_reason();
 
             // Parse finish_reason from string to proper type
-            let finish_reason =
-                utils::parse_finish_reason(finish_reason_str, complete.completion_tokens());
+            let finish_reason = utils::parse_finish_reason(
+                if stopped_at_finish {
+                    "stop"
+                } else {
+                    finish_reason_str
+                },
+                complete.completion_tokens(),
+            );
 
-            let matched_stop = complete.matched_stop_json();
+            // The decoder's string stop when it matched one (the engine does not
+            // see string stops it did not apply), else the engine's value: a
+            // stop token's id stays reported, as on the other paths.
+            let matched_stop = stop_decoder
+                .matched_stop()
+                .map(|stop| serde_json::Value::String(stop.to_string()))
+                .or_else(|| complete.matched_stop_json());
 
             // Extract logprobs if requested (convert proto types to Generate format)
             let input_token_logprobs = if request_logprobs {
@@ -598,29 +673,55 @@ impl ResponseProcessor {
                 )
             })?;
 
+        // Accumulate text with early breaks, noting where each token's text
+        // ends to place the thinking span in tokens (as the chat path does).
         let mut final_text = String::new();
         let mut stopped = false;
+        let mut held = false;
+        let mut token_ends = Vec::with_capacity(outputs.len());
         for output in outputs {
             match output {
                 SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
                 SequenceDecoderOutput::StoppedWithText(t) => {
                     final_text.push_str(&t);
                     stopped = true;
-                    break;
                 }
-                SequenceDecoderOutput::Stopped => {
-                    stopped = true;
-                    break;
-                }
-                SequenceDecoderOutput::Held => {}
+                SequenceDecoderOutput::Stopped => stopped = true,
+                SequenceDecoderOutput::Held => held = true,
+            }
+            token_ends.push(final_text.len());
+            if stopped {
+                break;
             }
         }
-        if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+        let tail = stop_decoder.finish().map_err(|e| {
+            error::internal_error(
+                "process_tokens_failed",
+                format!("Failed to finish token decoding: {e}"),
+            )
+        })?;
+        utils::warn_detokenize_recoveries(&dispatch.request_id, 0, stop_decoder);
+        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail {
             final_text.push_str(&t);
+            if let Some(last) = token_ends.last_mut() {
+                *last = final_text.len();
+            }
         }
+        if held && tokenizer.uses_byte_fallback() && reasoning_parser_available {
+            if let Some(ends) = eager_token_ends(
+                &tokenizer,
+                &complete.output_ids()[..token_ends.len()],
+                stop_decoder.skip_special_tokens(),
+                &final_text,
+            ) {
+                token_ends = ends;
+            }
+        }
+        stopped |= stop_decoder.is_stopped();
 
         // Step 1: Parse reasoning content
         let mut reasoning_text: Option<String> = None;
+        let mut thinking_tokens = 0;
         let mut processed_text = final_text;
 
         if reasoning_parser_available {
@@ -631,24 +732,19 @@ impl ResponseProcessor {
                 reasoning_parser_name.as_deref(),
                 model,
             ) {
-                // If thinking is effectively ON and template has a toggle, start in reasoning mode.
-                {
-                    let user_thinking = match &messages_request.thinking {
-                        Some(
-                            messages::ThinkingConfig::Enabled { .. }
-                            | messages::ThinkingConfig::Adaptive { .. },
-                        ) => Some(true),
-                        Some(messages::ThinkingConfig::Disabled) => Some(false),
-                        None => None,
-                    };
-                    if utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref()) {
-                        parser.mark_reasoning_started();
-                    }
+                if messages_request.reasoning_starts_in_prefill(tokenizer.as_ref()) {
+                    parser.mark_reasoning_started();
                 }
 
                 match parser.detect_and_parse_reasoning(&processed_text) {
                     Ok(result) => {
                         if !result.reasoning_text.is_empty() {
+                            thinking_tokens = reasoning_span_tokens(
+                                &token_ends,
+                                &processed_text,
+                                &result.reasoning_text,
+                                &result.normal_text,
+                            );
                             reasoning_text = Some(result.reasoning_text);
                         }
                         processed_text = result.normal_text;
@@ -665,11 +761,11 @@ impl ResponseProcessor {
 
         if tool_choice_enabled && messages_request.has_tools {
             // Check if JSON schema constraint was used (specific tool or any/required mode)
-            let has_structural_tag = self
+            let native_tool_format = self
                 .tool_parser_factory
                 .registry()
-                .has_structural_tag_for_parser(tool_parser_name.as_deref());
-            let used_json_schema = !has_structural_tag
+                .uses_native_tool_format(tool_parser_name.as_deref());
+            let used_json_schema = !native_tool_format
                 && matches!(
                     &messages_request.tool_choice,
                     Some(messages::ToolChoice::Tool { .. } | messages::ToolChoice::Any { .. })
@@ -741,6 +837,7 @@ impl ResponseProcessor {
                     id: utils::message_utils::anthropic_tool_use_id(&tc.id),
                     name: tc.function.name.clone(),
                     input,
+                    caller: messages::ToolUseCaller::Direct,
                 });
             }
         }
@@ -778,9 +875,21 @@ impl ResponseProcessor {
             None
         };
 
-        // Step 5: Build usage
-        let usage =
-            messages_usage_from_counts(complete.prompt_tokens(), complete.completion_tokens());
+        // Step 5: Build usage. A turn that ran with thinking reports its
+        // thinking tokens: the engine's own count when it keeps one, else the
+        // tokens the parser placed in the thinking span.
+        let thinking_requested = matches!(
+            &messages_request.thinking,
+            Some(
+                messages::ThinkingConfig::Enabled { .. }
+                    | messages::ThinkingConfig::Adaptive { .. }
+            )
+        );
+        let usage = messages_usage_from_counts(
+            complete.prompt_tokens(),
+            complete.completion_tokens(),
+            thinking_requested.then_some(complete.reasoning_tokens().max(thinking_tokens)),
+        );
 
         // Step 6: Build Message
         Ok(Message {
@@ -791,7 +900,9 @@ impl ResponseProcessor {
             model: dispatch.model,
             stop_reason,
             stop_sequence,
+            stop_details: None,
             usage,
+            container: None,
         })
     }
 
@@ -828,6 +939,8 @@ impl ResponseProcessor {
 
         let mut total_prompt = 0u32;
         let mut total_completion = 0u32;
+        let mut total_cached = 0u32;
+        let mut total_reasoning = 0u32;
         let mut total_spec_accepted = 0u32;
         let mut total_spec_drafted = 0u32;
         let mut choices = Vec::new();
@@ -840,6 +953,7 @@ impl ResponseProcessor {
             let index_offset = prompt_index as u32 * choices_per_prompt;
             // n>1 choices share one prompt: max within a prompt, summed across prompts.
             let mut prompt_tokens = 0u32;
+            let mut cached_tokens = 0u32;
 
             // Arrival order, not `complete.index()`: SGLang non-streaming
             // Complete frames carry index 0 for every choice.
@@ -874,12 +988,28 @@ impl ResponseProcessor {
                     }
                 }
 
-                if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+                let tail = stop_decoder.finish().map_err(|e| {
+                    error::internal_error(
+                        "process_tokens_failed",
+                        format!("Failed to finish token decoding: {e}"),
+                    )
+                })?;
+                utils::warn_detokenize_recoveries(
+                    &dispatch.request_id,
+                    index_offset + i as u32,
+                    stop_decoder,
+                );
+                if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) =
+                    tail
+                {
                     decoded_text.push_str(&t);
                 }
+                stopped |= stop_decoder.is_stopped();
 
                 prompt_tokens = prompt_tokens.max(complete.prompt_tokens());
+                cached_tokens = cached_tokens.max(complete.cached_tokens());
                 total_completion += complete.completion_tokens();
+                total_reasoning += complete.reasoning_tokens();
                 total_spec_accepted += complete.spec_accepted_tokens();
                 total_spec_drafted += complete.spec_draft_tokens();
 
@@ -938,6 +1068,7 @@ impl ResponseProcessor {
             }
 
             total_prompt += prompt_tokens;
+            total_cached += cached_tokens;
         }
 
         Ok(CompletionResponse {
@@ -946,13 +1077,76 @@ impl ResponseProcessor {
             created: dispatch.created,
             model: dispatch.model.clone(),
             choices,
+            // The usage object the streamed answer's usage chunk carries.
             usage: Some(
-                Usage::from_counts(total_prompt, total_completion)
-                    .with_speculative_tokens(total_spec_accepted, total_spec_drafted),
+                response_formatting::TokenCounts {
+                    prompt: total_prompt,
+                    completion: total_completion,
+                    cached: total_cached,
+                    reasoning: total_reasoning,
+                    spec_accepted: total_spec_accepted,
+                    spec_drafted: total_spec_drafted,
+                }
+                .usage(),
             ),
             system_fingerprint: dispatch.weight_version.clone(),
         })
     }
+}
+
+// Byte buffering can release several tokens at once. Observe their original
+// eager boundaries only for accounting; canonical text and stops stay with the
+// stable decoder. A mismatched observation keeps the existing span estimate.
+fn eager_token_ends(
+    tokenizer: &Arc<dyn Tokenizer>,
+    token_ids: &[u32],
+    skip_special_tokens: bool,
+    text: &str,
+) -> Option<Vec<usize>> {
+    let mut ids = Vec::new();
+    let mut prefix = String::new();
+    let mut prefix_index = 0;
+    let mut observed = String::new();
+    let mut ends = Vec::with_capacity(token_ids.len());
+    for &token_id in token_ids {
+        if let Some(delta) = tokenizer
+            .decode_step_eager(
+                token_id,
+                &mut ids,
+                &mut prefix,
+                &mut prefix_index,
+                skip_special_tokens,
+            )
+            .ok()?
+        {
+            observed.push_str(&delta);
+        }
+        ends.push(observed.len().min(text.len()));
+    }
+    observed.starts_with(text).then_some(ends)
+}
+
+/// Tokens of the output whose text overlaps the reasoning span, given the
+/// cumulative text length after each token. The span is `reasoning` as found
+/// in `text`, else (a delimiter inside it was removed) everything before the
+/// normal text. Tokens that decoded to nothing count with the token that
+/// released their text; the delimiters around the span are not reasoning,
+/// like the engines' own counts.
+fn reasoning_span_tokens(token_ends: &[usize], text: &str, reasoning: &str, normal: &str) -> u32 {
+    let (start, end) = match text.find(reasoning) {
+        Some(start) => (start, start + reasoning.len()),
+        None => (0, text.len().saturating_sub(normal.len())),
+    };
+    let mut token_start = 0;
+    let mut count = 0;
+    for &token_end in token_ends {
+        // A zero-width token at the span's start held the text that starts it.
+        if token_start < end && (token_end > start || token_start == start) {
+            count += 1;
+        }
+        token_start = token_end;
+    }
+    count
 }
 
 /// Residual assistant text → OpenAI `content`. Whitespace-only (the `"\n\n"` left
@@ -968,16 +1162,18 @@ fn normalize_assistant_content(text: String) -> Option<String> {
 
 /// Usage for a unary Messages response. Cache counters are integer zeros,
 /// never null: the Anthropic wire contract has always-present cache counters
-/// (0 when caching is unused) and clients do arithmetic on them.
-fn messages_usage_from_counts(input_tokens: u32, output_tokens: u32) -> messages::Usage {
-    messages::Usage {
-        input_tokens,
-        output_tokens,
-        cache_creation_input_tokens: Some(0),
-        cache_read_input_tokens: Some(0),
-        cache_creation: None,
-        server_tool_use: None,
-        service_tier: None,
+/// (0 when caching is unused) and clients do arithmetic on them; the
+/// cache-creation breakdown, service tier and inference geography are always
+/// written too, and `output_tokens_details` when the turn ran with thinking.
+fn messages_usage_from_counts(
+    input_tokens: u32,
+    output_tokens: u32,
+    thinking_tokens: Option<u32>,
+) -> messages::Usage {
+    let usage = messages::Usage::from_counts(input_tokens, output_tokens);
+    match thinking_tokens {
+        Some(thinking_tokens) => usage.with_thinking_tokens(thinking_tokens),
+        None => usage,
     }
 }
 
@@ -997,6 +1193,38 @@ mod content_normalization_tests {
 }
 
 #[cfg(test)]
+mod reasoning_span_tests {
+    use super::reasoning_span_tokens;
+
+    #[test]
+    fn reasoning_span_tokens_skips_the_delimiters_and_keeps_held_tokens() {
+        // Tokens: "<think>" | "a" | "" (text held back) | "b" | "</think>" | "c"
+        let text = "<think>ab</think>c";
+        assert_eq!(
+            reasoning_span_tokens(&[7, 8, 8, 9, 17, 18], text, "ab", "c"),
+            3
+        );
+        // Reasoning cut off before its end: every token is reasoning.
+        assert_eq!(reasoning_span_tokens(&[7, 8, 9], "<think>ab", "ab", ""), 2);
+        // The span text is not in the output verbatim: everything before the
+        // normal text, delimiters included.
+        assert_eq!(
+            reasoning_span_tokens(&[7, 8, 9, 17, 18], text, "xy", "c"),
+            4
+        );
+        // Text the stop decoder held back to the end ("ST" of a partial
+        // "STOP") went to the last token at the flush: the held tokens before
+        // it are zero-width inside the span, or at its start.
+        assert_eq!(
+            reasoning_span_tokens(&[7, 9, 9, 11], "<think>abST", "abST", ""),
+            3
+        );
+        assert_eq!(reasoning_span_tokens(&[7, 7, 9], "<think>ST", "ST", ""), 2);
+        assert_eq!(reasoning_span_tokens(&[0, 2], "ST", "ST", ""), 2);
+    }
+}
+
+#[cfg(test)]
 mod messages_usage_wire_tests {
     use super::messages_usage_from_counts;
 
@@ -1005,11 +1233,40 @@ mod messages_usage_wire_tests {
     /// a serde attr silently skipped would still fail here).
     #[test]
     fn cache_counters_serialize_as_integer_zeros() {
-        let v = serde_json::to_value(messages_usage_from_counts(25, 150)).unwrap();
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, None)).unwrap();
         assert_eq!(v["input_tokens"], 25);
         assert_eq!(v["output_tokens"], 150);
         assert_eq!(v["cache_creation_input_tokens"], 0);
         assert_eq!(v["cache_read_input_tokens"], 0);
+    }
+
+    /// The public API writes these keys on every message; a typed client
+    /// reads a missing `cache_creation` as a decode error, not as zero.
+    #[test]
+    fn always_present_usage_keys_are_written_without_thinking() {
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, None)).unwrap();
+        assert_eq!(
+            v["cache_creation"],
+            serde_json::json!({"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0})
+        );
+        assert_eq!(v["service_tier"], "standard");
+        assert_eq!(v["inference_geo"], "not_available");
+        let keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        assert!(
+            !keys.contains(&"output_tokens_details".to_string()),
+            "{keys:?}"
+        );
+        assert!(!keys.contains(&"server_tool_use".to_string()), "{keys:?}");
+    }
+
+    /// A turn that ran with thinking reports its thinking tokens, zero
+    /// included: the key says thinking was on, the count says how much.
+    #[test]
+    fn thinking_tokens_are_written_when_the_turn_ran_with_thinking() {
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, Some(40))).unwrap();
+        assert_eq!(v["output_tokens_details"]["thinking_tokens"], 40);
+        let v = serde_json::to_value(messages_usage_from_counts(25, 150, Some(0))).unwrap();
+        assert_eq!(v["output_tokens_details"]["thinking_tokens"], 0);
     }
 }
 
@@ -1056,8 +1313,9 @@ mod responses_finish_reason_tests {
                 llm_tokenizer::StopSequenceConfig::default(),
                 false,
             );
-            let choice = processor
+            let (choice, _) = processor
                 .process_single_choice(
+                    "test-request",
                     &complete,
                     0,
                     &ChatResponseSpec::from(&request),
@@ -1074,6 +1332,143 @@ mod responses_finish_reason_tests {
                 .unwrap();
             assert_eq!(choice.finish_reason.as_deref(), Some(expected));
             assert_eq!(choice.message.tool_calls.as_ref().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn vllm_json_tool_nonstream_keeps_prefilled_reasoning() {
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        );
+        for (tool_choice, output) in [
+            (
+                serde_json::json!("required"),
+                r#"plan</think>[{"name":"lookup","parameters":{"q":"Paris"}}]"#,
+            ),
+            (
+                serde_json::json!({"type":"function", "function":{"name":"lookup"}}),
+                r#"plan</think>{"q":"Paris"}"#,
+            ),
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model":"test-model", "messages":[], "separate_reasoning":true,
+                "tool_choice":tool_choice,
+                "tools":[{"type":"function","function":{"name":"lookup",
+                    "parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
+            }))
+            .unwrap();
+            let mut spec = ChatResponseSpec::from(&request);
+            spec.reasoning_in_prefill = Some(true);
+            let tokenizer: Arc<dyn Tokenizer> =
+                Arc::new(scripted_tokenizer::ScriptedTokenizer::new(output));
+            let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+                output_ids: vec![100],
+                finish_reason: "stop".into(),
+                ..Default::default()
+            });
+            let mut decoder = StopSequenceDecoder::new(
+                tokenizer.clone(),
+                llm_tokenizer::StopSequenceConfig::default(),
+                false,
+            );
+            let (choice, _) = processor
+                .process_single_choice(
+                    "test-request",
+                    &complete,
+                    0,
+                    &spec,
+                    "test-model",
+                    &tokenizer,
+                    &mut decoder,
+                    0,
+                    true,
+                    true,
+                    Some("qwen3"),
+                    Some("qwen_coder"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+            assert!(choice.message.content.is_none());
+            assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
+            let calls = choice.message.tool_calls.unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].function.name, "lookup");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    calls[0].function.arguments.as_deref().unwrap()
+                )
+                .unwrap(),
+                serde_json::json!({"q":"Paris"})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gemma4_nonstream_native_tool_choices_preserve_reasoning_and_arguments() {
+        let output = r#"<|channel>thought
+plan<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>"#;
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(scripted_tokenizer::ScriptedTokenizer::new(output));
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        );
+        for tool_choice in [
+            serde_json::json!("auto"),
+            serde_json::json!("required"),
+            serde_json::json!({"type":"function", "function":{"name":"get_weather"}}),
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model":"test-model", "messages":[], "separate_reasoning":true,
+                "tool_choice":tool_choice,
+                "tools":[{"type":"function","function":{"name":"get_weather",
+                    "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
+            }))
+            .unwrap();
+            let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+                output_ids: vec![100],
+                finish_reason: "stop".into(),
+                ..Default::default()
+            });
+            let mut decoder = StopSequenceDecoder::new(
+                tokenizer.clone(),
+                llm_tokenizer::StopSequenceConfig::default(),
+                false,
+            );
+            let (choice, _) = processor
+                .process_single_choice(
+                    "test-request",
+                    &complete,
+                    0,
+                    &ChatResponseSpec::from(&request),
+                    "test-model",
+                    &tokenizer,
+                    &mut decoder,
+                    0,
+                    true,
+                    true,
+                    Some("gemma4"),
+                    Some("gemma4"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+            assert!(choice.message.content.is_none());
+            assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
+            let calls = choice.message.tool_calls.unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].function.name, "get_weather");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    calls[0].function.arguments.as_deref().unwrap()
+                )
+                .unwrap(),
+                serde_json::json!({"city":"Paris"})
+            );
         }
     }
 }

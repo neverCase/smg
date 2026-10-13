@@ -10,7 +10,10 @@
 //! The plan is held until the retry window closes (first non-retryable
 //! response).
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::response::{IntoResponse, Response};
 use openai_protocol::{
@@ -25,7 +28,7 @@ use openai_protocol::{
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_external_router::header_utils::insert_routed_worker_id;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::error;
+use tracing::{debug, error};
 
 use super::{
     common::{
@@ -68,7 +71,7 @@ use super::{
 };
 use crate::{
     config::types::RetryConfig,
-    middleware::TenantRequestMeta,
+    middleware::{ReportedRefusal, TenantRequestMeta},
     observability::{
         cache_trace,
         metrics::{bool_to_static_str, metrics_labels, Metrics},
@@ -76,10 +79,13 @@ use crate::{
     policies::PolicyRegistry,
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
-        common::retry::{is_retryable_response, BackoffCalculator},
+        common::{
+            placement::{self, Candidates, WireConstraint},
+            retry::{is_retryable_response, BackoffCalculator},
+        },
         error,
     },
-    worker::{PrefillAdmission, WorkerRegistry},
+    worker::{PrefillAdmission, RoutingPool, WorkerRegistry},
 };
 
 /// Which endpoint a pipeline serves. Selects the endpoint-specific stage set
@@ -114,6 +120,9 @@ pub(crate) struct PipelineDeps {
     /// `None` when tenant rate limiting is disabled; read only by the
     /// endpoints that insert `RateLimitReserveStage` (chat/messages/completion/harmony).
     rate_limit_manager: Option<Arc<RateLimitManager>>,
+    /// `--queue-timeout-secs`: a request still ahead of worker selection this
+    /// long after the gateway accepted it is refused instead of dispatched.
+    queue_timeout: Duration,
 }
 
 impl PipelineDeps {
@@ -132,6 +141,7 @@ impl PipelineDeps {
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
+        queue_timeout: Duration,
     ) -> Self {
         Self {
             worker_registry,
@@ -142,6 +152,7 @@ impl PipelineDeps {
             configured_tool_parser,
             configured_reasoning_parser,
             rate_limit_manager,
+            queue_timeout,
         }
     }
 
@@ -152,6 +163,7 @@ impl PipelineDeps {
         policy_registry: Arc<PolicyRegistry>,
         prefill_admission: Option<Arc<PrefillAdmission>>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
+        queue_timeout: Duration,
     ) -> Self {
         Self {
             worker_registry,
@@ -162,6 +174,7 @@ impl PipelineDeps {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             rate_limit_manager,
+            queue_timeout,
         }
     }
 
@@ -227,6 +240,7 @@ impl PipelineDeps {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             rate_limit_manager: None,
+            queue_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -256,6 +270,8 @@ pub(crate) struct RequestPipeline {
     mode: Mode,
     /// The registry, read at dispatch for `--worker-overload-shed`.
     worker_registry: Arc<WorkerRegistry>,
+    /// Shapes a forced tool call's constraint for each attempt's worker.
+    tool_parser_factory: ToolParserFactory,
 }
 
 /// Outcome of one full pipeline run.
@@ -286,7 +302,8 @@ impl RequestPipeline {
             deps.policy_registry.clone(),
             mode.worker_selection(),
             deps.prefill_admission.clone(),
-        );
+        )
+        .with_queue_timeout(deps.queue_timeout);
         let plan_kind = mode.plan_kind();
         let inject_pd_metadata = mode.inject_pd_metadata();
         let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
@@ -433,6 +450,7 @@ impl RequestPipeline {
             backend_type: backend,
             mode,
             worker_registry: deps.worker_registry.clone(),
+            tool_parser_factory: deps.tool_parser_factory.clone(),
         })
     }
 
@@ -441,7 +459,17 @@ impl RequestPipeline {
         macro_rules! step {
             ($stage:expr, $result:expr) => {
                 $result.inspect_err(|response: &Response| {
-                    error!("Stage {} failed with status {}", $stage, response.status());
+                    if response.extensions().get::<ReportedRefusal>().is_some() {
+                        // The stage wrote the one line this refusal gets
+                        // (rate-limited, with the pool's state).
+                        debug!(
+                            "Stage {} refused the request with status {}",
+                            $stage,
+                            response.status()
+                        );
+                    } else {
+                        error!("Stage {} failed with status {}", $stage, response.status());
+                    }
                 })
             };
         }
@@ -515,9 +543,9 @@ impl RequestPipeline {
         dctx.attempt = attempt;
         if attempt > 0 {
             // Fresh worker selection per attempt; the retained plan is
-            // re-stamped (engine ids, sampling defaults, PD rooms) for the
-            // new workers. Buffered decode state from the failed attempt is
-            // reset.
+            // re-stamped (engine ids, sampling defaults, the forced tool
+            // call's shape, PD rooms) for the new workers. Buffered decode
+            // state from the failed attempt is reset.
             self.stages.worker_selection.reselect(dctx).await?;
             let workers = dctx.workers.as_ref().ok_or_else(|| {
                 error!(
@@ -541,7 +569,7 @@ impl RequestPipeline {
                 error!(function = "run_attempt", "Execution plan already consumed");
                 error::internal_error("execution_plan_consumed", "Execution plan already consumed")
             })?;
-            helpers::restamp_plan_for_attempt(retained, stamp, workers)?;
+            helpers::restamp_plan_for_attempt(retained, stamp, workers, &self.tool_parser_factory)?;
             if let Some(decoder) = dctx.response.stop_decoder.as_mut() {
                 decoder.reset();
             }
@@ -597,12 +625,13 @@ impl RequestPipeline {
         metrics_endpoint: Option<&'static str>,
         retry_config: Option<&RetryConfig>,
     ) -> Result<RunOutcome, Response> {
-        if !cache_trace::enabled() {
+        let requested = cache_trace::requested(ctx.input.headers.as_ref());
+        if !cache_trace::enabled() && !requested {
             return self.run_inner(ctx, metrics_endpoint, retry_config).await;
         }
         let root_id = helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref())
             .map(str::to_owned);
-        Box::pin(cache_trace::scope(async {
+        Box::pin(cache_trace::scope(requested, async {
             let result = self.run_inner(ctx, metrics_endpoint, retry_config).await;
             if let Err(response) = &result {
                 cache_trace::failure(root_id.as_deref(), response.status().as_u16());
@@ -620,14 +649,7 @@ impl RequestPipeline {
     ) -> Result<RunOutcome, Response> {
         let mut attempt_start = Instant::now();
         if let Some(endpoint) = metrics_endpoint {
-            Metrics::record_router_request(
-                metrics_labels::ROUTER_GRPC,
-                self.backend_type,
-                metrics_labels::CONNECTION_GRPC,
-                &ctx.input.model_id,
-                endpoint,
-                bool_to_static_str(ctx.is_streaming()),
-            );
+            self.record_request(endpoint, &ctx.input.model_id, ctx.is_streaming());
         }
 
         let build = match self.run_ingress(&mut ctx).await {
@@ -659,19 +681,12 @@ impl RequestPipeline {
             if attempt > 0 {
                 attempt_start = Instant::now();
                 if let Some(endpoint) = metrics_endpoint {
-                    Metrics::record_router_request(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &dctx.model_id,
-                        endpoint,
-                        bool_to_static_str(dctx.streaming),
-                    );
+                    self.record_request(endpoint, &dctx.model_id, dctx.streaming);
                 }
             }
 
             let last_attempt = attempt + 1 >= max_attempts;
-            let failure = match self
+            let mut failure = match self
                 .run_attempt(&mut dctx, &mut plan, &spec, &stamp, attempt, last_attempt)
                 .await
             {
@@ -693,17 +708,38 @@ impl RequestPipeline {
             };
 
             self.record_error(metrics_endpoint, &dctx.model_id, &failure);
-            error!(
-                attempt,
-                status = %failure.status(),
-                "pipeline attempt failed"
-            );
+            if failure.extensions().get::<ReportedRefusal>().is_some() {
+                // The re-selection wrote this refusal's line (rate-limited,
+                // with the pool's state), as for the first selection.
+                debug!(
+                    attempt,
+                    status = %failure.status(),
+                    "pipeline attempt refused"
+                );
+            } else {
+                error!(
+                    attempt,
+                    status = %failure.status(),
+                    "pipeline attempt failed"
+                );
+            }
             // The failed attempt's worker load must not stay elevated through
             // the backoff window (a fresh context dropped them here before).
             // This releases its PD admission claim too, so the retry is not
             // queued behind its own predecessor's bootstrap rooms.
             dctx.load_guards = None;
             dctx.pd_prefill_guard = None;
+            // A worker's definitive answer closes the retry window on that
+            // worker: the next attempt goes to another available worker, or
+            // the answer stands as the client's response.
+            if let Some(workers) = dctx.workers.as_ref() {
+                let pools = self.retry_pools(&dctx.model_id, dctx.wire);
+                dctx.ledger.settle(
+                    &mut failure,
+                    workers.workers(),
+                    pools.iter().flat_map(|pool| pool.as_slice().iter()),
+                );
+            }
 
             let Some(config) = retry_config else {
                 return Err(failure);
@@ -718,6 +754,20 @@ impl RequestPipeline {
                 return Err(failure);
             }
 
+            // The retry re-selects away from the engines this attempt used,
+            // while another available worker is left to take the request.
+            let engines: Vec<String> = dctx
+                .workers
+                .iter()
+                .flat_map(WorkerSelection::engines)
+                .map(str::to_string)
+                .collect();
+            for engine in engines {
+                if !dctx.tried.contains(&engine) {
+                    dctx.tried.push(engine);
+                }
+            }
+
             let next_attempt = attempt + 1;
             let delay = BackoffCalculator::calculate_delay(config, attempt);
             if let Some(endpoint) = metrics_endpoint {
@@ -727,6 +777,21 @@ impl RequestPipeline {
             tokio::time::sleep(delay).await;
             attempt = next_attempt;
         }
+    }
+
+    /// The pools a retry of `model_id` re-selects from, narrowed to the
+    /// retained wire as the re-selection itself is.
+    fn retry_pools(&self, model_id: &str, wire: WireConstraint) -> Vec<Candidates> {
+        let pools: &[RoutingPool] = match self.mode {
+            Mode::Regular => &[RoutingPool::GrpcPipelineRegular],
+            Mode::PrefillDecode | Mode::EncodePrefillDecode => {
+                &[RoutingPool::GrpcPrefill, RoutingPool::GrpcDecode]
+            }
+        };
+        pools
+            .iter()
+            .map(|pool| placement::candidates(&self.worker_registry, model_id, *pool, Some(wire)))
+            .collect()
     }
 
     /// Attribute a response to the worker from the successful dispatch attempt.
@@ -746,7 +811,28 @@ impl RequestPipeline {
         response
     }
 
-    fn record_error(&self, endpoint: Option<&'static str>, model: &str, response: &Response) {
+    /// One router request under this pipeline's labels, the count the
+    /// dashboards read: recorded per attempt here, and by the router for an
+    /// answer it gives without the pipeline, so that traffic stays visible.
+    pub(crate) fn record_request(&self, endpoint: &'static str, model: &str, streaming: bool) {
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_type,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            endpoint,
+            bool_to_static_str(streaming),
+        );
+    }
+
+    /// A refused request under this pipeline's labels, by the response's
+    /// status class.
+    pub(crate) fn record_error(
+        &self,
+        endpoint: Option<&'static str>,
+        model: &str,
+        response: &Response,
+    ) {
         if let Some(endpoint) = endpoint {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_GRPC,
@@ -1560,7 +1646,13 @@ mod alias_pipeline_tests {
             .unwrap();
 
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        let deps = PipelineDeps::pair(worker_registry.clone(), policy_registry, None, None);
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            policy_registry,
+            None,
+            None,
+            Duration::from_secs(60),
+        );
         let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
         let components = Arc::new(SharedComponents {
             tokenizer_registry,
@@ -1619,7 +1711,7 @@ mod request_release_tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Mutex, PoisonError, Weak,
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -1627,29 +1719,58 @@ mod request_release_tests {
     use llm_tokenizer::{
         traits::Tokenizer, HuggingFaceTokenizer, MockTokenizer, TokenizerRegistry,
     };
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::{
         completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
     };
     use portpicker::pick_unused_port;
-    use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
+    use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts, vllm_proto};
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
     use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
 
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        routers::grpc::multimodal::{
-            MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
+        routers::grpc::{
+            client::ModelInfo,
+            multimodal::{
+                MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
+                SUPPORTS_VISION_LABEL,
+            },
+            utils::tonic_ext::TonicStatusExt,
         },
         worker::{
+            circuit_breaker::{CircuitBreakerConfig, CircuitState},
             BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker,
             WorkerType,
         },
     };
 
     const MODEL: &str = "request-release-test-model";
+    /// A valid 1x1 PNG, as a client sends an inline image.
+    const ONE_PIXEL_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    /// The worker label of an engine without a vision encoder (vLLM
+    /// `--language-model-only`, or a text-only model).
+    const LANGUAGE_MODEL_ONLY: &[(&str, &str)] = &[(SUPPORTS_VISION_LABEL, "false")];
+
+    /// The labels discovery derives from a servicer's `GetModelInfo`, as
+    /// `(key, value)` pairs for the worker builders of these tests.
+    fn labels_of(info: &ModelInfo) -> Vec<(String, String)> {
+        let mut labels: Vec<(String, String)> = info.to_labels().into_iter().collect();
+        labels.sort();
+        labels
+    }
+
+    fn label_pairs(labels: &[(String, String)]) -> Vec<(&str, &str)> {
+        labels
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect()
+    }
 
     /// The `(offset, length)` placeholder ranges of one generate call.
     type PlaceholderRanges = Vec<(u32, u32)>;
@@ -1664,10 +1785,13 @@ mod request_release_tests {
     /// the outcome in `released`. An ungated stub (no probe) answers
     /// immediately -- used for the PD prefill leg. `fail_first` makes the
     /// first generate call return UNAVAILABLE, for retry-replay tests;
-    /// `fail_always` fails every call, and `answer_after` stalls the generate
-    /// RPC, standing in for an engine that answers only at its own deadline.
-    /// Every call's input token ids and engine request id are recorded, as is
-    /// every aborted request id.
+    /// `fail_always` fails every call, `fail_internal` answers every call with
+    /// INTERNAL (an engine that took the request and failed on it), and
+    /// `answer_after` stalls the generate RPC, standing in for an engine that
+    /// answers only at its own deadline; `frame_gap` paces the response frames,
+    /// for a stream that outlasts its dispatch. Every call's input token ids,
+    /// prompt text and engine request id are recorded, as is every aborted
+    /// request id.
     #[derive(Clone, Default)]
     struct GatedScheduler {
         probe: Option<Weak<CompletionRequest>>,
@@ -1675,9 +1799,12 @@ mod request_release_tests {
         released: Arc<AtomicBool>,
         fail_first: bool,
         fail_always: bool,
+        fail_internal: bool,
         answer_after: Option<Duration>,
+        frame_gap: Option<Duration>,
         calls: Arc<AtomicUsize>,
         seen_input_ids: Arc<Mutex<Vec<Vec<u32>>>>,
+        seen_original_texts: Arc<Mutex<Vec<String>>>,
         seen_mm_placeholders: Arc<Mutex<Vec<PlaceholderRanges>>>,
         seen_request_ids: Arc<Mutex<Vec<String>>>,
         aborted_request_ids: Arc<Mutex<Vec<String>>>,
@@ -1757,6 +1884,16 @@ mod request_release_tests {
                         })
                         .unwrap_or_default(),
                 );
+            self.seen_original_texts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(
+                    request
+                        .tokenized
+                        .as_ref()
+                        .map(|t| t.original_text.clone())
+                        .unwrap_or_default(),
+                );
             self.seen_input_ids
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -1770,6 +1907,9 @@ mod request_release_tests {
             {
                 return Err(Status::unavailable("release-test induced failure"));
             }
+            if self.fail_internal {
+                return Err(Status::internal("release-test induced engine failure"));
+            }
             if let Some(delay) = self.answer_after {
                 tokio::time::sleep(delay).await;
             }
@@ -1782,11 +1922,15 @@ mod request_release_tests {
             let (tx, rx) = mpsc::channel(8);
             let probe = (!self.gate_rpc).then(|| self.probe.clone()).flatten();
             let released = Arc::clone(&self.released);
+            let frame_gap = self.frame_gap;
             tokio::spawn(async move {
                 if let Some(probe) = probe {
                     Self::await_probe(&probe, &released).await;
                 }
                 for frame in generate_frames(&request_id) {
+                    if let Some(gap) = frame_gap {
+                        tokio::time::sleep(gap).await;
+                    }
                     if tx.send(frame).await.is_err() {
                         return;
                     }
@@ -1927,12 +2071,52 @@ mod request_release_tests {
         port: u16,
         worker_type: WorkerType,
     ) -> Arc<dyn Worker> {
+        register_worker_with_labels(registry, port, worker_type, &[])
+    }
+
+    fn register_worker_with_labels(
+        registry: &WorkerRegistry,
+        port: u16,
+        worker_type: WorkerType,
+        labels: &[(&str, &str)],
+    ) -> Arc<dyn Worker> {
+        let mut builder = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+            .worker_type(worker_type)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::TokenSpeed)
+            .model(ModelCard::new(MODEL))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            });
+        for (key, value) in labels {
+            builder = builder.label(*key, *value);
+        }
+        let worker: Arc<dyn Worker> = Arc::new(builder.build());
+        registry
+            .register(Arc::clone(&worker))
+            .expect("register release-test worker");
+        worker
+    }
+
+    /// [`register_worker`] with a circuit breaker opening at `failure_threshold`.
+    fn register_worker_with_breaker(
+        registry: &WorkerRegistry,
+        port: u16,
+        failure_threshold: u32,
+    ) -> Arc<dyn Worker> {
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-                .worker_type(worker_type)
+                .worker_type(WorkerType::Regular)
                 .connection_mode(ConnectionMode::Grpc)
                 .runtime_type(RuntimeType::TokenSpeed)
                 .model(ModelCard::new(MODEL))
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold,
+                    success_threshold: 1,
+                    timeout_duration: Duration::from_secs(60),
+                    window_duration: Duration::from_secs(60),
+                })
                 .health_config(HealthCheckConfig {
                     disable_health_check: true,
                     ..Default::default()
@@ -1946,6 +2130,16 @@ mod request_release_tests {
     }
 
     async fn components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponents> {
+        components_with_multimodal(worker_registry, false).await
+    }
+
+    /// Components over the mock tokenizer; `with_multimodal` adds the
+    /// multimodal bundle (default settings, no model directory) so media
+    /// reaches the multimodal path instead of the "not available" refusal.
+    async fn components_with_multimodal(
+        worker_registry: Arc<WorkerRegistry>,
+        with_multimodal: bool,
+    ) -> Arc<SharedComponents> {
         let tokenizer_registry = Arc::new(TokenizerRegistry::new());
         let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
         tokenizer_registry
@@ -1957,14 +2151,192 @@ mod request_release_tests {
             )
             .await
             .expect("load mock tokenizer");
+        let multimodal = with_multimodal.then(|| {
+            Arc::new(
+                MultimodalComponents::new(
+                    Arc::new(MultimodalConfigRegistry::new()),
+                    None,
+                    None,
+                    &MultimodalSettings::default(),
+                )
+                .expect("multimodal components"),
+            )
+        });
         Arc::new(SharedComponents {
             tokenizer_registry,
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
             parser_resolver: utils::ParserResolver::disabled(),
-            multimodal: None,
+            multimodal,
         })
+    }
+
+    /// A worker whose servicer left `supports_vision` unset (the SGLang and
+    /// TokenSpeed protos carry the field; only vLLM's servicer sets it on
+    /// purpose) is not a language-model-only worker: its labels carry no
+    /// vision verdict, and an image request goes on past the refusal into
+    /// multimodal processing (here, to the config lookup the mock tokenizer
+    /// cannot satisfy) instead of a `multimodal_not_supported`.
+    #[tokio::test]
+    async fn image_to_a_worker_without_a_vision_verdict_is_not_refused() {
+        let labels = labels_of(&ModelInfo::Sglang(Box::default()));
+        assert!(
+            labels.iter().all(|(key, _)| key != SUPPORTS_VISION_LABEL),
+            "{labels:?}"
+        );
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            seen_input_ids: Arc::clone(&seen_ids),
+            ..Default::default()
+        })
+        .await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker_with_labels(
+            &worker_registry,
+            port,
+            WorkerType::Regular,
+            &label_pairs(&labels),
+        );
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        let components = components_with_multimodal(worker_registry, true).await;
+        let request: Arc<ChatCompletionRequest> = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What colour is this pixel?"},
+                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
+                    ]
+                }],
+                "max_completion_tokens": 32,
+            }))
+            .expect("chat request"),
+        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.execute_chat(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the mock path answers");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
+        assert_eq!(
+            body["error"]["code"], "invalid_multimodal_request",
+            "{body}"
+        );
+    }
+
+    /// An image to a model whose only worker runs without a vision encoder
+    /// is refused with a prompt 400 that names the modality and the model,
+    /// before any media is decoded and before anything reaches the worker
+    /// (an engine without an encoder admits such a request and never
+    /// schedules it, which the client saw as a hang).
+    #[tokio::test]
+    async fn image_to_a_language_model_only_pool_is_refused_before_dispatch() {
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            seen_input_ids: Arc::clone(&seen_ids),
+            ..Default::default()
+        })
+        .await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker_with_labels(
+            &worker_registry,
+            port,
+            WorkerType::Regular,
+            LANGUAGE_MODEL_ONLY,
+        );
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        let components = components_with_multimodal(worker_registry, true).await;
+        let request: Arc<ChatCompletionRequest> = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What colour is this pixel?"},
+                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
+                    ]
+                }],
+                "max_completion_tokens": 32,
+            }))
+            .expect("chat request"),
+        );
+
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.execute_chat(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the refusal must not wait on anything");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
+        let message = body["error"]["message"].as_str().expect("message");
+        assert!(
+            message.starts_with("image input is not supported by model"),
+            "{message}"
+        );
+        assert!(message.contains("language model only"), "{message}");
+        assert!(
+            seen_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing must reach the worker"
+        );
     }
 
     fn completion_request(stream: bool) -> Arc<CompletionRequest> {
@@ -1992,8 +2364,24 @@ mod request_release_tests {
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
             prefill_admission,
             None,
+            Duration::from_secs(60),
         );
         RequestPipeline::build(Endpoint::Completion, mode, &deps).expect("completion pipeline")
+    }
+
+    fn completion_pipeline_with_policy(
+        worker_registry: &Arc<WorkerRegistry>,
+        policy: PolicyConfig,
+    ) -> RequestPipeline {
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(policy)),
+            None,
+            None,
+            Duration::from_secs(60),
+        );
+        RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+            .expect("completion pipeline")
     }
 
     fn fast_retry_config(max_retries: u32) -> RetryConfig {
@@ -2004,6 +2392,70 @@ mod request_release_tests {
             backoff_multiplier: 1.0,
             jitter_factor: 0.0,
         }
+    }
+
+    /// A request pinned by a routing key whose engine cannot start it
+    /// (UNAVAILABLE) is retried on another engine, not replayed on the one
+    /// that just refused: one call there, one on the other engine, 200.
+    #[tokio::test]
+    async fn a_pinned_retry_moves_to_another_engine_after_an_unavailable_start() {
+        let seen_refusing = Arc::new(Mutex::new(Vec::new()));
+        let seen_serving = Arc::new(Mutex::new(Vec::new()));
+        let refusing_port = spawn_stub(GatedScheduler {
+            fail_always: true,
+            seen_request_ids: Arc::clone(&seen_refusing),
+            ..Default::default()
+        })
+        .await;
+        let serving_port = spawn_stub(GatedScheduler {
+            seen_request_ids: Arc::clone(&seen_serving),
+            ..Default::default()
+        })
+        .await;
+        let calls =
+            |seen: &Mutex<Vec<String>>| seen.lock().unwrap_or_else(PoisonError::into_inner).len();
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, refusing_port, WorkerType::Regular);
+        register_worker(&worker_registry, serving_port, WorkerType::Regular);
+        let pipeline =
+            completion_pipeline_with_policy(&worker_registry, PolicyConfig::ConsistentHashing);
+        let components = components(worker_registry).await;
+        let retry = fast_retry_config(3);
+
+        // Keys hash to either engine; the first one owned by the refusing
+        // engine is the case under test (the others succeed in one call).
+        for key in (0..64).map(|i| format!("session-{i}")) {
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-smg-routing-key", key.parse().unwrap());
+            let refused_before = calls(&seen_refusing);
+            let served_before = calls(&seen_serving);
+            let response = pipeline
+                .execute_completion(
+                    completion_request(false),
+                    Some(headers),
+                    MODEL.to_string(),
+                    Arc::clone(&components),
+                    None,
+                    None,
+                    Some(&retry),
+                )
+                .await;
+            assert_eq!(response.status(), http::StatusCode::OK, "key {key}");
+            let refused_now = calls(&seen_refusing) - refused_before;
+            let served_now = calls(&seen_serving) - served_before;
+            if refused_now == 0 {
+                assert_eq!(served_now, 1, "a key owned by the serving engine: one call");
+                continue;
+            }
+            assert_eq!(
+                refused_now, 1,
+                "the refusing engine sees the request once, not once per retry"
+            );
+            assert_eq!(served_now, 1, "the retry landed on the other engine");
+            return;
+        }
+        panic!("no key hashed to the refusing engine");
     }
 
     async fn run_and_drain(
@@ -2028,6 +2480,122 @@ mod request_release_tests {
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("drain SSE body")
+    }
+
+    /// The spans the OpenTelemetry layer exported, as a trace backend sees
+    /// them: name, start and end.
+    #[derive(Clone, Debug, Default)]
+    struct ExportedSpans(Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+
+    impl opentelemetry_sdk::trace::SpanExporter for ExportedSpans {
+        fn export(
+            &self,
+            batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
+        {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(batch);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// The exported upstream span covers the response stream, not the
+    /// dispatch alone: with the stub pacing its two frames 100 ms apart,
+    /// `grpc_execute` ends after the stream's end, not before its first frame.
+    #[tokio::test]
+    async fn upstream_span_closes_with_the_response_stream() {
+        use opentelemetry::trace::TracerProvider as _;
+        const FRAME_GAP: Duration = Duration::from_millis(100);
+        let request = completion_request(true);
+        let port = spawn_stub(GatedScheduler {
+            frame_gap: Some(FRAME_GAP),
+            ..Default::default()
+        })
+        .await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, port, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+        // `tracing` rebuilds a callsite's cached interest from the current
+        // thread's default alone while it knows of a single dispatcher; a
+        // parallel test dispatching first, under no subscriber, would then
+        // cache "never" for `grpc_execute`. A second live dispatcher keeps
+        // every rebuild over all of them.
+        let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+        let exported = ExportedSpans::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exported.clone())
+            .build();
+        // The gateway's exporter setup: the OpenTelemetry layer over the
+        // gateway's own spans alone (see `CustomOtelFilter`).
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")))
+            .with(tracing_subscriber::filter::Targets::new().with_target(
+                "smg::otel-trace",
+                tracing::level_filters::LevelFilter::TRACE,
+            ));
+
+        let (dispatched, drained) = async {
+            // A callsite's interest cached before this subscriber existed
+            // is rebuilt over the live dispatchers, this one included.
+            tracing::callsite::rebuild_interest_cache();
+            let response = pipeline
+                .execute_completion(
+                    request,
+                    None,
+                    MODEL.to_string(),
+                    components,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let dispatched = Instant::now();
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("drain SSE body");
+            (dispatched, Instant::now())
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        let upstream_spans = || -> Vec<Duration> {
+            exported
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|span| span.name == "grpc_execute")
+                .map(|span| {
+                    span.end_time
+                        .duration_since(span.start_time)
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        // The body's drop ends the span; give a slow thread a moment.
+        for _ in 0..50 {
+            if !upstream_spans().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let lasted = upstream_spans();
+        assert_eq!(lasted.len(), 1, "one upstream span per dispatch");
+        assert!(
+            drained >= dispatched + FRAME_GAP,
+            "the stub paced the stream over {:?}",
+            drained - dispatched
+        );
+        assert!(
+            lasted[0] >= FRAME_GAP,
+            "the exported upstream span lasted {:?}: it ended at dispatch, not with the stream ({:?} later)",
+            lasted[0],
+            drained - dispatched
+        );
     }
 
     /// The stream task must run off the response spec: the stub refuses to
@@ -2063,6 +2631,45 @@ mod request_release_tests {
         );
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("data: [DONE]"), "stream must finish: {body}");
+    }
+
+    /// A text-only request puts its token ids on the wire and not a second
+    /// copy of the rendered prompt: the worker generates from the ids, and a
+    /// million-token prompt's text would triple the Generate.
+    #[tokio::test]
+    async fn text_only_request_sends_its_ids_without_the_prompt_text() {
+        let request = completion_request(false);
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let seen_texts = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            seen_input_ids: Arc::clone(&seen_ids),
+            seen_original_texts: Arc::clone(&seen_texts),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, port, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        run_and_drain(
+            pipeline,
+            components,
+            request,
+            &format!("grpc://127.0.0.1:{port}"),
+        )
+        .await;
+
+        let ids = seen_ids.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(ids.len(), 1, "one Generate: {ids:?}");
+        assert!(!ids[0].is_empty(), "the prompt's ids are on the wire");
+        let texts = seen_texts.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            texts.as_slice(),
+            [String::new()],
+            "a text-only request sends no prompt text next to its ids"
+        );
     }
 
     /// grpc_pd twin: the decode leg's stream task must not pin the parsed
@@ -2250,10 +2857,10 @@ mod request_release_tests {
             assert_eq!(ids.len(), 2);
             assert!(ids[0].starts_with("cmpl_") && ids[1].starts_with("cmpl_"));
             assert_ne!(ids[0], ids[1], "each attempt gets a fresh engine id");
+            // The header switch alone must yield the header: the capture
+            // does not depend on the log switch.
             let trace_header = response.headers().get("x-smg-cache-trace");
-            if cache_trace::enabled()
-                && std::env::var("SMG_CACHE_TRACE_HEADER").is_ok_and(|v| v == "1")
-            {
+            if std::env::var("SMG_CACHE_TRACE_HEADER").is_ok_and(|v| v == "1") {
                 let trace: serde_json::Value =
                     serde_json::from_str(trace_header.unwrap().to_str().unwrap()).unwrap();
                 assert_eq!(trace["attempt"], 1);
@@ -2263,6 +2870,206 @@ mod request_release_tests {
                 assert!(trace_header.is_none());
             }
         }
+    }
+
+    /// `x-smg-cache-trace: 1` on a request returns that request's decision
+    /// record, with the chosen worker, whatever the process switches say.
+    #[tokio::test]
+    async fn a_request_header_opts_into_the_decision_record_with_its_worker() {
+        let port = spawn_stub(GatedScheduler::default()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-smg-cache-trace", http::HeaderValue::from_static("1"));
+        let response = pipeline
+            .execute_completion(
+                completion_request(false),
+                Some(headers),
+                MODEL.to_string(),
+                Arc::clone(&components),
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let trace: serde_json::Value =
+            serde_json::from_str(response.headers()["x-smg-cache-trace"].to_str().unwrap())
+                .unwrap();
+        assert_eq!(trace["attempt"], 0);
+        assert_eq!(trace["selections"][0]["worker"], worker.url());
+        assert_eq!(trace["selections"][0]["origin"], "policy");
+        assert!(trace["selections"][0].get("candidates").is_none());
+        assert_eq!(response.headers()["x-smg-routed-worker-id"], worker.url());
+
+        // Without the request header the process switches decide, as before.
+        let response = pipeline
+            .execute_completion(
+                completion_request(false),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        if !std::env::var("SMG_CACHE_TRACE_HEADER").is_ok_and(|v| v == "1") {
+            assert!(response.headers().get("x-smg-cache-trace").is_none());
+        }
+    }
+
+    async fn run_completion(
+        pipeline: RequestPipeline,
+        components: Arc<SharedComponents>,
+        retry: &RetryConfig,
+    ) -> Response {
+        pipeline
+            .execute_completion(
+                completion_request(false),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                Some(retry),
+            )
+            .await
+    }
+
+    fn calls_seen(ids: &Mutex<Vec<String>>) -> usize {
+        ids.lock().unwrap_or_else(PoisonError::into_inner).len()
+    }
+
+    /// Three attempts of one request on a worker that cannot serve it now are
+    /// one failure for its breaker: the threshold counts failed requests, not
+    /// attempts.
+    #[tokio::test]
+    async fn transient_start_failures_charge_the_breaker_once_per_request() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            fail_always: true,
+            seen_request_ids: Arc::clone(&seen),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker_with_breaker(&worker_registry, port, 2);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let response = run_completion(pipeline, components, &fast_retry_config(3)).await;
+
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            calls_seen(&seen),
+            3,
+            "an UNAVAILABLE start is replayed up to the retry limit"
+        );
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Closed,
+            "one failed request is one failure, under the threshold of two"
+        );
+    }
+
+    /// INTERNAL is the engine's own answer for this payload: it is returned
+    /// at once rather than replayed on the worker, and the worker is charged
+    /// once.
+    #[tokio::test]
+    async fn an_internal_engine_error_is_not_replayed_on_its_worker() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            fail_internal: true,
+            seen_request_ids: Arc::clone(&seen),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker_with_breaker(&worker_registry, port, 2);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let response = run_completion(pipeline, components, &fast_retry_config(5)).await;
+
+        assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            calls_seen(&seen),
+            1,
+            "the answer is definitive for this payload"
+        );
+        assert!(!is_retryable_response(&response));
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// With two workers the request moves to the other one once; a second
+    /// INTERNAL answer stands.
+    #[tokio::test]
+    async fn an_internal_engine_error_moves_the_request_to_another_worker_once() {
+        let seen_a = Arc::new(Mutex::new(Vec::new()));
+        let seen_b = Arc::new(Mutex::new(Vec::new()));
+        let port_a = spawn_stub(GatedScheduler {
+            fail_internal: true,
+            seen_request_ids: Arc::clone(&seen_a),
+            ..Default::default()
+        })
+        .await;
+        let port_b = spawn_stub(GatedScheduler {
+            fail_internal: true,
+            seen_request_ids: Arc::clone(&seen_b),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker_a = register_worker_with_breaker(&worker_registry, port_a, 5);
+        let worker_b = register_worker_with_breaker(&worker_registry, port_b, 5);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let response = run_completion(pipeline, components, &fast_retry_config(5)).await;
+
+        assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(calls_seen(&seen_a), 1);
+        assert_eq!(calls_seen(&seen_b), 1);
+        assert!(!is_retryable_response(&response));
+        assert_eq!(worker_a.circuit_breaker_state(), CircuitState::Closed);
+        assert_eq!(worker_b.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// Once the only worker's breaker opens, the verdict clears at the
+    /// breaker timeout, not inside a backoff: the 503 ends the retry window.
+    #[tokio::test]
+    async fn a_pool_of_open_breakers_ends_the_retry_window_at_once() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            fail_always: true,
+            seen_request_ids: Arc::clone(&seen),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker_with_breaker(&worker_registry, port, 1);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let response = run_completion(pipeline, components, &fast_retry_config(5)).await;
+
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+        assert_eq!(calls_seen(&seen), 1, "the open breaker takes no attempt");
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
+        assert!(!is_retryable_response(&response));
     }
 
     /// A prefill leg that cannot start must answer the client immediately
@@ -2668,6 +3475,16 @@ mod request_release_tests {
         request: serde_json::Value,
         with_multimodal: bool,
     ) -> ChatRun {
+        v41_run_chat_on(dir, request, with_multimodal, &[]).await
+    }
+
+    /// [`v41_run_chat`] with `worker_labels` on the stub's worker.
+    async fn v41_run_chat_on(
+        dir: &Path,
+        request: serde_json::Value,
+        with_multimodal: bool,
+        worker_labels: &[(&str, &str)],
+    ) -> ChatRun {
         let seen_ids = Arc::new(Mutex::new(Vec::new()));
         let seen_mm = Arc::new(Mutex::new(Vec::new()));
         let port = spawn_stub(GatedScheduler {
@@ -2677,12 +3494,13 @@ mod request_release_tests {
         })
         .await;
         let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker(&worker_registry, port, WorkerType::Regular);
+        register_worker_with_labels(&worker_registry, port, WorkerType::Regular, worker_labels);
         let deps = PipelineDeps::pair(
             worker_registry.clone(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
             None,
             None,
+            Duration::from_secs(60),
         );
         let pipeline =
             RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
@@ -2854,6 +3672,133 @@ mod request_release_tests {
             "the image span is contiguous"
         );
         assert_eq!(mm, vec![vec![(first as u32, V41_CORN_TOKENS as u32)]]);
+    }
+
+    /// A dispatch the engine answered with RESOURCE_EXHAUSTED is counted as
+    /// the rate-limit error the client reads in the 429 body, not as an
+    /// internal error of the router.
+    #[test]
+    fn a_dispatch_the_engine_throttled_is_counted_as_a_rate_limit_error() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let failure = Status::resource_exhausted("kv cache full")
+            .to_http_error("engine_busy", "kv cache full".to_string());
+        assert_eq!(failure.status(), http::StatusCode::TOO_MANY_REQUESTS);
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            pipeline.record_error(Some(metrics_labels::ENDPOINT_COMPLETIONS), MODEL, &failure);
+        });
+        let rendered = handle.render();
+        let line = rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_router_request_errors_total{")
+                    && line.contains(&format!("model=\"{MODEL}\""))
+                    && line.contains(&format!(
+                        "endpoint=\"{}\"",
+                        metrics_labels::ENDPOINT_COMPLETIONS
+                    ))
+            })
+            .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"rate_limit_error\""), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// The same image to the same model served by a worker without a vision
+    /// encoder: refused with a 400 in preparation, nothing preprocessed or
+    /// dispatched (the engine would admit the request and never schedule it).
+    #[tokio::test]
+    async fn deepseek_v41_image_to_a_language_model_only_worker_is_refused() {
+        let Some(dir) = deepseek_v41_model_dir() else {
+            skip_no_tokenizer();
+            return;
+        };
+        let data_url = format!("data:image/png;base64,{}", BASE64.encode(V41_CORN_PNG));
+        let (status, body, ids, mm) = v41_run_chat_on(
+            &dir,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this picture?"},
+                        {"type": "image_url", "image_url": {"url": data_url}}
+                    ]
+                }],
+                "chat_template_kwargs": {"thinking": false},
+                "max_tokens": 1,
+            }),
+            true,
+            LANGUAGE_MODEL_ONLY,
+        )
+        .await;
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("multimodal_not_supported"), "{body}");
+        assert!(body.contains("language model only"), "{body}");
+        assert!(ids.is_empty(), "nothing must reach the worker");
+        assert!(mm.is_empty(), "nothing must be preprocessed");
+    }
+
+    /// The same image with the worker labels discovery derives from each
+    /// servicer's `GetModelInfo`: a servicer that left `supports_vision`
+    /// unset (SGLang, TokenSpeed) gives no verdict, so the image is
+    /// preprocessed and dispatched as to any vision worker; vLLM's deliberate
+    /// `false` refuses it.
+    #[tokio::test]
+    async fn deepseek_v41_image_follows_the_servicer_vision_verdict() {
+        let Some(dir) = deepseek_v41_model_dir() else {
+            skip_no_tokenizer();
+            return;
+        };
+        let request = || {
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this picture?"},
+                        {"type": "image_url", "image_url": {"url": format!(
+                            "data:image/png;base64,{}", BASE64.encode(V41_CORN_PNG))}}
+                    ]
+                }],
+                "chat_template_kwargs": {"thinking": false},
+                "max_tokens": 1,
+            })
+        };
+        for (name, info) in [
+            ("sglang", ModelInfo::Sglang(Box::default())),
+            ("tokenspeed", ModelInfo::TokenSpeed(Box::default())),
+        ] {
+            let labels = labels_of(&info);
+            let (status, body, ids, mm) =
+                v41_run_chat_on(&dir, request(), true, &label_pairs(&labels)).await;
+            assert_eq!(
+                status,
+                http::StatusCode::OK,
+                "{name}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(ids.len(), 1, "{name}: dispatched once");
+            assert_eq!(
+                mm.iter().map(Vec::len).sum::<usize>(),
+                1,
+                "{name}: the image span reached the worker"
+            );
+        }
+
+        let labels = labels_of(&ModelInfo::Vllm(vllm_proto::GetModelInfoResponse {
+            supports_vision: false,
+            ..Default::default()
+        }));
+        let (status, body, ids, _) =
+            v41_run_chat_on(&dir, request(), true, &label_pairs(&labels)).await;
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("multimodal_not_supported"), "{body}");
+        assert!(ids.is_empty(), "nothing must reach the worker");
     }
 }
 

@@ -34,8 +34,8 @@ use crate::{
         ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
     },
     traits::{
-        ChatTemplateOutput, Decoder, Encoder, Encoding, IncrementalDecoder, SpecialTokens,
-        TokenIdType, Tokenizer,
+        ChatTemplateOutput, DecodeStep, Decoder, Encoder, Encoding, IncrementalDecoder,
+        SpecialTokens, TokenIdType, Tokenizer,
     },
 };
 
@@ -250,7 +250,11 @@ impl Encoder for CachedTokenizer {
             };
 
             if let Some(l0) = &self.l0 {
-                l0.insert(input.to_string(), add_special_tokens, encoding.clone());
+                l0.insert(
+                    input.to_string(),
+                    add_special_tokens,
+                    Encoding::Plain(encoding.token_ids().to_vec()),
+                );
             }
 
             return Ok(encoding);
@@ -260,7 +264,11 @@ impl Encoder for CachedTokenizer {
         let encoding = self.inner.encode(input, add_special_tokens)?;
 
         if let Some(l0) = &self.l0 {
-            l0.insert(input.to_string(), add_special_tokens, encoding.clone());
+            l0.insert(
+                input.to_string(),
+                add_special_tokens,
+                Encoding::Plain(encoding.token_ids().to_vec()),
+            );
         }
 
         Ok(encoding)
@@ -277,6 +285,10 @@ impl Encoder for CachedTokenizer {
 }
 
 impl Decoder for CachedTokenizer {
+    fn uses_byte_fallback(&self) -> bool {
+        self.inner.uses_byte_fallback()
+    }
+
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
         // Decoding is not cached (it's fast enough and rarely repeated)
         self.inner.decode(token_ids, skip_special_tokens)
@@ -294,6 +306,48 @@ impl Decoder for CachedTokenizer {
     ) -> Result<Option<String>> {
         self.inner
             .decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
+    fn decode_step_eager(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        self.inner
+            .decode_step_eager(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
+    fn decode_step_reporting(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+        eager: bool,
+    ) -> Result<DecodeStep> {
+        self.inner.decode_step_reporting(
+            token_id,
+            ids,
+            prefix,
+            prefix_index,
+            skip_special_tokens,
+            eager,
+        )
+    }
+
+    fn finish_decode(
+        &self,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<DecodeStep> {
+        self.inner
+            .finish_decode(ids, prefix, prefix_index, skip_special_tokens)
     }
 
     fn incremental_decoder(
@@ -373,8 +427,20 @@ impl Tokenizer for CachedTokenizer {
         self.inner.think_in_prefill()
     }
 
+    fn prefill_opens_think_block(&self) -> bool {
+        self.inner.prefill_opens_think_block()
+    }
+
     fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
         self.inner.renderer_capabilities()
+    }
+
+    fn native_thinking_mode(
+        &self,
+        template_kwargs: Option<&std::collections::HashMap<String, serde_json::Value>>,
+        thinking: Option<bool>,
+    ) -> Option<bool> {
+        self.inner.native_thinking_mode(template_kwargs, thinking)
     }
 
     fn eos_token_ids(&self) -> &[TokenIdType] {

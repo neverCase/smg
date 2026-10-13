@@ -3,13 +3,17 @@
 ``sglang.launch_server --grpc-mode`` hands the process to this package's
 :func:`smg_grpc_servicer.sglang.server.serve_grpc`, which serves
 ``sglang.grpc.scheduler.SglangScheduler`` from Python over a request manager
-in front of the scheduler. With ``SMG_SGLANG_SERVICER_IMPL=rust`` the same
-entrypoint hands the process to :func:`serve_rust` before any of that exists:
+in front of the scheduler. With ``--servicer-impl rust`` (a flag this package
+adds to SGLang's parser as an SGLang plugin, see
+:mod:`smg_grpc_servicer.sglang.plugin`; ``SMG_SGLANG_SERVICER_IMPL=rust`` is
+the fallback the flag overrides) the same entrypoint hands the process to
+:func:`serve_rust` before any of that exists:
 the contract is served by the Rust :class:`smg.servicer.SglangGrpcServer` on a
-Rust-owned thread, and the scheduler runs headless in a spawned child (this
-package's :mod:`headless` launcher, with its SGLang plugin dialing the
-servicer's same-host msgpack ZMQ handshake). Python keeps the lifecycle only.
-The Router cannot tell the two implementations apart.
+Rust-owned thread, and the scheduler ranks are started from this same process
+(SGLang's own spawner, the way this package's :mod:`headless` launcher starts
+them), each with this package's SGLang plugin dialing the servicer's same-host
+msgpack ZMQ handshake. Python keeps the lifecycle only. The Router cannot tell
+the two implementations apart.
 
 What the msgpack wire does not carry, the Rust path reports rather than
 emulates: ``Embed``, ``FlushCache``, profiling, LoRA loading and the KV-event
@@ -25,20 +29,33 @@ import json
 import logging
 import multiprocessing
 import os
-from collections.abc import Mapping
+import signal
+import threading
+from collections.abc import Mapping, MutableMapping
 from typing import Any
 
 from smg_grpc_servicer.hostport import host_port
+from smg_grpc_servicer.mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 from smg_grpc_servicer.rust_lifecycle import (
     DEFAULT_DRAIN_SECS,
+    DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     EngineProcess,
+    EngineProcessGroup,
+    FaultLatch,
+    SchedulerProcesses,
     default_socket_dir,
+    ensure_spawn_start_method,
     env_float,
     free_port,
+    on_fault_signal,
     resolve_tokenizer_dir,
     supervise,
+)
+from smg_grpc_servicer.structured_outputs import (
+    grammar_start_labels,
+    sglang_structured_outputs_start,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,6 +64,7 @@ SERVICER_IMPL_ENV = "SMG_SGLANG_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_SGLANG_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_SGLANG_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS"
+STARTUP_CEILING_SECS_ENV = "SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS"
 # Set to 0/false/no/off to keep SGLang's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_SGLANG_SERVICER_KV_EVENTS"
@@ -56,16 +74,46 @@ _OFF_VALUES = ("0", "false", "no", "off")
 # the topic; no replay socket).
 DEFAULT_KV_EVENTS_CONFIG = '{"publisher": "zmq"}'
 IMPLS = ("python", "rust")
+# Where the implementation choice came from, for the startup log line.
+SOURCE_FLAG = "flag"
+SOURCE_ENV = "env"
+SOURCE_DEFAULT = "default"
 
 
-def resolve_servicer_impl(environ: Mapping[str, str] | None = None) -> str:
-    """Which implementation serves this process: ``$SMG_SGLANG_SERVICER_IMPL``,
-    else python."""
+def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = None) -> str:
+    """Which implementation serves this process: the launcher's
+    ``--servicer-impl`` when it carried one (``args.servicer_impl``, or the
+    value this package's SGLang plugin parsed in this process), else
+    ``$SMG_SGLANG_SERVICER_IMPL``, else python."""
+    return servicer_impl_source(args, environ)[0]
+
+
+def servicer_impl_source(
+    args: Any = None, environ: Mapping[str, str] | None = None
+) -> tuple[str, str]:
+    """:func:`resolve_servicer_impl`'s answer with where it came from:
+    ``flag``, ``env`` or ``default``.
+
+    A decision made with the launcher's flag in hand is written back to the
+    environment, so the scheduler processes this process starts and anything
+    that reads only the variable agree with it when ``--servicer-impl python``
+    overrides an exported ``rust``."""
     source = os.environ if environ is None else environ
-    value = str(source.get(SERVICER_IMPL_ENV) or "python").strip().lower()
+    value = getattr(args, "servicer_impl", None) if args is not None else None
+    if not value:
+        from smg_grpc_servicer.sglang import plugin
+
+        value = plugin.parsed_flag()
+    origin = SOURCE_FLAG
+    if not value:
+        value = source.get(SERVICER_IMPL_ENV)
+        origin = SOURCE_ENV if value else SOURCE_DEFAULT
+    value = str(value or "python").strip().lower()
     if value not in IMPLS:
         raise ValueError(f"{SERVICER_IMPL_ENV} must be one of {IMPLS}, got {value!r}")
-    return value
+    if origin == SOURCE_FLAG and isinstance(source, MutableMapping):
+        source[SERVICER_IMPL_ENV] = value
+    return value, origin
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +225,16 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     pairing_protocol = pairing_protocol_from_env()
     if pairing_protocol:
         args_dict["pairing_protocol"] = pairing_protocol
+    # The engine's own per-request media limits, flat, as the Python servicer
+    # adds them: the Router's media pipeline holds requests to them.
+    item_limits = sglang_item_limits(server_args)
+    if item_limits:
+        args_dict[MM_ITEM_LIMITS_KEY] = item_limits
+    # The engine's reasoning parser and where it starts a grammar on a thinking
+    # prompt, as the Python servicer adds them.
+    args_dict.update(
+        grammar_start_labels(server_args, sglang_structured_outputs_start(server_args))
+    )
     try:
         from sglang.version import __version__ as sglang_version
     except ImportError:  # the launcher's unit tests run without SGLang
@@ -255,7 +313,7 @@ def default_kv_events_config(
 
 
 # ---------------------------------------------------------------------------
-# Headless scheduler: this package's launcher, dialing this servicer
+# Scheduler ranks: SGLang's own spawner from this process, dialing this servicer
 # ---------------------------------------------------------------------------
 
 
@@ -267,9 +325,11 @@ def _run_headless(server_args: Any, handshake_address: str) -> None:
 
 
 def launch_headless_scheduler(server_args: Any, *, handshake_port: int) -> EngineProcess:
-    """Start the headless scheduler ranks in a spawned child: a fresh
+    """Start this package's headless launcher in a spawned child: a fresh
     interpreter that inherits no Rust thread and never consults the servicer
-    switch."""
+    switch. Only a caller off the main thread goes this way (see
+    :func:`launch_scheduler_ranks`): the child is a second full Python/torch
+    process per engine pod."""
     context = multiprocessing.get_context("spawn")
     process = context.Process(
         target=_run_headless,
@@ -278,6 +338,72 @@ def launch_headless_scheduler(server_args: Any, *, handshake_port: int) -> Engin
     )
     process.start()
     return EngineProcess(process)
+
+
+def launch_scheduler_ranks(
+    server_args: Any, *, handshake_port: int
+) -> EngineProcessGroup | EngineProcess:
+    """Start the scheduler ranks from this process, the way this package's
+    headless launcher (:func:`headless.run`) starts them: the server args
+    prepared as SGLang's entrypoint prepares them, then SGLang's own spawner
+    (``Engine._launch_scheduler_processes``, which knows the running
+    version's rank layout), with this package's plugin dialing the servicer's
+    handshake from each rank. This process has already imported SGLang for
+    the servicer's own facts, so hosting the launch here costs no second
+    interpreter, where the spawned launcher was a full Python/torch process
+    per engine pod, idle once the ranks ran.
+
+    The ranks are spawned (SGLang sets the start method), so they inherit no
+    Rust thread. A rank that hits an exception signals its parent (SIGQUIT);
+    SGLang's launch-phase handler for it kills the whole process tree, so the
+    group's own handler takes its place and the servicer drains and exits
+    through :func:`supervise`. Off the main thread, where no handler can be
+    installed, the spawned launcher child is kept.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        logger.info(
+            "Scheduler launch left to the headless launcher in a spawned process "
+            "(not on the main thread)"
+        )
+        return launch_headless_scheduler(server_args, handshake_port=handshake_port)
+    from sglang.srt.entrypoints.engine import Engine, _set_envs_and_config
+    from sglang.srt.managers.scheduler import run_scheduler_process
+    from sglang.srt.plugins import load_plugins
+    from sglang.srt.runtime_context import publish
+    from sglang.srt.server_args import PortArgs
+    from sglang.srt.utils import configure_logger
+
+    from smg_grpc_servicer.sglang.zmq_plugin import ENGINE_INDEX_ENV, HANDSHAKE_ENV
+
+    # The ranks inherit the environment; the plugin registers its hooks on it.
+    os.environ[HANDSHAKE_ENV] = f"tcp://127.0.0.1:{int(handshake_port)}"
+    os.environ[ENGINE_INDEX_ENV] = "0"
+    configure_logger(server_args)
+    server_args.resolve_once()
+    _set_envs_and_config(server_args)
+    ensure_spawn_start_method("SGLang scheduler")
+    load_plugins()
+    server_args.check_server_args()
+    # This process fills the tokenizer manager's role for argument resolution
+    # only; the ranks publish their own records when they start.
+    publish(server_args, role="tokenizer")
+    port_args = PortArgs.init_new(server_args)
+    # The fault handler goes in before the spawner starts a rank: a rank that
+    # fails during its start signals its parent at once.
+    latch = FaultLatch()
+    on_fault_signal(latch, signal.SIGQUIT, what="SGLang scheduler")
+    init, processes = Engine._launch_scheduler_processes(
+        server_args, port_args, run_scheduler_process
+    )
+    ranks = SchedulerProcesses(list(processes or []), ready=init.wait_for_ready)
+    engine = latch.attach(EngineProcessGroup(ranks))
+    ranks.watch_ready("SGLang scheduler", on_failure=engine.fault)
+    logger.info(
+        "Started %d scheduler rank process(es) from the servicer process: pids %s",
+        len(ranks.processes),
+        ", ".join(str(pid) for pid in ranks.pids),
+    )
+    return engine
 
 
 def tokenizer_dir_for(server_args: Any) -> str | None:
@@ -312,7 +438,7 @@ def refuse_disaggregation(server_args: Any) -> None:
 
 async def serve_rust(server_args: Any) -> int:
     """Serve this process's gRPC contract from Rust: start the Rust server,
-    launch the headless scheduler against its handshake, and supervise both
+    start the scheduler ranks against its handshake, and supervise both
     until a signal or a failure. Returns the process exit code."""
     refuse_disaggregation(server_args)
     from smg.servicer import SglangGrpcServer, init_servicer_tracing
@@ -353,21 +479,30 @@ async def serve_rust(server_args: Any) -> int:
             "No local tokenizer directory for %s; GetTokenizer will be unavailable",
             getattr(server_args, "model_path", ""),
         )
+    startup_timeout_secs = env_float(STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS)
+    startup_ceiling_secs = env_float(STARTUP_CEILING_SECS_ENV, DEFAULT_STARTUP_CEILING_SECS)
     server = SglangGrpcServer(
         bind_address=host_port(host, port),
         ipc_base_url=f"ipc://{socket_dir}/sglang-servicer-{os.getpid()}",
         handshake_address=f"tcp://127.0.0.1:{handshake_port}",
         engine_count=engine_count,
         tokenizer_dir=tokenizer_dir,
-        engine_startup_timeout_secs=env_float(
-            STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS
-        ),
+        engine_startup_timeout_secs=startup_timeout_secs,
+        engine_startup_ceiling_secs=startup_ceiling_secs,
         **facts,
     )
     logger.info(
-        "Rust SGLang servicer listening on %s; headless scheduler dials handshake port %d",
+        "Rust SGLang servicer listening on %s; scheduler ranks dial handshake port %d",
         server.address,
         handshake_port,
     )
-    engine = launch_headless_scheduler(server_args, handshake_port=handshake_port)
+    logger.info(
+        "Scheduler startup bounds: %.0fs without a sign of life (%s), ceiling %s (%s); "
+        "the handshake waits while the scheduler process is alive",
+        startup_timeout_secs,
+        STARTUP_TIMEOUT_SECS_ENV,
+        f"{startup_ceiling_secs:.0f}s" if startup_ceiling_secs else "none",
+        STARTUP_CEILING_SECS_ENV,
+    )
+    engine = launch_scheduler_ranks(server_args, handshake_port=handshake_port)
     return await supervise(server, engine, drain_secs=env_float(DRAIN_SECS_ENV, DEFAULT_DRAIN_SECS))
