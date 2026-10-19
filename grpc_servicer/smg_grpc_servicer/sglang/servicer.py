@@ -12,6 +12,7 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,20 +47,30 @@ from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 
+from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
-from smg_grpc_servicer.sglang.loads import convert_loads_to_protobuf, load_record
+from smg_grpc_servicer.sglang.loads import (
+    convert_loads_to_protobuf,
+    effective_running_window,
+    load_record,
+    ranks_with_a_window,
+)
 from smg_grpc_servicer.sglang.request_manager import (
     GrpcRequestManager,
     _validate_token_ids_logprobs,
 )
-from smg_grpc_servicer.sglang.utils import abort_code_from_output, to_token_id_array
+from smg_grpc_servicer.sglang.utils import (
+    abort_code_from_output,
+    scheduler_abort,
+    to_token_id_array,
+)
 from smg_grpc_servicer.tensor_wire import tensor_from_parts
-from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
+from smg_grpc_servicer.tokenizer_bundle import build_tokenizer_zip, tokenizer_chunks
 
+from ..constrained_decoding import grammar_start_labels, sglang_constrained_decoding_start
 from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from ..pd_pairing import pairing_protocol_from_env
-from ..structured_outputs import grammar_start_labels, sglang_structured_outputs_start
 
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
@@ -122,6 +133,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     Standalone gRPC service implementation using GrpcRequestManager.
     Fully separated from HTTP server with its own process and no shared globals.
     """
+
+    # The running window the schedulers computed, once every rank's load
+    # snapshot has shown its bound (the bound does not change for the
+    # engine's lifetime); 0 until then. See `_running_window`.
+    _computed_running_window: int = 0
 
     def __init__(
         self,
@@ -214,6 +230,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                                 abort_code_from_output(batch_output),
                                 batch_output["error"],
                             )
+                        elif (aborted := scheduler_abort(batch_output)) is not None:
+                            # The scheduler's own abort, with its status: the
+                            # caller's error or the worker's, never a completion.
+                            await context.abort(
+                                abort_code_from_output(batch_output),
+                                aborted.get("message") or "aborted by the scheduler",
+                            )
                         else:
                             # All non-error batch outputs are final responses
                             yield self._create_completion_response(request.request_id, batch_output)
@@ -223,6 +246,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                         await context.abort(
                             abort_code_from_output(output),
                             output["error"],
+                        )
+                    elif (aborted := scheduler_abort(output)) is not None:
+                        # The scheduler's own abort, with its status (a 400 for
+                        # the caller's input, a 503 for a full queue): the stream
+                        # ends with that status and the scheduler's message, as
+                        # the TokenSpeed servicer ends it, not with a
+                        # `Complete(finish_reason = "abort")` that drops both.
+                        await context.abort(
+                            abort_code_from_output(output),
+                            aborted.get("message") or "aborted by the scheduler",
                         )
                     elif request.stream:
                         yield self._create_chunk_response(request.request_id, output)
@@ -346,12 +379,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # Submit health check request
         async def run_health_check():
             try:
-                async for _ in self.request_manager.generate_request(
-                    obj=health_req,
-                    request_id=rid,
-                ):
-                    # Got at least one response, server is healthy
-                    return True
+                # The probe leaves the stream at its first output. Closing the
+                # stream on the way out releases the probe's request state
+                # here, in the probe's own task, rather than whenever the
+                # garbage collector finalizes the abandoned stream.
+                async with aclosing(
+                    self.request_manager.generate_request(obj=health_req, request_id=rid)
+                ) as outputs:
+                    async for _ in outputs:
+                        # Got at least one response, server is healthy
+                        return True
             except Exception as e:
                 logger.warning(f"Health check failed: {e}")
                 return False
@@ -359,26 +396,30 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         task = asyncio.create_task(run_health_check())
 
-        # Wait for response with timeout
-        tic = time.time()
-        while time.time() < tic + HEALTH_CHECK_TIMEOUT:
-            await asyncio.sleep(1)
-            # Check if we got a response from scheduler
-            if self.request_manager.last_receive_tstamp > tic:
-                task.cancel()
-                # Clean up health check state
-                self.request_manager._cleanup_request_state(rid)
-                return sglang_scheduler_pb2.HealthCheckResponse(
-                    healthy=True, message="Health check passed"
-                )
+        try:
+            # Wait for response with timeout
+            tic = time.time()
+            while time.time() < tic + HEALTH_CHECK_TIMEOUT:
+                await asyncio.sleep(1)
+                # Check if we got a response from scheduler
+                if self.request_manager.last_receive_tstamp > tic:
+                    return sglang_scheduler_pb2.HealthCheckResponse(
+                        healthy=True, message="Health check passed"
+                    )
 
-        # Timeout - server not responding
-        task.cancel()
-        self.request_manager._cleanup_request_state(rid)
-        logger.warning(f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s")
-        return sglang_scheduler_pb2.HealthCheckResponse(
-            healthy=False, message=f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s"
-        )
+            # Timeout - server not responding
+            logger.warning(f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s")
+            return sglang_scheduler_pb2.HealthCheckResponse(
+                healthy=False, message=f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s"
+            )
+        finally:
+            # The RPC may be cancelled before a scheduler response or the timeout.
+            # Reap its probe before removing state that the probe can still access.
+            task.cancel()
+            try:
+                await asyncio.gather(task, return_exceptions=True)
+            finally:
+                self.request_manager._cleanup_request_state(rid)
 
     async def Abort(
         self,
@@ -514,9 +555,22 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # grammar by.
         serializable_args.update(
             grammar_start_labels(
-                self.server_args, sglang_structured_outputs_start(self.server_args)
+                self.server_args, sglang_constrained_decoding_start(self.server_args)
             )
         )
+        # The gateway reads this worker's running window (its PD admission
+        # bound, its share of the fleet's capacity) from `max_running_requests`
+        # here, which is None unless the operator set the flag: the scheduler
+        # then computes the bound itself and publishes it with its load
+        # snapshots. Report the bound the scheduler enforces under the
+        # argument's name and in the flag's units (the whole worker's, across
+        # its attention-DP workers), so a default start advertises the window
+        # a flag would; the operator's flag, when set, stays the figure
+        # reported.
+        if not serializable_args.get("max_running_requests"):
+            window = self._running_window()
+            if window > 0:
+                serializable_args["max_running_requests"] = window
         server_args_struct.update(serializable_args)
 
         # Convert scheduler_info to Struct
@@ -545,6 +599,50 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             start_time=start_timestamp,
             max_total_num_tokens=self.scheduler_info.get("max_total_num_tokens", 0),
         )
+
+    def _attention_dp_size(self) -> int:
+        """How many attention-DP workers the flag is split across, on either
+        engine release (see `ServerArgsSection.attention_dp_width`: the pinned
+        release's ``dp_size`` under ``--enable-dp-attention``, the newer
+        releases' resolved ``attn_dp_size``)."""
+        return EngineConfigView(self.server_args).server_args.attention_dp_width
+
+    def _rank_count(self) -> int:
+        """How many schedulers publish a load snapshot, on either engine
+        release (see `ServerArgsSection.scheduler_count`)."""
+        return EngineConfigView(self.server_args).server_args.scheduler_count
+
+    def _running_window(self) -> int:
+        """The running window the schedulers enforce, in the flag's units: the
+        operator's `--max-running-requests` when set, else the figure the
+        schedulers publish in their load snapshots (one attention-DP worker's
+        share each, scaled back to the flag's units), else 0 (no snapshot
+        published yet, or a request manager without the reader). The figure is
+        cached once every rank has published its bound; a partial read (the
+        reader skips the ranks that have not published yet) is reported as it
+        stands and read again on the next call, so a rank with a smaller bound
+        still corrects it."""
+        configured = EngineConfigView(self.server_args).server_args.max_running_requests
+        if configured is not None:
+            return configured
+        if self._computed_running_window > 0:
+            return self._computed_running_window
+        reader = getattr(self.request_manager, "load_snapshot_reader", None)
+        if reader is None:
+            return 0
+        try:
+            snapshots = reader.read_all()
+        except Exception as e:  # noqa: BLE001 - the window is advisory; GetServerInfo must answer
+            logger.debug("load snapshots unreadable while resolving the running window: %s", e)
+            return 0
+        window = effective_running_window(snapshots, self._attention_dp_size())
+        if window > 0 and ranks_with_a_window(snapshots) >= self._rank_count():
+            self._computed_running_window = window
+            logger.info(
+                "max_running_requests is unset: reporting the scheduler's computed window %d",
+                window,
+            )
+        return window
 
     async def GetLoads(
         self,
@@ -732,17 +830,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             sha256,
         )
 
-        # Stream chunks; SHA-256 only on the final chunk
-        offset = 0
-        total = len(zip_data)
-        while offset < total:
-            end = min(offset + CHUNK_SIZE, total)
-            is_last = end == total
-            yield common_pb2.GetTokenizerChunk(
-                data=bytes(zip_data[offset:end]),
-                sha256=sha256 if is_last else "",
-            )
-            offset = end
+        for chunk in tokenizer_chunks(zip_data, sha256):
+            yield chunk
 
     async def SubscribeKvEvents(
         self,
@@ -771,12 +860,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
         """The load record the KV-event stream carries for ``dp_rank``: the
         scheduler's published snapshot as ``GetLoads`` reports it, read for
-        every batch and heartbeat; ``None`` while none is published."""
-        try:
-            return load_record(self.request_manager.load_snapshot_reader.read_all(), dp_rank)
-        except Exception:  # noqa: BLE001 - a record that cannot be read leaves the batch without one
-            logger.debug("load record unavailable", exc_info=True)
-            return None
+        every batch and heartbeat; ``None`` while none is published. A read
+        that raises is the recorder's to report."""
+        return load_record(self.request_manager.load_snapshot_reader.read_all(), dp_rank)
 
     def _handle_epd_disaggregation_encode_request(
         self,

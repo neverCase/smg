@@ -1,6 +1,6 @@
 [package]
 name = "llm-multimodal"
-version = "1.13.0"
+version = "1.14.0"
 edition = "2021"
 description = "Multimodal processing for vision and other modalities"
 license = "Apache-2.0"
@@ -43,9 +43,10 @@ serde_bytes = "0.11"
 serde_json.workspace = true
 tempfile = "3.27"
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "process", "time"] }
+tokio = { workspace = true, features = ["sync", "fs", "net", "rt-multi-thread", "process", "time"] }
 tracing.workspace = true
 url = "2.5.8"
+futures.workspace = true
 
 # Workspace crates
 anyhow.workspace = true
@@ -53,15 +54,25 @@ blake3.workspace = true
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
-futures.workspace = true
 http.workspace = true
-npyz = { version = "0.9", features = ["npz"] }
+# The golden tests read `.npz` fixtures: a zip archive whose members are the arrays as `.npy` files.
+npyz = "0.9"
+zip = "9.0"
+# The dump example for bellwether's multimodal fixtures digests its artifacts with SHA-256, as the fixtures do.
+sha2 = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# The wire benchmark measures the process's CPU time.
+rustix = { version = "1", default-features = false, features = ["time"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [build-dependencies]
 cc = "1"
 pkg-config = "0.3"
+
+# The dump example for bellwether's multimodal fixtures carries unit tests of its own (`cargo test --example bellwether_dump`).
+[[example]]
+name = "bellwether_dump"
+test = true
 
 [[bench]]
 name = "image_preprocess"

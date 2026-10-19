@@ -4,33 +4,32 @@
 //! - ToolLoopState for tracking multi-turn tool calling
 //! - Helper functions for tool preparation and extraction
 //! - MCP metadata builders
-//! - Conversation history loading
+//!
+//! A request's history is loaded by the shared
+//! [`crate::routers::grpc::common::responses::load_history`].
 
-use axum::{http, response::Response};
+use axum::http;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{Tool, ToolChoice, ToolChoiceValue, Usage},
     responses::{
-        self, InputTokensDetails, OutputTokensDetails, ResponseContentPart, ResponseInput,
-        ResponseInputOutputItem, ResponseOutputItem, ResponseUsage, ResponsesRequest,
+        self, InputTokensDetails, OutputTokensDetails, ResponseInput, ResponseInputOutputItem,
+        ResponseOutputItem, ResponseUsage, ResponsesRequest,
     },
 };
-use serde_json::Value;
-use smg_data_connector::{
-    self as data_connector, ConversationId, ResponseId, ResponseStorage, ResponseStorageError,
-};
-use smg_mcp::McpToolSession;
-use tracing::{debug, warn};
+use serde_json::{json, Value};
+use smg_mcp::{McpToolSession, ToolExecutionOutput};
+use tracing::warn;
 
 use crate::{
     middleware::TenantRequestMeta,
+    observability::metrics::{metrics_labels, Metrics},
     routers::{
         common::{
-            mcp_utils::DEFAULT_MAX_ITERATIONS, openai_bridge,
-            persistence_utils::split_stored_message_content,
+            mcp_utils::{prepare_hosted_dispatch_args, DEFAULT_MAX_ITERATIONS},
+            openai_bridge::{self, ResponseFormat},
         },
-        error,
-        grpc::common::responses::{utils::resolve_function_identity, ResponsesContext},
+        grpc::common::responses::{history::current_input_items, utils::resolve_function_identity},
     },
 };
 
@@ -44,8 +43,12 @@ pub(super) struct ToolLoopState {
     pub iteration: usize,
     pub total_calls: usize,
     pub usage: Option<ResponseUsage>,
+    /// The calls this loop executed, each with its output, in order.
     pub conversation_history: Vec<ResponseInputOutputItem>,
-    pub original_input: ResponseInput,
+    /// The input the loop started from, the request's history loaded: every
+    /// later iteration is rebuilt on it, so a stored turn's tool calls and
+    /// their outputs stay in front of the calls this loop executes.
+    pub base_input: ResponseInput,
     pub mcp_call_items: Vec<ResponseOutputItem>,
 }
 
@@ -59,6 +62,7 @@ pub(super) struct ResponsesCallContext {
 }
 
 impl ToolLoopState {
+    /// `request` is the request the loop starts from, its history loaded.
     pub fn new(request: &ResponsesRequest) -> Self {
         Self {
             tools: request.tools.clone(),
@@ -66,7 +70,7 @@ impl ToolLoopState {
             total_calls: 0,
             usage: None,
             conversation_history: Vec::new(),
-            original_input: request.input.clone(),
+            base_input: request.input.clone(),
             mcp_call_items: Vec::new(),
         }
     }
@@ -136,17 +140,9 @@ impl ToolLoopState {
 // Tool Preparation and Extraction
 // ============================================================================
 
-/// Merge function tools from request with MCP tools and set tool_choice based on iteration
-pub(super) fn prepare_chat_tools_and_choice(
-    chat_request: &mut ChatCompletionRequest,
-    mcp_chat_tools: &[Tool],
-    iteration: usize,
-) {
-    // Merge function tools from request with MCP tools
-    let mut all_tools = chat_request.tools.take().unwrap_or_default();
-    all_tools.extend(mcp_chat_tools.iter().cloned());
-    chat_request.tools = Some(all_tools);
-
+/// Set tool_choice based on iteration (the MCP tools join the request's tools
+/// where the chat request is built: `conversions::responses_to_chat_with_mcp_tools`)
+pub(super) fn prepare_tool_choice(chat_request: &mut ChatCompletionRequest, iteration: usize) {
     // Set tool_choice based on iteration
     // - Iteration 0: Use user's tool_choice or default to auto
     // - Iteration 1+: Always use auto to avoid infinite loops
@@ -254,345 +250,69 @@ pub(super) fn extract_all_tool_calls_from_chat(
     }
 }
 
+/// The model's argument payload as the object the hosted-tool merge needs,
+/// with the request's hosted-tool config and user merged in. A scalar, an
+/// array or null becomes an empty object first, so caller-declared config is
+/// applied instead of silently dropped (`apply_hosted_tool_overrides` is a
+/// no-op on anything but an object).
+pub(super) fn dispatch_arguments(
+    response_format: ResponseFormat,
+    original_request: &ResponsesRequest,
+    arguments: &str,
+) -> Value {
+    let mut arguments = match serde_json::from_str::<Value>(arguments) {
+        Ok(Value::Object(map)) => Value::Object(map),
+        _ => json!({}),
+    };
+    prepare_hosted_dispatch_args(
+        &mut arguments,
+        response_format,
+        original_request.tools.as_deref().unwrap_or(&[]),
+        original_request.user.as_deref(),
+    );
+    arguments
+}
+
+/// An executed MCP call's metrics and its place in the loop's history.
+pub(super) fn record_mcp_call(
+    state: &mut ToolLoopState,
+    model: &str,
+    output: ToolExecutionOutput,
+    output_str: String,
+    output_item: ResponseOutputItem,
+) {
+    let success = !output.is_error;
+    Metrics::record_mcp_tool_duration(model, &output.tool_name, output.duration);
+    Metrics::record_mcp_tool_call(
+        model,
+        &output.tool_name,
+        if success {
+            metrics_labels::RESULT_SUCCESS
+        } else {
+            metrics_labels::RESULT_ERROR
+        },
+    );
+    state.record_call(
+        output.call_id,
+        output.tool_name,
+        output.arguments_str,
+        output_str,
+        output_item,
+        success,
+    );
+}
+
 pub(super) fn convert_mcp_tools_to_chat_tools(session: &McpToolSession<'_>) -> Vec<Tool> {
     openai_bridge::chat_function_tools(session)
 }
 
-// ============================================================================
-// Conversation History Loading
-// ============================================================================
-
-/// Load conversation history and response chains, returning modified request
-pub(super) async fn load_conversation_history(
-    ctx: &ResponsesContext,
-    request: &ResponsesRequest,
-) -> Result<ResponsesRequest, Response> {
-    let mut modified_request = request.clone();
-    let mut conversation_items: Option<Vec<ResponseInputOutputItem>> = None;
-
-    // Handle previous_response_id by loading response chain
-    if let Some(ref prev_id_str) = modified_request.previous_response_id {
-        let prev_id = ResponseId::from(prev_id_str.as_str());
-        match ctx
-            .response_storage
-            .get_response_chain(&prev_id, None)
-            .await
-        {
-            Ok(chain) if !chain.responses.is_empty() => {
-                let mut items = Vec::new();
-                for stored in &chain.responses {
-                    // Convert input items from stored input (which is now a JSON array)
-                    if let Some(input_arr) = stored.input.as_array() {
-                        for item in input_arr {
-                            match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
-                                Ok(input_item) => {
-                                    items.push(input_item);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to deserialize stored input item: {}. Item: {}",
-                                        e, item
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    // Convert output items from stored raw_response["output"] (which is a JSON array)
-                    if let Some(output_arr) =
-                        stored.raw_response.get("output").and_then(|v| v.as_array())
-                    {
-                        for item in output_arr {
-                            match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
-                                Ok(output_item) => {
-                                    items.push(output_item);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to deserialize stored output item: {}. Item: {}",
-                                        e, item
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                conversation_items = Some(items);
-                modified_request.previous_response_id = None;
-            }
-            Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => {
-                return Err(error::bad_request(
-                    "previous_response_not_found",
-                    format!("Previous response with id '{prev_id_str}' not found."),
-                ));
-            }
-            Err(e) => {
-                return Err(error::internal_error(
-                    "load_previous_response_chain_failed",
-                    format!("Failed to load previous response chain for {prev_id_str}: {e}"),
-                ));
-            }
-        }
-    }
-
-    // Handle conversation by loading conversation history
-    if let Some(ref conv_ref) = request.conversation {
-        let conv_id_str = conv_ref.as_id();
-        let conv_id = ConversationId::from(conv_id_str);
-
-        // Check if conversation exists - return error if not found
-        let conversation = ctx
-            .conversation_storage
-            .get_conversation(&conv_id)
-            .await
-            .map_err(|e| {
-                error::internal_error(
-                    "check_conversation_failed",
-                    format!("Failed to check conversation: {e}"),
-                )
-            })?;
-
-        if conversation.is_none() {
-            return Err(error::not_found(
-                "conversation_not_found",
-                format!(
-                    "Conversation '{conv_id_str}' not found. Please create the conversation first using the conversations API."
-                )
-            ));
-        }
-
-        // Load conversation history
-        const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
-        let params = data_connector::ListParams {
-            limit: MAX_CONVERSATION_HISTORY_ITEMS,
-            order: data_connector::SortOrder::Asc,
-            after: None,
-        };
-
-        match ctx
-            .conversation_item_storage
-            .list_items(&conv_id, params)
-            .await
-        {
-            Ok(stored_items) => {
-                let mut items: Vec<ResponseInputOutputItem> = Vec::new();
-                for item in stored_items {
-                    if item.item_type == "message" {
-                        // Stored content may be either the raw content array
-                        // (legacy) or an object `{content: [...], phase: ...}`
-                        // when the message carried a phase label (P3).
-                        let (content_value, stored_phase) =
-                            split_stored_message_content(item.content.clone());
-                        if let Ok(content_parts) =
-                            serde_json::from_value::<Vec<ResponseContentPart>>(content_value)
-                        {
-                            items.push(ResponseInputOutputItem::Message {
-                                id: item.id.0.clone(),
-                                role: item.role.clone().unwrap_or_else(|| "user".to_string()),
-                                content: content_parts,
-                                status: item.status.clone(),
-                                phase: stored_phase,
-                            });
-                        }
-                    }
-                }
-
-                // Append current request
-                match &modified_request.input {
-                    ResponseInput::Text(text) => {
-                        items.push(ResponseInputOutputItem::Message {
-                            id: format!("msg_u_{}", conv_id.0),
-                            role: "user".to_string(),
-                            content: vec![ResponseContentPart::InputText { text: text.clone() }],
-                            status: Some("completed".to_string()),
-                            phase: None,
-                        });
-                    }
-                    ResponseInput::Items(current_items) => {
-                        // Process all item types, converting SimpleInputMessage to Message
-                        for item in current_items {
-                            let normalized = responses::normalize_input_item(item);
-                            items.push(normalized);
-                        }
-                    }
-                }
-
-                modified_request.input = ResponseInput::Items(items);
-            }
-            Err(e) => {
-                warn!("Failed to load conversation history: {}", e);
-            }
-        }
-    }
-
-    // If we have conversation_items from previous_response_id, merge them
-    if let Some(mut items) = conversation_items {
-        // Append current request
-        match &modified_request.input {
-            ResponseInput::Text(text) => {
-                items.push(ResponseInputOutputItem::Message {
-                    id: format!(
-                        "msg_u_{}",
-                        request.previous_response_id.as_deref().unwrap_or("new")
-                    ),
-                    role: "user".to_string(),
-                    content: vec![ResponseContentPart::InputText { text: text.clone() }],
-                    status: Some("completed".to_string()),
-                    phase: None,
-                });
-            }
-            ResponseInput::Items(current_items) => {
-                // Process all item types, converting SimpleInputMessage to Message
-                for item in current_items {
-                    let normalized = responses::normalize_input_item(item);
-                    items.push(normalized);
-                }
-            }
-        }
-
-        modified_request.input = ResponseInput::Items(items);
-    }
-
-    // Resolve `item_reference` input items against what this request already
-    // loaded (the previous_response_id chain, the conversation history) and,
-    // failing that, the response store.
-    if let ResponseInput::Items(items) = &modified_request.input {
-        if items
-            .iter()
-            .any(|item| matches!(item, ResponseInputOutputItem::ItemReference { .. }))
-        {
-            let resolved =
-                resolve_item_references(ctx.response_storage.as_ref(), items.clone()).await?;
-            modified_request.input = ResponseInput::Items(resolved);
-        }
-    }
-
-    debug!(
-        has_previous_response = request.previous_response_id.is_some(),
-        has_conversation = request.conversation.is_some(),
-        "Loaded conversation history"
-    );
-
-    Ok(modified_request)
-}
-
-/// Replace every `item_reference` input item by the item it points to: an item
-/// already in the list (loaded from the previous_response_id chain or the
-/// conversation history) or an output item of a stored response. An unknown id
-/// answers 404, as the public API does.
-pub(super) async fn resolve_item_references(
-    storage: &dyn ResponseStorage,
-    items: Vec<ResponseInputOutputItem>,
-) -> Result<Vec<ResponseInputOutputItem>, Response> {
-    let mut resolved: Vec<ResponseInputOutputItem> = Vec::with_capacity(items.len());
-    for item in items {
-        let ResponseInputOutputItem::ItemReference { id, .. } = &item else {
-            resolved.push(item);
-            continue;
-        };
-        if let Some(found) = resolved
-            .iter()
-            .find(|candidate| input_item_id(candidate) == Some(id.as_str()))
-            .cloned()
-        {
-            resolved.push(found);
-            continue;
-        }
-        let stored = storage
-            .find_response_by_output_item(id)
-            .await
-            .map_err(|e| {
-                error::internal_error(
-                    "resolve_item_reference_failed",
-                    format!("Failed to resolve item '{id}': {e}"),
-                )
-            })?;
-        let candidate = stored
-            .as_ref()
-            .and_then(|response| response.raw_response.get("output"))
-            .and_then(Value::as_array)
-            .and_then(|output| {
-                output
-                    .iter()
-                    .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(id))
-            });
-        let Some(candidate) = candidate else {
-            return Err(error::not_found(
-                "item_not_found",
-                format!("Item with id '{id}' not found."),
-            ));
-        };
-        // a stored item that has no input form (a built-in tool call, an older
-        // schema) exists but cannot be re-injected: say so, not "not found"
-        match serde_json::from_value::<ResponseInputOutputItem>(candidate.clone()) {
-            Ok(found) => resolved.push(found),
-            Err(e) => {
-                let item_type = candidate
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                warn!(
-                    "item_reference '{id}' (type '{item_type}') names a stored output item that cannot be used as input: {e}"
-                );
-                return Err(error::bad_request(
-                    "item_not_usable_as_input",
-                    format!("Item '{id}' of type '{item_type}' cannot be used as an input item."),
-                ));
-            }
-        }
-    }
-    Ok(resolved)
-}
-
-/// The id an input item carries, for `item_reference` resolution. Every
-/// variant is named, so a new one has to say whether it carries an id.
-fn input_item_id(item: &ResponseInputOutputItem) -> Option<&str> {
-    match item {
-        ResponseInputOutputItem::Message { id, .. }
-        | ResponseInputOutputItem::Reasoning { id, .. }
-        | ResponseInputOutputItem::McpApprovalRequest { id, .. }
-        | ResponseInputOutputItem::ImageGenerationCall { id, .. }
-        | ResponseInputOutputItem::ComputerCall { id, .. }
-        | ResponseInputOutputItem::LocalShellCall { id, .. }
-        | ResponseInputOutputItem::LocalShellCallOutput { id, .. }
-        | ResponseInputOutputItem::McpCall { id, .. }
-        | ResponseInputOutputItem::McpListTools { id, .. } => Some(id.as_str()),
-        ResponseInputOutputItem::FunctionToolCall { id, .. }
-        | ResponseInputOutputItem::FunctionCallOutput { id, .. }
-        | ResponseInputOutputItem::McpApprovalResponse { id, .. }
-        | ResponseInputOutputItem::Compaction { id, .. }
-        | ResponseInputOutputItem::ComputerCallOutput { id, .. }
-        | ResponseInputOutputItem::CustomToolCall { id, .. }
-        | ResponseInputOutputItem::CustomToolCallOutput { id, .. }
-        | ResponseInputOutputItem::ShellCall { id, .. }
-        | ResponseInputOutputItem::ShellCallOutput { id, .. }
-        | ResponseInputOutputItem::ApplyPatchCall { id, .. }
-        | ResponseInputOutputItem::ApplyPatchCallOutput { id, .. } => id.as_deref(),
-        // a reference is what gets resolved, never a resolution; a bare input
-        // message carries no id
-        ResponseInputOutputItem::ItemReference { .. }
-        | ResponseInputOutputItem::SimpleInputMessage { .. } => None,
-    }
-}
-
-/// Build next request with updated conversation history
+/// Build next request with updated conversation history: the input the loop
+/// started from, then every call this loop executed with its output.
 pub(super) fn build_next_request(
     state: &ToolLoopState,
     current_request: ResponsesRequest,
 ) -> ResponsesRequest {
-    // Start with original input
-    let mut input_items = match &state.original_input {
-        ResponseInput::Text(text) => vec![ResponseInputOutputItem::Message {
-            id: format!("msg_u_{}", state.iteration),
-            role: "user".to_string(),
-            content: vec![ResponseContentPart::InputText { text: text.clone() }],
-            status: Some("completed".to_string()),
-            phase: None,
-        }],
-        ResponseInput::Items(items) => items.iter().map(responses::normalize_input_item).collect(),
-    };
-
-    // Append all conversation history (function calls and outputs)
+    let mut input_items = current_input_items(&state.base_input);
     input_items.extend_from_slice(&state.conversation_history);
 
     // Build new request for next iteration, moving fields from old request to avoid cloning
@@ -679,6 +399,41 @@ mod usage_tests {
     use super::*;
 
     #[test]
+    fn dispatch_arguments_keep_an_object_and_make_an_empty_one_of_anything_else() {
+        let request = ResponsesRequest::default();
+        assert_eq!(
+            dispatch_arguments(ResponseFormat::Passthrough, &request, r#"{"q": "x"}"#),
+            json!({"q": "x"})
+        );
+        for payload in ["\"text\"", "[1, 2]", "null", "not json"] {
+            assert_eq!(
+                dispatch_arguments(ResponseFormat::Passthrough, &request, payload),
+                json!({}),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_arguments_merge_the_requests_hosted_tool_config_and_user_into_a_coerced_payload() {
+        // The reason for the coercion: a scalar payload under a hosted format
+        // still takes the caller-declared config and the request's user.
+        let request = ResponsesRequest {
+            tools: Some(vec![responses::ResponseTool::WebSearchPreview(
+                responses::WebSearchPreviewTool {
+                    search_context_size: Some("low".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            user: Some("u-1".to_string()),
+            ..Default::default()
+        };
+        let merged = dispatch_arguments(ResponseFormat::WebSearchCall, &request, "\"text\"");
+        assert_eq!(merged["search_context_size"], json!("low"));
+        assert_eq!(merged["user"], json!("u-1"));
+    }
+
+    #[test]
     fn mcp_usage_accumulates_reasoning_and_cache_and_survives_missing_usage() {
         let mut state = ToolLoopState::new(&ResponsesRequest::default());
         state.record_usage(None);
@@ -703,123 +458,92 @@ mod usage_tests {
             })
         );
     }
+}
 
-    fn stored_response_with_message(item_id: &str, text: &str) -> data_connector::StoredResponse {
-        let mut stored = data_connector::StoredResponse::new(None);
-        stored.raw_response = json!({
-            "id": "resp_stored",
-            "output": [{
-                "type": "message", "id": item_id, "role": "assistant", "status": "completed",
-                "content": [{"type": "output_text", "text": text, "annotations": []}]
-            }]
-        });
-        stored
-    }
+#[cfg(test)]
+mod history_tests {
+    //! The tool loop is rebuilt on the loaded request: a stored turn's tool
+    //! calls and outputs stay in front of the calls this loop executes.
 
-    fn reference(id: &str) -> ResponseInputOutputItem {
-        serde_json::from_value(json!({"type": "item_reference", "id": id})).unwrap()
-    }
+    use openai_protocol::{chat::ChatMessage, common::ConversationRef};
 
+    use super::{super::conversions, *};
+    use crate::routers::grpc::common::responses::{
+        history::tests::{function_call_output, function_call_output_input, shape, Stores},
+        load_history,
+    };
+
+    /// Turn 2 answers the call a stored turn issued: the engine sees the
+    /// question, the call and its answer on the first iteration, and the
+    /// request rebuilt after a call this loop executed still carries them,
+    /// in front of that call.
     #[tokio::test]
-    async fn item_reference_resolves_a_stored_output_item() {
-        let storage = data_connector::MemoryResponseStorage::new();
-        storage
-            .store_response(stored_response_with_message("msg_stored", "earlier answer"))
-            .await
-            .unwrap();
-        let user = responses::normalize_input_item(
-            &serde_json::from_value(json!({"role": "user", "content": "continue"})).unwrap(),
-        );
-
-        let resolved = resolve_item_references(&storage, vec![reference("msg_stored"), user])
-            .await
-            .expect("a stored output item resolves");
-
-        assert_eq!(resolved.len(), 2);
-        match &resolved[0] {
-            ResponseInputOutputItem::Message {
-                id, role, content, ..
-            } => {
-                assert_eq!(id, "msg_stored");
-                assert_eq!(role, "assistant");
-                assert!(matches!(
-                    &content[0],
-                    ResponseContentPart::OutputText { text, .. } if text == "earlier answer"
-                ));
-            }
-            other => panic!("expected the stored message, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn item_reference_prefers_an_item_already_loaded() {
-        let storage = data_connector::MemoryResponseStorage::new();
-        let loaded = ResponseInputOutputItem::Message {
-            id: "msg_loaded".to_string(),
-            role: "assistant".to_string(),
-            content: vec![ResponseContentPart::OutputText {
-                text: "from the chain".to_string(),
-                annotations: vec![],
-                logprobs: None,
-            }],
-            status: Some("completed".to_string()),
-            phase: None,
+    async fn the_tool_loop_rebuilds_on_the_loaded_history() {
+        let stores = Stores::with_conversation().await;
+        let turn_1 = ResponsesRequest {
+            input: ResponseInput::Text("What is 6*7?".to_string()),
+            conversation: Some(ConversationRef::Id("conv_1".to_string())),
+            ..Default::default()
         };
-
-        let resolved = resolve_item_references(&storage, vec![loaded, reference("msg_loaded")])
+        stores
+            .store_turn("resp_1", &turn_1, function_call_output())
+            .await;
+        let turn_2 = ResponsesRequest {
+            input: function_call_output_input(),
+            conversation: Some(ConversationRef::Id("conv_1".to_string())),
+            ..Default::default()
+        };
+        let loaded = load_history(stores.history(), &turn_2, None)
             .await
-            .expect("an item already in the list resolves without storage");
+            .expect("the conversation loads");
 
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(input_item_id(&resolved[1]), Some("msg_loaded"));
-        assert!(!matches!(
-            resolved[1],
-            ResponseInputOutputItem::ItemReference { .. }
-        ));
-    }
+        let chat = conversions::responses_to_chat(&loaded).expect("the loaded history converts");
+        let turns: Vec<&str> = chat
+            .messages
+            .iter()
+            .map(|message| match message {
+                ChatMessage::User { .. } => "user",
+                ChatMessage::Assistant {
+                    tool_calls: Some(_),
+                    ..
+                } => "assistant+tool_calls",
+                ChatMessage::Tool { .. } => "tool",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(turns, ["user", "assistant+tool_calls", "tool"]);
 
-    #[tokio::test]
-    async fn item_reference_to_a_stored_item_with_no_input_form_is_400() {
-        let storage = data_connector::MemoryResponseStorage::new();
-        let mut stored = data_connector::StoredResponse::new(None);
-        stored.raw_response = json!({
-            "id": "resp_stored",
-            "output": [{"type": "web_search_call", "id": "ws_1", "status": "completed"}]
-        });
-        storage.store_response(stored).await.unwrap();
+        let mut state = ToolLoopState::new(&loaded);
+        state.record_call(
+            "call_B".to_string(),
+            "search".to_string(),
+            "{}".to_string(),
+            "found".to_string(),
+            ResponseOutputItem::new_function_tool_call(
+                "fc_B".to_string(),
+                "call_B".to_string(),
+                "search".to_string(),
+                "{}".to_string(),
+                None,
+                "completed".to_string(),
+            ),
+            true,
+        );
+        let next = build_next_request(&state, loaded);
 
-        let response = resolve_item_references(&storage, vec![reference("ws_1")])
-            .await
-            .expect_err("a stored item without an input form is refused");
-
-        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn item_reference_finds_a_loaded_custom_tool_call_by_its_id() {
-        let storage = data_connector::MemoryResponseStorage::new();
-        let loaded: ResponseInputOutputItem = serde_json::from_value(json!({
-            "type": "custom_tool_call", "id": "ctc_1", "call_id": "call_1",
-            "name": "lookup", "input": "weather"
-        }))
-        .unwrap();
-
-        let resolved = resolve_item_references(&storage, vec![loaded, reference("ctc_1")])
-            .await
-            .expect("an item already in the list resolves without storage");
-
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(input_item_id(&resolved[1]), Some("ctc_1"));
-    }
-
-    #[tokio::test]
-    async fn item_reference_to_an_unknown_id_is_404() {
-        let storage = data_connector::MemoryResponseStorage::new();
-
-        let response = resolve_item_references(&storage, vec![reference("msg_missing")])
-            .await
-            .expect_err("an unknown item is refused");
-
-        assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+        let ResponseInput::Items(items) = &next.input else {
+            panic!("the next request's input is an item list");
+        };
+        assert_eq!(
+            shape(items),
+            [
+                "message:user",
+                "function_call:call_A",
+                "function_call_output:call_A",
+                "function_call:call_B+output",
+            ]
+        );
+        assert_eq!(next.conversation, None);
+        assert_eq!(next.store, Some(false));
     }
 }

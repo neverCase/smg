@@ -33,10 +33,11 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
 from smg_grpc_servicer.kv_relay import Engine, relay
-from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
+from smg_grpc_servicer.tokenizer_bundle import build_tokenizer_zip, tokenizer_chunks
 from smg_grpc_servicer.trace_context import trace_headers
 from smg_grpc_servicer.vllm import attach_vllm_logging
 from smg_grpc_servicer.vllm.admin import flush_cache
+from smg_grpc_servicer.vllm.config_view import EngineConfigView, uses_mrope
 from smg_grpc_servicer.vllm.errors import grpc_code_for
 from smg_grpc_servicer.vllm.kv_events import (
     rank_sources_for,
@@ -68,13 +69,14 @@ from smg_grpc_servicer.vllm.mm_salt import (
 )
 from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
 from smg_grpc_servicer.vllm.model_info import (
+    constrained_decoding_start,
     engine_reasoning_parser,
     mm_device_do_normalize,
+    mm_encoder_budget,
     mm_item_limits,
     model_facts,
     running_window,
     server_facts,
-    structured_outputs_start,
 )
 
 from .mm_keys import (
@@ -107,11 +109,9 @@ def _prompt_length(prompt) -> int:
 
 def _kv_capacity_tokens(engine) -> int:
     """The KV cache's token capacity, when the engine config exposes it."""
-    cache = getattr(getattr(engine, "vllm_config", None), "cache_config", None)
-    blocks = getattr(cache, "num_gpu_blocks", None)
-    block_size = getattr(cache, "block_size", None)
-    if isinstance(blocks, int) and isinstance(block_size, int) and blocks > 0 and block_size > 0:
-        return blocks * block_size
+    cache = EngineConfigView(getattr(engine, "vllm_config", None)).cache
+    if cache.num_gpu_blocks is not None and cache.block_size is not None:
+        return cache.num_gpu_blocks * cache.block_size
     return 0
 
 
@@ -120,21 +120,87 @@ def _max_running_requests(engine) -> int:
     return running_window(getattr(engine, "vllm_config", None))
 
 
-def _first_rank(engine) -> int:
-    """The lowest data-parallel rank this servicer serves: the first of the
-    engine client's managed ranks (a slice of all the ranks under external or
+def _managed_ranks(engine) -> list[int]:
+    """The data-parallel ranks this servicer serves, in order: the engine
+    client's managed ranks (a slice of all the ranks under external or
     hybrid load balancing, from ``data_parallel_rank`` on), else that start
-    rank from the config, else 0. ``GetLoads`` reports this rank, and its
-    pushed record is the one that carries the servicer's estimate, as the
-    first entry of the Rust servicer's ``GetLoads`` does."""
+    rank from the config alone, else rank 0. ``GetLoads`` reports each of
+    them, as the Rust servicer's does."""
     managed = getattr(getattr(engine, "engine_core", None), "engine_ranks_managed", None)
     if isinstance(managed, (list, tuple, range)):
-        ranks = [rank for rank in managed if isinstance(rank, int)]
+        ranks = sorted({rank for rank in managed if isinstance(rank, int)})
         if ranks:
-            return min(ranks)
-    parallel = getattr(getattr(engine, "vllm_config", None), "parallel_config", None)
-    start = getattr(parallel, "data_parallel_rank", 0)
-    return start if isinstance(start, int) and start > 0 else 0
+            return ranks
+    return [EngineConfigView(getattr(engine, "vllm_config", None)).parallel.data_parallel_rank]
+
+
+def _first_rank(engine) -> int:
+    """The lowest data-parallel rank this servicer serves (the first of
+    :func:`_managed_ranks`): the rank a request that names none is counted
+    on, and the one whose load entry is zero-filled before its first
+    snapshot rather than left out."""
+    return _managed_ranks(engine)[0]
+
+
+def _rank_in_flight(engine, request_id: str, choice: int = 0) -> int | None:
+    """The data-parallel rank vLLM's load-balancing engine client routed
+    ``request_id`` to, while the request is in flight: for an ``n > 1``
+    request the rank of its ``choice``, each choice being a request of its
+    own to the engine. The client keeps the engine of every request it
+    routed, to route its abort (``reqs_in_flight``, keyed by the engine's
+    internal request id, valued with the engine's two-byte identity, which
+    is its rank), and the output processor keeps the internal ids under the
+    id the caller gave (``external_req_ids``; a choice's id starts with its
+    index). ``None`` when the client keeps no such table (one engine), the
+    request is not routed yet, or it has finished."""
+    table = getattr(getattr(engine, "engine_core", None), "reqs_in_flight", None)
+    names = getattr(getattr(engine, "output_processor", None), "external_req_ids", None)
+    if not isinstance(table, dict) or not isinstance(names, dict):
+        return None
+    internal_ids = list(names.get(request_id) or ())
+    own = [internal_id for internal_id in internal_ids if internal_id.startswith(f"{choice}_")]
+    for internal_id in own + [
+        internal_id for internal_id in internal_ids if internal_id not in own
+    ]:
+        identity = table.get(internal_id)
+        if isinstance(identity, (bytes, bytearray)) and len(identity) == 2:
+            return int.from_bytes(identity, "little")
+    return None
+
+
+def _routed_rank(engine, request_id: str, choice: int = 0) -> int | None:
+    """The rank an unpinned request (its ``choice``) went to, for its queued
+    prompt: the one the engine's load-balancing client routed it to (see
+    :func:`_rank_in_flight`), this servicer's first rank when the client
+    keeps no routing table (one engine: every request is its), ``None``
+    while the request is not routed yet."""
+    if not isinstance(getattr(getattr(engine, "engine_core", None), "reqs_in_flight", None), dict):
+        return _first_rank(engine)
+    return _rank_in_flight(engine, request_id, choice)
+
+
+def _request_rank(
+    engine,
+    request_id: str,
+    pinned: int | None,
+    choice: int = 0,
+    remembered: int | None = None,
+) -> int:
+    """The rank serving ``request_id`` (its ``choice``) from its first output
+    on, for the load tracker: the one the engine's client routed it to while
+    it is in flight (a pinned request is in that table too); else the rank
+    the tracker learned for it while it was queued (``remembered``: a
+    request the engine has already retired, whose only output was its last,
+    is in neither table any more); else the rank the request named; else
+    this servicer's first rank."""
+    rank = _routed_rank(engine, request_id, choice)
+    if rank is not None:
+        return rank
+    if remembered is not None:
+        return remembered
+    if pinned is not None:
+        return int(pinned)
+    return _first_rank(engine)
 
 
 def _latest_scheduler_stats(engine, engine_idx: int = 0):
@@ -218,10 +284,16 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)
         # Queued token-work, generation throughput and hit rate for GetLoads,
-        # from the requests this servicer forwards (vLLM's stats carry none).
-        self._loads = LoadTracker()
+        # per rank, from the requests this servicer forwards (vLLM's stats
+        # carry none); an unpinned request's queued prompt counts on the rank
+        # the engine routes it to, read once it has.
+        self._loads = LoadTracker(rank_of=lambda request_id: _routed_rank(async_llm, request_id))
         # Flag > env > default, resolved once so each value names its source.
         self._mm_settings = (mm_settings or launcher_settings() or MmSettings()).resolve()
+        # The engine's encoder budget, derived once (vLLM's helper builds the
+        # largest item the model's processor can produce) and advertised so
+        # the Router's media pipeline refuses a larger item before the engine.
+        self._mm_encoder_budget = mm_encoder_budget(getattr(async_llm, "vllm_config", None))
         # Worker-side media processing (media_refs); None keeps refs rejected.
         self._mm_processor = build_mm_processor(async_llm, settings=self._mm_settings)
         # One cap over all the multimodal work this servicer runs off the event
@@ -315,7 +387,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         input_type = request.WhichOneof("input")
         # One batch per modality: `mm_inputs`, then `extra_mm_inputs` for a
         # request that mixes image and video. A pixel-less mm payload with
-        # grid tensors is the PD decode leg's form: enough to rebuild mm
+        # grid tensors is the PD decode side's form: enough to rebuild mm
         # features (positions + block hashing).
         preprocessed_batches = [
             batch for batch in mm_batches(request) if has_preprocessed_mm_payload(batch)
@@ -334,7 +406,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         )
 
         kv_transfer_params: dict | None = None
-        # What a PD prefill leg learned about its media, for the decode leg.
+        # What a PD prefill side learned about its media, for the decode side.
         media_identity = None
         engine_started = False
         try:
@@ -368,7 +440,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
                 finally:
                     self._mm_inflight.release()
-                # A PD prefill leg answers with the identity so decode is
+                # A PD prefill side answers with the identity so decode is
                 # served without pixels or references. The identity is an
                 # optimisation with a fallback (decode reprocesses), so a
                 # shape it cannot read must not fail a served request.
@@ -378,7 +450,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                             media_identity = build_media_identity(prompt)
                         except Exception as e:  # noqa: BLE001 - any failure falls back
                             logger.warning(
-                                "Request %s: media identity not built (%s); the decode leg "
+                                "Request %s: media identity not built (%s); the decode side "
                                 "will reprocess the media",
                                 request_id,
                                 e,
@@ -387,11 +459,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     else:
                         logger.warning(
                             "Request %s: the installed smg-grpc-proto has no media_identity; "
-                            "the decode leg will reprocess the media",
+                            "the decode side will reprocess the media",
                             request_id,
                         )
             elif has_preprocessed_mm and input_type == "tokenized":
-                # A pixel-less payload (PD decode leg) is only decodable with
+                # A pixel-less payload (PD decode side) is only decodable with
                 # remote KV: a local recompute would schedule the vision
                 # encoder with no pixels and crash the engine.
                 # Every batch needs its own, not just one of them: a batch left
@@ -421,16 +493,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 prompt: TokensPrompt = {"prompt_token_ids": list(request.tokenized.input_ids)}
                 if request.tokenized.original_text:
                     prompt["prompt"] = request.tokenized.original_text
-                # Tensor-less mm payload (grid-less PD decode leg): fold the
+                # Tensor-less mm payload (grid-less PD decode side): fold the
                 # kept mm hashes into cache_salt so different images cannot
-                # alias. Grid-carrying legs took the preprocessed path above.
+                # alias. Grid-carrying sides took the preprocessed path above.
                 batches = mm_batches(request)
                 if batches:
                     cache_salt = mm_identity_cache_salt(mm_identity_hashes(batches))
                     if cache_salt is not None:
                         prompt["cache_salt"] = cache_salt
-                    model_config = getattr(self.engine, "model_config", None)
-                    if model_config is not None and getattr(model_config, "uses_mrope", False):
+                    if uses_mrope(getattr(self.engine, "model_config", None)):
                         logger.warning(
                             "Request %s carries mm identity but no grid tensors on an "
                             "M-RoPE model; decode-side positions will be text-only",
@@ -455,25 +526,54 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # Track which indices have sent their first chunk
             seen_indices: set[int] = set()
 
-            self._loads.submitted(request_id, _prompt_length(prompt))
+            pinned_rank = (
+                request.data_parallel_rank if request.HasField("data_parallel_rank") else None
+            )
+            # The rank the request goes to: the pin, else the engine's choice,
+            # which the tracker reads once the engine has routed it (at every
+            # load read while the request is queued) and this loop reads when
+            # a choice first shows up (each choice of an n > 1 request is
+            # routed on its own); a non-streamed request's only output comes
+            # once the engine has retired it, so the tracker's reading is
+            # what names its rank then.
+            self._loads.submitted(request_id, _prompt_length(prompt), rank=pinned_rank)
+            ranks: dict[int, int] = {}
+            remembered: int | None = None
+
+            def rank_of(choice: int) -> int:
+                nonlocal remembered
+                if choice not in ranks:
+                    if not ranks:
+                        # Read once, at the first choice: the first output
+                        # takes the request out of the tracker's queue, and
+                        # the other choices of a retired request need it too.
+                        remembered = self._loads.pending_rank(request_id)
+                    ranks[choice] = _request_rank(
+                        self.engine, request_id, pinned_rank, choice, remembered=remembered
+                    )
+                return ranks[choice]
+
             async for output in self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
                 tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers(context.invocation_metadata()),
-                data_parallel_rank=(
-                    request.data_parallel_rank if request.HasField("data_parallel_rank") else None
-                ),
+                data_parallel_rank=pinned_rank,
             ):
                 if not engine_started:
+                    # The prompt's cached count is the reporting choice's
+                    # (the first output of an n > 1 request is whichever
+                    # choice stepped first).
                     self._loads.first_output(
                         request_id,
                         len(output.prompt_token_ids or ()),
                         getattr(output, "num_cached_tokens", 0) or 0,
+                        rank=rank_of(output.outputs[0].index if output.outputs else 0),
                     )
                 engine_started = True
-                self._loads.generated(sum(len(c.token_ids) for c in output.outputs))
+                for completion in output.outputs:
+                    self._loads.generated(len(completion.token_ids), rank=rank_of(completion.index))
                 # For streaming, send chunks for EACH completion output (n outputs)
                 if request.stream:
                     for completion in output.outputs:
@@ -763,12 +863,17 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # pipeline to hold requests to; likewise absent from an older package.
         if "mm_item_limits" in info.DESCRIPTOR.fields_by_name:
             info.mm_item_limits = mm_item_limits(self.engine.vllm_config)
+        # The engine's encoder budget, for the Router's media pipeline to
+        # refuse an item the engine could never place; likewise absent from
+        # an older package.
+        if self._mm_encoder_budget and "mm_encoder_budget" in info.DESCRIPTOR.fields_by_name:
+            info.mm_encoder_budget = self._mm_encoder_budget
         # The engine's reasoning parser and where it starts a grammar on a
         # thinking prompt, for the Router to shape a forced tool call's
         # grammar by; likewise absent from an older package.
-        if "structured_outputs_start" in info.DESCRIPTOR.fields_by_name:
+        if "constrained_decoding_start" in info.DESCRIPTOR.fields_by_name:
             info.engine_reasoning_parser = engine_reasoning_parser(self.engine.vllm_config)
-            info.structured_outputs_start = structured_outputs_start(self.engine.vllm_config)
+            info.constrained_decoding_start = constrained_decoding_start(self.engine.vllm_config)
         return info
 
     async def GetLoads(
@@ -779,23 +884,26 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         """
         Handle load-metric requests.
 
-        Reads the latest SchedulerStats snapshot cached on the engine's stat
-        loggers and maps it onto a single-DP-rank SchedulerLoad: ``token_usage``
-        carries KV-cache utilization ([0,1)) and ``num_running_reqs`` /
+        One SchedulerLoad per data-parallel rank this servicer serves (see
+        ``_managed_ranks``), from the latest SchedulerStats snapshot cached
+        on the engine's stat loggers for that rank: ``token_usage`` carries
+        KV-cache utilization ([0,1)) and ``num_running_reqs`` /
         ``num_waiting_reqs`` report queue depth. ``num_waiting_uncached_tokens``,
         ``gen_throughput`` and ``cache_hit_rate`` come from this servicer's own
-        bookkeeping of the requests it forwards (``smg_grpc_servicer.vllm.loads``),
-        since vLLM's stats do not carry them.
+        bookkeeping of the requests it forwards, per rank
+        (``smg_grpc_servicer.vllm.loads``), since vLLM's stats do not carry them.
+        The entries are the figures the ranks' pushed load records carry, so
+        a poll refreshes every rank, those whose event stream is quiet too.
 
-        Always returns exactly one SchedulerLoad entry (zero-filled when no
-        snapshot is available yet, e.g. with --disable-log-stats or before the
-        first engine step) so callers treat the worker as responsive rather than
-        dropping the poll.
+        The first rank's entry is always present (zero-filled when no snapshot
+        is available yet, e.g. with --disable-log-stats or before the first
+        engine step) so callers treat the worker as responsive rather than
+        dropping the poll; another rank without a readable snapshot gets no
+        entry rather than another rank's figures (see ``_rank_counts``).
 
-        Note: ``request.dp_rank`` and ``request.include`` are accepted but not yet
-        applied — vLLM reports a single DP rank (the servicer's first, see
-        ``_first_rank``; ``dp_rank_count=1``) with only core metrics, so there is
-        nothing to filter. They are reserved for future multi-DP /
+        Note: ``request.dp_rank`` and ``request.include`` are accepted but not
+        yet applied — every served rank is reported with only core metrics, so
+        there is nothing to filter. They are reserved for future
         sectioned-metrics support.
 
         Args:
@@ -805,25 +913,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Returns:
             GetLoadsResponse protobuf
         """
-        first_rank = _first_rank(self.engine)
-        num_running, num_waiting, kv_usage = self._scheduler_counts(first_rank) or (0, 0, 0.0)
-        load = vllm_engine_pb2.SchedulerLoad(
-            **scheduler_load_fields(
-                num_running,
-                num_waiting,
-                kv_usage,
-                self._loads.estimate(num_waiting),
-                dp_rank=first_rank,
-                max_total_num_tokens=_kv_capacity_tokens(self.engine),
-                max_running_requests=_max_running_requests(self.engine),
-            )
-        )
-
+        loads = self._scheduler_loads()
         return vllm_engine_pb2.GetLoadsResponse(
             timestamp=datetime.now(timezone.utc).isoformat(),
             version=VLLM_VERSION,
-            dp_rank_count=1,
-            loads=[load],
+            dp_rank_count=len(loads),
+            loads=loads,
         )
 
     def _scheduler_counts(self, engine_idx: int = 0) -> tuple[int, int, float] | None:
@@ -841,35 +936,70 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             float(getattr(stats, "kv_cache_usage", 0.0) or 0.0),
         )
 
+    def _rank_counts(self, rank: int) -> tuple[int, int, float] | None:
+        """``rank``'s running, waiting and KV usage for a load report
+        (``GetLoads`` and the pushed record alike): its own snapshot's;
+        zeros for the servicer's first rank before its first snapshot, so a
+        poll always has an entry to read; ``None`` for another rank whose
+        snapshot the servicer cannot read, which gets no entry rather than
+        another rank's figures or zeros that read as idle."""
+        counts = self._scheduler_counts(rank)
+        if counts is None and rank == _first_rank(self.engine):
+            return (0, 0, 0.0)
+        return counts
+
+    def _scheduler_loads(self) -> list[vllm_engine_pb2.SchedulerLoad]:
+        """The ``GetLoads`` entries: one per rank this servicer serves (see
+        ``_managed_ranks``) with counts to report (see ``_rank_counts``),
+        each with that rank's own counts and this servicer's own estimate
+        for it, the figures the rank's pushed record carries
+        (``_load_record``)."""
+        max_total_num_tokens = _kv_capacity_tokens(self.engine)
+        max_running_requests = _max_running_requests(self.engine)
+        loads = []
+        for rank in _managed_ranks(self.engine):
+            counts = self._rank_counts(rank)
+            if counts is None:
+                continue
+            num_running, num_waiting, kv_usage = counts
+            loads.append(
+                vllm_engine_pb2.SchedulerLoad(
+                    **scheduler_load_fields(
+                        num_running,
+                        num_waiting,
+                        kv_usage,
+                        self._loads.estimate(num_waiting, rank=rank),
+                        dp_rank=rank,
+                        max_total_num_tokens=max_total_num_tokens,
+                        max_running_requests=max_running_requests,
+                    )
+                )
+            )
+        return loads
+
     def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
         """The load record the KV-event stream carries for the batch's rank
         (the servicer's first rank when it names none, see ``_first_rank``):
-        that rank's own scheduler counts, with this servicer's queued-work
-        estimate on the first rank only, as the Rust servicer stamps its
-        batches. A rank whose snapshot the servicer cannot read gets no
-        record rather than another rank's figures; the first rank reports
-        zeros before its first snapshot, as ``GetLoads`` does."""
-        try:
-            first_rank = _first_rank(self.engine)
-            rank = first_rank if dp_rank is None else dp_rank
-            counts = self._scheduler_counts(rank)
-            if counts is None:
-                if rank != first_rank:
-                    return None
-                counts = (0, 0, 0.0)
-            num_running, num_waiting, kv_usage = counts
-            return load_record(
-                num_running,
-                num_waiting,
-                kv_usage,
-                self._loads.estimate(num_waiting) if rank == first_rank else None,
-                dp_rank=rank,
-                max_total_num_tokens=_kv_capacity_tokens(self.engine),
-                max_running_requests=_max_running_requests(self.engine),
-            )
-        except Exception:  # noqa: BLE001 - a record that cannot be read leaves the batch without one
-            logger.debug("load record unavailable", exc_info=True)
+        that rank's own scheduler counts and this servicer's own queued-work,
+        throughput and hit-rate figures for that rank, as the Rust servicer
+        stamps its batches. A rank whose snapshot the servicer cannot read
+        gets no record rather than another rank's figures; the first rank
+        reports zeros before its first snapshot, as ``GetLoads`` does (see
+        ``_rank_counts``). A read that raises is the recorder's to report."""
+        rank = _first_rank(self.engine) if dp_rank is None else dp_rank
+        counts = self._rank_counts(rank)
+        if counts is None:
             return None
+        num_running, num_waiting, kv_usage = counts
+        return load_record(
+            num_running,
+            num_waiting,
+            kv_usage,
+            self._loads.estimate(num_waiting, rank=rank),
+            dp_rank=rank,
+            max_total_num_tokens=_kv_capacity_tokens(self.engine),
+            max_running_requests=_max_running_requests(self.engine),
+        )
 
     async def GetTokenizer(
         self,
@@ -912,17 +1042,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             sha256,
         )
 
-        # Stream chunks; SHA-256 only on the final chunk
-        offset = 0
-        total = len(zip_data)
-        while offset < total:
-            end = min(offset + CHUNK_SIZE, total)
-            is_last = end == total
-            yield common_pb2.GetTokenizerChunk(
-                data=bytes(zip_data[offset:end]),
-                sha256=sha256 if is_last else "",
-            )
-            offset = end
+        for chunk in tokenizer_chunks(zip_data, sha256):
+            yield chunk
 
     # ========== Helper methods ==========
 
@@ -940,7 +1061,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         """Build vLLM MultiModalInput from preprocessed proto data.
 
         Bypasses HF processor entirely — the tensors were already computed by
-        the Rust router. Pixel values are optional: the PD decode leg carries
+        the Rust router. Pixel values are optional: the PD decode side carries
         only the grid tensors (positions + block hashing need no pixels).
         Field layouts (batched / flat / shared) are also determined by the
         router via ``batched_keys`` and ``flat_keys`` proto fields.
@@ -975,7 +1096,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
             num_items = len(mm_proto.mm_placeholders)
 
-            # Deserialize all tensors from proto. The PD decode leg carries no
+            # Deserialize all tensors from proto. The PD decode side carries no
             # pixel_values (KV arrives via the P/D transfer), only grid tensors.
             # The primary tensor is registered under the model's forward kwarg
             # (``encoder_input_key``; DeepSeek-V4.1 takes ``patches``), the same
@@ -1314,7 +1435,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                        If None, uses output.outputs[0] for backwards compatibility.
             num_logprobs: Number of top logprobs for output tokens
             num_prompt_logprobs: Number of top logprobs for prompt tokens
-            media_identity: A PD prefill leg's processed media, for the decode leg
+            media_identity: A PD prefill side's processed media, for the decode side
 
         Returns:
             GenerateResponse with complete field set
@@ -1350,7 +1471,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             num_prompt_logprobs,
         )
 
-        # Connector KV-transfer params returned by the engine (PD prefill leg)
+        # Connector KV-transfer params returned by the engine (PD prefill side)
         kv_transfer_params, kv_transfer_params_json = params_to_response_fields(
             output.kv_transfer_params
         )

@@ -13,12 +13,13 @@ use super::{
         validate_stop, ChatLogProbs, ContextManagementEntry, ConversationRef, Detail, Function,
         FunctionChoice, GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo,
         ResponsePrompt, StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
-        ToolChoiceValue as ChatToolChoiceValue, ToolReference, UsageInfo,
+        ToolChoiceValue as ChatToolChoiceValue, ToolReference, Usage, UsageInfo,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
 use crate::{
-    builders::ResponsesResponseBuilder, profile::is_openai_vendor_model, validated::Normalizable,
+    builders::ResponsesResponseBuilder, common::invalid, profile::is_openai_vendor_model,
+    validated::Normalizable,
 };
 
 // ============================================================================
@@ -1635,14 +1636,13 @@ impl StringOrContentParts {
             Self::Array(parts) => {
                 let mut text = String::new();
                 for part in parts {
-                    match part {
-                        ResponseContentPart::InputText { text: part }
-                        | ResponseContentPart::OutputText { text: part, .. } => text.push_str(part),
-                        _ => return Err(
+                    let Some(part) = part.text() else {
+                        return Err(
                             "Multimodal function output is not supported by this text-only backend"
                                 .to_string(),
-                        ),
-                    }
+                        );
+                    };
+                    text.push_str(part);
                 }
                 Ok(text)
             }
@@ -2203,6 +2203,17 @@ pub enum ResponseContentPart {
     /// `ResponseOutputRefusal`).
     #[serde(rename = "refusal")]
     Refusal { refusal: String },
+}
+
+impl ResponseContentPart {
+    /// The text a part carries toward the prompt: an input or output text
+    /// part's text; none for an image, a file or a refusal.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::OutputText { text, .. } | Self::InputText { text } => Some(text),
+            Self::InputImage { .. } | Self::InputFile { .. } | Self::Refusal { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -2990,6 +3001,33 @@ impl From<UsageInfo> for ResponseUsage {
     }
 }
 
+/// The usage of an answer as the Responses API reports it, from the usage of
+/// a chat-style answer: the three counts with both detail objects present,
+/// zero included, the cached and reasoning counts read from the details the
+/// usage carries. A response's final object and its `response.completed`
+/// event build their usage here, so the two are the same.
+impl From<&Usage> for ResponseUsage {
+    fn from(usage: &Usage) -> Self {
+        Self {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            input_tokens_details: usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(InputTokensDetails::from)
+                .unwrap_or_default(),
+            output_tokens_details: OutputTokensDetails {
+                reasoning_tokens: usage
+                    .completion_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.reasoning_tokens)
+                    .unwrap_or(0),
+            },
+        }
+    }
+}
+
 impl ResponseUsage {
     /// Convert back to standard UsageInfo format
     pub fn to_usage_info(&self) -> UsageInfo {
@@ -3075,9 +3113,12 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
 
-    /// Maximum number of output tokens (the public API's minimum is 16)
+    /// Maximum number of output tokens. At least 1, as `max_tokens` on the
+    /// chat endpoint: the vendors' Responses contracts accept small values
+    /// (a one-word answer under 8), so the public API's own floor of 16 is
+    /// not imposed on the models served here.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[validate(custom(function = "validate_max_output_tokens"))]
+    #[validate(range(min = 1))]
     pub max_output_tokens: Option<u32>,
 
     /// Maximum number of tool calls
@@ -3347,47 +3388,17 @@ impl GenerationRequest for ResponsesRequest {
 
                 for item in items {
                     match item {
-                        ResponseInputOutputItem::Message { content, .. } => {
-                            for part in content {
-                                let text = match part {
-                                    ResponseContentPart::OutputText { text, .. } => {
-                                        Some(text.as_str())
-                                    }
-                                    ResponseContentPart::InputText { text } => Some(text.as_str()),
-                                    // Non-text parts (images, files, refusals) contribute no
-                                    // prompt text; skip without appending.
-                                    ResponseContentPart::InputImage { .. }
-                                    | ResponseContentPart::InputFile { .. }
-                                    | ResponseContentPart::Refusal { .. } => None,
-                                };
-                                if let Some(t) = text {
-                                    append_text(t);
-                                }
-                            }
-                        }
+                        ResponseInputOutputItem::Message { content, .. } => content
+                            .iter()
+                            .filter_map(ResponseContentPart::text)
+                            .for_each(&mut append_text),
                         ResponseInputOutputItem::SimpleInputMessage { content, .. } => {
                             match content {
-                                StringOrContentParts::String(s) => {
-                                    append_text(s.as_str());
-                                }
-                                StringOrContentParts::Array(parts) => {
-                                    for part in parts {
-                                        let text = match part {
-                                            ResponseContentPart::OutputText { text, .. } => {
-                                                Some(text.as_str())
-                                            }
-                                            ResponseContentPart::InputText { text } => {
-                                                Some(text.as_str())
-                                            }
-                                            ResponseContentPart::InputImage { .. }
-                                            | ResponseContentPart::InputFile { .. }
-                                            | ResponseContentPart::Refusal { .. } => None,
-                                        };
-                                        if let Some(t) = text {
-                                            append_text(t);
-                                        }
-                                    }
-                                }
+                                StringOrContentParts::String(s) => append_text(s.as_str()),
+                                StringOrContentParts::Array(parts) => parts
+                                    .iter()
+                                    .filter_map(ResponseContentPart::text)
+                                    .for_each(&mut append_text),
                             }
                         }
                         ResponseInputOutputItem::Reasoning { content, .. } => {
@@ -3437,11 +3448,12 @@ impl GenerationRequest for ResponsesRequest {
 pub fn validate_conversation_id(conv: &ConversationRef) -> Result<(), ValidationError> {
     let conv_id = conv.as_id();
     if !conv_id.starts_with("conv_") {
-        let mut error = ValidationError::new("invalid_conversation_id");
-        error.message = Some(std::borrow::Cow::Owned(format!(
-            "Invalid 'conversation': '{conv_id}'. Expected an ID that begins with 'conv_'."
-        )));
-        return Err(error);
+        return Err(invalid(
+            "invalid_conversation_id",
+            format!(
+                "Invalid 'conversation': '{conv_id}'. Expected an ID that begins with 'conv_'."
+            ),
+        ));
     }
 
     // Check if the conversation ID contains only valid characters
@@ -3450,11 +3462,12 @@ pub fn validate_conversation_id(conv: &ConversationRef) -> Result<(), Validation
         .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
 
     if !is_valid {
-        let mut error = ValidationError::new("invalid_conversation_id");
-        error.message = Some(std::borrow::Cow::Owned(format!(
-            "Invalid 'conversation': '{conv_id}'. Expected an ID that contains letters, numbers, underscores, or dashes, but this value contained additional characters."
-        )));
-        return Err(error);
+        return Err(invalid(
+            "invalid_conversation_id",
+            format!(
+                "Invalid 'conversation': '{conv_id}'. Expected an ID that contains letters, numbers, underscores, or dashes, but this value contained additional characters."
+            ),
+        ));
     }
     Ok(())
 }
@@ -3473,9 +3486,10 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
 
     // Check if tool_choice requires tools but none are provided
     if is_some_choice && !has_tools {
-        let mut e = ValidationError::new("tool_choice_requires_tools");
-        e.message = Some("Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.".into());
-        return Err(e);
+        return Err(invalid(
+            "tool_choice_requires_tools",
+            "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
+        ));
     }
 
     // Validate tool references exist when tools are present
@@ -3513,14 +3527,12 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
                     _ => false,
                 });
                 if !found {
-                    let mut e = ValidationError::new("tool_choice_function_not_found");
-                    e.message = Some(
+                    return Err(invalid(
+                        "tool_choice_function_not_found",
                         format!(
-                            "Invalid value for 'tool_choice': function '{name}' not found in 'tools'.",
-                        )
-                        .into(),
-                    );
-                    return Err(e);
+                            "Invalid value for 'tool_choice': function '{name}' not found in 'tools'."
+                        ),
+                    ));
                 }
             }
         }
@@ -3531,28 +3543,24 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
         } => {
             // Validate mode is "auto" or "required"
             if mode != "auto" && mode != "required" {
-                let mut e = ValidationError::new("tool_choice_invalid_mode");
-                e.message = Some(
+                return Err(invalid(
+                    "tool_choice_invalid_mode",
                     format!(
                         "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{mode}'."
-                    )
-                    .into(),
-                );
-                return Err(e);
+                    ),
+                ));
             }
 
             // Validate that all function tool references exist
             for tool_ref in allowed_tools {
                 if let ToolReference::Function { name } = tool_ref {
                     if !function_tool_names.contains(&name.as_str()) {
-                        let mut e = ValidationError::new("tool_choice_tool_not_found");
-                        e.message = Some(
+                        return Err(invalid(
+                            "tool_choice_tool_not_found",
                             format!(
                                 "Invalid value for 'tool_choice.tools': tool '{name}' not found in 'tools'."
-                            )
-                            .into(),
-                        );
-                        return Err(e);
+                            ),
+                        ));
                     }
                 }
                 // Note: MCP and hosted tools don't need existence validation here
@@ -3584,9 +3592,10 @@ fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(),
 
     // 3. Validate conversation and previous_response_id are mutually exclusive
     if request.conversation.is_some() && request.previous_response_id.is_some() {
-        let mut e = ValidationError::new("mutually_exclusive_parameters");
-        e.message = Some("Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.".into());
-        return Err(e);
+        return Err(invalid(
+            "mutually_exclusive_parameters",
+            "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
+        ));
     }
 
     // 4. The public OpenAI API's rules on request content beyond the schema
@@ -3621,15 +3630,13 @@ fn validate_openai_structured_output_rules(
         let function = &function_tool.function;
         if function.strict == Some(true) {
             if let Some(path) = strict_schema_missing_additional_properties(&function.parameters) {
-                let mut e = ValidationError::new("invalid_function_parameters");
-                e.message = Some(
+                return Err(invalid(
+                    "invalid_function_parameters",
                     format!(
                         "Invalid schema for function '{}': In context={path}, 'additionalProperties' is required to be supplied and to be false.",
                         function.name
-                    )
-                    .into(),
-                );
-                return Err(e);
+                    ),
+                ));
             }
         }
     }
@@ -3642,23 +3649,19 @@ fn validate_openai_structured_output_rules(
             ..
         }) => {
             if let Some(path) = strict_schema_missing_additional_properties(schema) {
-                let mut e = ValidationError::new("invalid_json_schema");
-                e.message = Some(
+                return Err(invalid(
+                    "invalid_json_schema",
                     format!(
                         "Invalid schema for response_format '{name}': In context={path}, 'additionalProperties' is required to be supplied and to be false."
-                    )
-                    .into(),
-                );
-                return Err(e);
+                    ),
+                ));
             }
         }
         Some(TextFormat::JsonObject) if !request_mentions_json(request) => {
-            let mut e = ValidationError::new("json_object_requires_json_in_input");
-            e.message = Some(
-                "Response input messages must contain the word 'json' in some form to use 'text.format' of type 'json_object'."
-                    .into(),
-            );
-            return Err(e);
+            return Err(invalid(
+                "json_object_requires_json_in_input",
+                "Response input messages must contain the word 'json' in some form to use 'text.format' of type 'json_object'.",
+            ));
         }
         _ => {}
     }
@@ -3690,23 +3693,6 @@ fn request_mentions_json(request: &ResponsesRequest) -> bool {
     }
 }
 
-/// The public API's `max_output_tokens` minimum.
-const MIN_MAX_OUTPUT_TOKENS: u32 = 16;
-
-fn validate_max_output_tokens(value: u32) -> Result<(), ValidationError> {
-    if value < MIN_MAX_OUTPUT_TOKENS {
-        let mut e = ValidationError::new("integer_below_min_value");
-        e.message = Some(
-            format!(
-                "Invalid 'max_output_tokens': integer below minimum value. Expected a value >= {MIN_MAX_OUTPUT_TOKENS}, but got {value} instead."
-            )
-            .into(),
-        );
-        return Err(e);
-    }
-    Ok(())
-}
-
 /// The public API's metadata limits: 16 pairs, 64-character keys, 512-character string values.
 const MAX_METADATA_PAIRS: usize = 16;
 const MAX_METADATA_KEY_CHARS: usize = 64;
@@ -3714,39 +3700,33 @@ const MAX_METADATA_VALUE_CHARS: usize = 512;
 
 fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), ValidationError> {
     if metadata.len() > MAX_METADATA_PAIRS {
-        let mut e = ValidationError::new("object_above_max_properties");
-        e.message = Some(
+        return Err(invalid(
+            "object_above_max_properties",
             format!(
                 "Invalid 'metadata': too many properties. The object has {} properties, but the maximum is {MAX_METADATA_PAIRS}.",
                 metadata.len()
-            )
-            .into(),
-        );
-        return Err(e);
+            ),
+        ));
     }
     for (key, value) in metadata {
         if key.chars().count() > MAX_METADATA_KEY_CHARS {
-            let mut e = ValidationError::new("string_above_max_length");
-            e.message = Some(
+            return Err(invalid(
+                "string_above_max_length",
                 format!(
                     "Invalid 'metadata': a key is too long. Expected a key with a maximum length of {MAX_METADATA_KEY_CHARS}, but got one of {} characters instead.",
                     key.chars().count()
-                )
-                .into(),
-            );
-            return Err(e);
+                ),
+            ));
         }
         if let Some(text) = value.as_str() {
             if text.chars().count() > MAX_METADATA_VALUE_CHARS {
-                let mut e = ValidationError::new("string_above_max_length");
-                e.message = Some(
+                return Err(invalid(
+                    "string_above_max_length",
                     format!(
                         "Invalid 'metadata.{key}': string too long. Expected a string with maximum length {MAX_METADATA_VALUE_CHARS}, but got a string with length {} instead.",
                         text.chars().count()
-                    )
-                    .into(),
-                );
-                return Err(e);
+                    ),
+                ));
             }
         }
     }
@@ -3760,14 +3740,12 @@ fn validate_input_message_role(role: &str) -> Result<(), ValidationError> {
     if INPUT_MESSAGE_ROLES.contains(&role) {
         return Ok(());
     }
-    let mut e = ValidationError::new("invalid_value");
-    e.message = Some(
+    Err(invalid(
+        "invalid_value",
         format!(
             "Invalid value: '{role}'. Supported values are: 'assistant', 'system', 'developer', and 'user'."
-        )
-        .into(),
-    );
-    Err(e)
+        ),
+    ))
 }
 
 // ============================================================================
@@ -3779,16 +3757,12 @@ fn validate_response_input(input: &ResponseInput) -> Result<(), ValidationError>
     match input {
         ResponseInput::Text(text) => {
             if text.is_empty() {
-                let mut e = ValidationError::new("input_text_empty");
-                e.message = Some("Input text cannot be empty".into());
-                return Err(e);
+                return Err(invalid("input_text_empty", "Input text cannot be empty"));
             }
         }
         ResponseInput::Items(items) => {
             if items.is_empty() {
-                let mut e = ValidationError::new("input_items_empty");
-                e.message = Some("Input items cannot be empty".into());
-                return Err(e);
+                return Err(invalid("input_items_empty", "Input items cannot be empty"));
             }
             // Validate each item has valid content
             for item in items {
@@ -3805,23 +3779,26 @@ fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationE
         ResponseInputOutputItem::Message { content, role, .. } => {
             validate_input_message_role(role)?;
             if content.is_empty() {
-                let mut e = ValidationError::new("message_content_empty");
-                e.message = Some("Message content cannot be empty".into());
-                return Err(e);
+                return Err(invalid(
+                    "message_content_empty",
+                    "Message content cannot be empty",
+                ));
             }
         }
         ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
             validate_input_message_role(role)?;
             match content {
                 StringOrContentParts::String(s) if s.is_empty() => {
-                    let mut e = ValidationError::new("message_content_empty");
-                    e.message = Some("Message content cannot be empty".into());
-                    return Err(e);
+                    return Err(invalid(
+                        "message_content_empty",
+                        "Message content cannot be empty",
+                    ));
                 }
                 StringOrContentParts::Array(parts) if parts.is_empty() => {
-                    let mut e = ValidationError::new("message_content_empty");
-                    e.message = Some("Message content parts cannot be empty".into());
-                    return Err(e);
+                    return Err(invalid(
+                        "message_content_empty",
+                        "Message content parts cannot be empty",
+                    ));
                 }
                 _ => {}
             }
@@ -3844,14 +3821,16 @@ fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationE
         ResponseInputOutputItem::CustomToolCall { .. } => {}
         ResponseInputOutputItem::CustomToolCallOutput { output, .. } => match output {
             CustomToolCallOutputContent::Text(s) if s.is_empty() => {
-                let mut e = ValidationError::new("custom_tool_call_output_empty");
-                e.message = Some("Custom tool call output cannot be empty".into());
-                return Err(e);
+                return Err(invalid(
+                    "custom_tool_call_output_empty",
+                    "Custom tool call output cannot be empty",
+                ));
             }
             CustomToolCallOutputContent::Parts(parts) if parts.is_empty() => {
-                let mut e = ValidationError::new("custom_tool_call_output_empty");
-                e.message = Some("Custom tool call output parts cannot be empty".into());
-                return Err(e);
+                return Err(invalid(
+                    "custom_tool_call_output_empty",
+                    "Custom tool call output parts cannot be empty",
+                ));
             }
             _ => {}
         },
@@ -3909,37 +3888,32 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
             ResponseTool::Function(function_tool) => {
                 let function = &function_tool.function;
                 if !function.parameters.is_object() {
-                    let mut e = ValidationError::new("invalid_type");
-                    e.message = Some(
+                    return Err(invalid(
+                        "invalid_type",
                         format!(
                             "Invalid type for 'tools[{idx}].parameters': expected an object, but got {} instead.",
                             json_type_name(&function.parameters)
-                        )
-                        .into(),
-                    );
-                    return Err(e);
+                        ),
+                    ));
                 }
             }
             // The hosted local_shell tool is not served by the gateway, and the
             // public API no longer accepts it either.
             ResponseTool::LocalShell => {
-                let mut e = ValidationError::new("tool_not_supported");
-                e.message = Some(
-                    format!("Invalid 'tools[{idx}]': the local_shell tool is not supported.")
-                        .into(),
-                );
-                return Err(e);
+                return Err(invalid(
+                    "tool_not_supported",
+                    format!("Invalid 'tools[{idx}]': the local_shell tool is not supported."),
+                ));
             }
             _ => {}
         }
         if let ResponseTool::Mcp(mcp) = tool {
             let raw_label = mcp.server_label.as_str();
             if raw_label.is_empty() {
-                let mut e = ValidationError::new("missing_required_parameter");
-                e.message = Some(
-                    format!("Missing required parameter: 'tools[{idx}].server_label'.").into(),
-                );
-                return Err(e);
+                return Err(invalid(
+                    "missing_required_parameter",
+                    format!("Missing required parameter: 'tools[{idx}].server_label'."),
+                ));
             }
 
             // OpenAI spec-compatible validation: require a non-empty label that starts with a
@@ -3949,38 +3923,32 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
             if !valid {
-                let mut e = ValidationError::new("invalid_server_label");
-                e.message = Some(
+                return Err(invalid(
+                    "invalid_server_label",
                     format!(
                         "Invalid input {raw_label}: 'server_label' must start with a letter and consist of only letters, digits, '-' and '_'"
-                    )
-                    .into(),
-                );
-                return Err(e);
+                    ),
+                ));
             }
 
             let normalized = raw_label.to_lowercase();
             if !seen_mcp_labels.insert(normalized) {
-                let mut e = ValidationError::new("mcp_tool_duplicate_server_label");
-                e.message = Some(
-                    format!("Duplicate MCP server_label '{raw_label}' found in 'tools' parameter.")
-                        .into(),
-                );
-                return Err(e);
+                return Err(invalid(
+                    "mcp_tool_duplicate_server_label",
+                    format!("Duplicate MCP server_label '{raw_label}' found in 'tools' parameter."),
+                ));
             }
 
             // One of `server_url` or `connector_id` is required, and the two
             // are mutually exclusive. Reject payloads that set both so
             // downstream target resolution is unambiguous.
             if mcp.server_url.is_some() && mcp.connector_id.is_some() {
-                let mut e = ValidationError::new("mcp_tool_conflicting_targets");
-                e.message = Some(
+                return Err(invalid(
+                    "mcp_tool_conflicting_targets",
                     format!(
                         "MCP tool with server_label '{raw_label}' sets both 'server_url' and 'connector_id'; exactly one is required."
-                    )
-                    .into(),
-                );
-                return Err(e);
+                    ),
+                ));
             }
         }
     }
@@ -4393,6 +4361,39 @@ impl ResponseReasoningContent {
 mod tests {
     use super::*;
 
+    /// The Responses API usage of a chat-style usage: both detail objects
+    /// present, zero included, the cached and reasoning counts from the
+    /// details the usage carries.
+    #[test]
+    fn response_usage_from_a_usage_carries_both_detail_objects() {
+        let usage = serde_json::to_value(ResponseUsage::from(
+            &Usage::from_counts(71, 16)
+                .with_cached_tokens(5)
+                .with_reasoning_tokens(3),
+        ))
+        .expect("a JSON usage");
+        assert_eq!(
+            usage,
+            serde_json::json!({
+                "input_tokens": 71,
+                "output_tokens": 16,
+                "total_tokens": 87,
+                "input_tokens_details": {"cached_tokens": 5},
+                "output_tokens_details": {"reasoning_tokens": 3},
+            })
+        );
+        let plain = serde_json::to_value(ResponseUsage::from(&Usage::from_counts(71, 16)))
+            .expect("a JSON usage");
+        assert_eq!(
+            plain["input_tokens_details"],
+            serde_json::json!({"cached_tokens": 0})
+        );
+        assert_eq!(
+            plain["output_tokens_details"],
+            serde_json::json!({"reasoning_tokens": 0})
+        );
+    }
+
     /// Lock `as_str()` to the canonical serde tag for the unit variants
     /// — drift between the two would produce inconsistent wire labels
     /// across dispatch paths and serializers.
@@ -4446,5 +4447,112 @@ mod tests {
         }
         let param: ResponseReasoningParam = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(param.effort, Some(ReasoningEffort::Medium));
+    }
+
+    /// The routing text of a Responses request: a text input as is; the
+    /// items' text parts in order, joined by one space, images, files and
+    /// refusals skipped; a simple message's string or its parts; a reasoning
+    /// item's text.
+    #[test]
+    fn the_routing_text_reads_every_text_part_once_in_order() {
+        let request = ResponsesRequest {
+            input: ResponseInput::Items(vec![
+                ResponseInputOutputItem::Message {
+                    id: "m1".to_string(),
+                    role: "user".to_string(),
+                    content: vec![
+                        ResponseContentPart::InputText {
+                            text: "one".to_string(),
+                        },
+                        ResponseContentPart::InputImage {
+                            detail: None,
+                            file_id: None,
+                            image_url: Some("https://a/1.png".to_string()),
+                        },
+                        ResponseContentPart::OutputText {
+                            text: "two".to_string(),
+                            annotations: vec![],
+                            logprobs: None,
+                        },
+                        ResponseContentPart::Refusal {
+                            refusal: "no".to_string(),
+                        },
+                    ],
+                    status: None,
+                    phase: None,
+                },
+                ResponseInputOutputItem::SimpleInputMessage {
+                    content: StringOrContentParts::String("three".to_string()),
+                    role: "user".to_string(),
+                    r#type: None,
+                    phase: None,
+                },
+                ResponseInputOutputItem::SimpleInputMessage {
+                    content: StringOrContentParts::Array(vec![
+                        ResponseContentPart::InputFile {
+                            detail: None,
+                            file_data: None,
+                            file_id: Some("f".to_string()),
+                            file_url: None,
+                            filename: None,
+                        },
+                        ResponseContentPart::InputText {
+                            text: "four".to_string(),
+                        },
+                    ]),
+                    role: "user".to_string(),
+                    r#type: None,
+                    phase: None,
+                },
+                ResponseInputOutputItem::Reasoning {
+                    id: "r1".to_string(),
+                    summary: vec![],
+                    content: vec![ResponseReasoningContent::ReasoningText {
+                        text: "five".to_string(),
+                    }],
+                    encrypted_content: None,
+                    status: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            request.extract_text_for_routing(),
+            "one two three four five"
+        );
+
+        let text = ResponsesRequest {
+            input: ResponseInput::Text("plain".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(text.extract_text_for_routing(), "plain");
+    }
+
+    /// Text-only content takes the text parts and refuses any other part.
+    #[test]
+    fn text_only_content_refuses_a_part_without_text() {
+        let with_image = StringOrContentParts::Array(vec![
+            ResponseContentPart::InputText {
+                text: "a".to_string(),
+            },
+            ResponseContentPart::InputImage {
+                detail: None,
+                file_id: None,
+                image_url: Some("https://a/1.png".to_string()),
+            },
+        ]);
+        assert!(with_image.to_text_only().is_err());
+
+        let text = StringOrContentParts::Array(vec![
+            ResponseContentPart::InputText {
+                text: "a".to_string(),
+            },
+            ResponseContentPart::OutputText {
+                text: "b".to_string(),
+                annotations: vec![],
+                logprobs: None,
+            },
+        ]);
+        assert_eq!(text.to_text_only().unwrap(), "ab");
     }
 }

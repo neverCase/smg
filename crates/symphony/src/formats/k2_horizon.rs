@@ -9,11 +9,7 @@
 //! a turn opens with `<|ifm|im_start|>assistant`, so the prompt's replay starts there. Recorded as
 //! `k2-horizon-36b` (IFM/K2-Horizon-36B).
 //!
-//! What the table leaves out, for want of fixtures: the template picks the thought's tag by
-//! `reasoning_effort` (`<ifm|think_fast>` and `<ifm|think_faster>` below the default), and it can
-//! write the calls as JSON objects or with a typed tag per argument (`tool_call_format`); the
-//! recorded sets hold the default thought and the default calls, read here. A thought under one of
-//! the other tags is content until a set shows it.
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::{
     format::{CallSyntax, Emits, Format},
@@ -52,10 +48,9 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, Text},
-        input::{EngineFinish, Input},
-        parser::Parser,
-        tagged::Declared,
+        event::{DropReason, Event, Text},
+        testing::{arguments_of, bytes, content, drive, reasoning},
+        Declared,
     };
 
     fn declared() -> Declared {
@@ -87,84 +82,7 @@ mod tests {
     );
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::new(k2_horizon(), declared());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        for piece in pieces {
-            parser
-                .feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: piece,
-                        spans: &[],
-                    },
-                    &mut out,
-                )
-                .expect("delta");
-        }
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn arguments_of(events: &[Event], call: u32) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
+        drive(&mut Engine::new(k2_horizon(), declared()), prompt, pieces)
     }
 
     fn dropped(text: &str) -> Event {

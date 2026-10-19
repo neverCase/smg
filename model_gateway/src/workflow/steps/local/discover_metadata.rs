@@ -40,6 +40,7 @@ pub struct ServerInfo {
     pub served_model_name: Option<String>,
     pub tp_size: Option<usize>,
     pub dp_size: Option<usize>,
+    pub attn_dp_size: Option<usize>,
     pub pp_size: Option<usize>,
     pub load_balance_method: Option<String>,
     pub disaggregation_mode: Option<String>,
@@ -52,6 +53,12 @@ pub struct ServerInfo {
     /// closes the HTTP-only path so capacity-aware consumers (e.g. WorkerCapacity)
     /// see the same label regardless of transport.
     pub max_running_requests: Option<usize>,
+    /// Whether the engine splits `max_running_requests` across its
+    /// attention-DP workers (`attn_dp_size` above carries that width as its
+    /// newer releases resolve it): under `--dp-aware` each rank worker then
+    /// gets its share of the window (`create_worker::labels_for_rank`), on
+    /// this path as on the gRPC one.
+    pub enable_dp_attention: Option<bool>,
     pub weight_version: Option<String>,
 }
 
@@ -654,7 +661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_sglang_http_metadata() {
         let labels =
             fetch_sglang_http_metadata(&crate::http_client::client(), "http://0.0.0.0:30000", None)
@@ -665,7 +672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_vllm_http_metadata() {
         let labels =
             fetch_vllm_http_metadata(&crate::http_client::client(), "http://0.0.0.0:20000", None)
@@ -676,7 +683,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_sglang_grpc_metadata() {
         let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:30001", "sglang")
             .await
@@ -686,7 +693,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_vllm_grpc_metadata() {
         let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:20001", "vllm")
             .await
@@ -700,20 +707,63 @@ mod tests {
         // Subset of an actual SGLang /server_info response. The full payload has
         // many more fields; `serde(deny_unknown_fields)` is off by default so
         // they're silently ignored.
+        for (dp_size, attn_dp_size) in [(4, None), (1, Some(4))] {
+            let body = serde_json::json!({
+                "model_path": "Qwen/Qwen3-8B",
+                "tp_size": 4,
+                "dp_size": dp_size,
+                "attn_dp_size": attn_dp_size,
+                "max_running_requests": 256,
+                "context_length": 32768,
+            });
+            let info: ServerInfo = serde_json::from_value(body).expect("deserialize ServerInfo");
+            assert_eq!(info.max_running_requests, Some(256));
+            assert_eq!(info.attn_dp_size, attn_dp_size);
+
+            let labels = flat_labels(&info);
+            assert_eq!(
+                labels.get("max_running_requests").map(String::as_str),
+                Some("256")
+            );
+            let dp_info = super::super::discover_dp::dp_info_from_labels(&labels).unwrap();
+            assert_eq!(dp_info.dp_size, 4);
+        }
+    }
+
+    /// The attention-DP split reaches the labels on this path too, so a
+    /// dp-aware registration over HTTP gives each rank worker its share of
+    /// the window as the gRPC path does.
+    #[test]
+    fn test_sglang_server_info_surfaces_the_attention_dp_split() {
         let body = serde_json::json!({
+            "model_path": "Qwen/Qwen3-8B",
+            "tp_size": 16,
+            "dp_size": 8,
+            "enable_dp_attention": true,
+            "attn_dp_size": 8,
+            "max_running_requests": 16384,
+        });
+        let info: ServerInfo = serde_json::from_value(body).expect("deserialize ServerInfo");
+        let labels = flat_labels(&info);
+        assert_eq!(
+            labels.get("enable_dp_attention").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(labels.get("attn_dp_size").map(String::as_str), Some("8"));
+
+        // Absent fields make no label, so a rank worker of an engine that
+        // reports neither keeps its window as it is.
+        let plain: ServerInfo = serde_json::from_value(serde_json::json!({
             "model_path": "Qwen/Qwen3-8B",
             "tp_size": 1,
             "dp_size": 1,
             "max_running_requests": 256,
-            "context_length": 32768,
-        });
-        let info: ServerInfo = serde_json::from_value(body).expect("deserialize ServerInfo");
-        assert_eq!(info.max_running_requests, Some(256));
-
-        let labels = flat_labels(&info);
-        assert_eq!(
-            labels.get("max_running_requests").map(String::as_str),
-            Some("256")
+        }))
+        .expect("deserialize ServerInfo");
+        let labels = flat_labels(&plain);
+        assert!(
+            !labels.contains_key("enable_dp_attention") && !labels.contains_key("attn_dp_size"),
+            "{labels:?}"
         );
     }
 

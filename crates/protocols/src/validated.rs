@@ -61,7 +61,12 @@ pub struct RejectionCode(pub String);
 /// `param` the offending field when one is known; the code also rides on the
 /// response as a [`RejectionCode`] extension.
 #[cfg(feature = "axum")]
-fn rejection(status: StatusCode, code: &str, param: Option<String>, message: String) -> Response {
+pub(crate) fn rejection(
+    status: StatusCode,
+    code: &str,
+    param: Option<String>,
+    message: String,
+) -> Response {
     let mut response = (
         status,
         Json(json!({
@@ -86,58 +91,96 @@ fn rejection(status: StatusCode, code: &str, param: Option<String>, message: Str
 #[cfg(feature = "axum")]
 const DESERIALIZE_PREFIX: &str = "Failed to deserialize the JSON body into the target type: ";
 
-/// The public API's `code` for a body the deserializer refused, read from
-/// serde's message: `missing_required_parameter` for a field that is not
-/// there, `unknown_parameter` for one the type does not know, `invalid_type`
-/// for a value of the wrong shape (a body that is not an object included),
-/// `invalid_value` for a value outside an enumeration, and
-/// `integer_below_min_value` for a negative integer where the field cannot be
-/// negative; `json_parse_error` for anything else. A JSON array where an
-/// object was expected is a wrong type too, whether serde reports the type
-/// or the length of the sequence.
+/// The words serde opens a reason with, in the order the public API's `code`
+/// is read from them (the longer `invalid value: integer `-` before `invalid
+/// value`): `missing_required_parameter` for a field that is not there,
+/// `unknown_parameter` for one the type does not know, `invalid_value` for a
+/// value outside an enumeration, `integer_below_min_value` for a negative
+/// integer where the field cannot be negative, `invalid_type` for a value of
+/// the wrong shape (a body that is not an object included; a JSON array
+/// where an object was expected is a wrong type too, whether serde reports
+/// the type or the length of the sequence).
+#[cfg(feature = "axum")]
+const SERDE_REASONS: &[(&str, &str)] = &[
+    ("missing field `", "missing_required_parameter"),
+    ("unknown field `", "unknown_parameter"),
+    ("unknown variant `", "invalid_value"),
+    ("invalid value: integer `-", "integer_below_min_value"),
+    ("invalid value", "invalid_value"),
+    ("invalid type", "invalid_type"),
+    ("invalid length", "invalid_type"),
+    ("data did not match any variant", "invalid_type"),
+];
+
+/// Whether `text` opens with one of serde's reasons.
+#[cfg(feature = "axum")]
+fn opens_a_reason(text: &str) -> bool {
+    SERDE_REASONS
+        .iter()
+        .any(|(words, _)| text.starts_with(words))
+}
+
+/// Serde's message without axum's prefix (split at the prefix's first copy:
+/// axum's comes before serde's text, a client's value after it), as the path
+/// serde puts in front of a nested value (`messages[0].content`) and the
+/// reason. The path is the first `: ` split's head when that head reads as a
+/// path (field names and indexes); the reason is the rest, serde's own words
+/// or a custom error's, and a value a custom error repeats cannot move the
+/// split, whatever it says. A key that is no plain path (a space, a colon, a
+/// letter outside ASCII) is a path all the same: the reason is then found by
+/// serde's own words, at the first split whose remainder opens with one
+/// (serde quotes the value it refused after its words, never before). This
+/// order reads two cases wrong: a key with a colon and a space in it, whose
+/// part before the colon reads as a path, is cut at the colon whatever
+/// follows; and a key that is no plain path, in front of a custom error,
+/// keeps no path.
+#[cfg(feature = "axum")]
+fn deserialize_detail(message: &str) -> (Option<&str>, &str) {
+    let detail = message
+        .split_once(DESERIALIZE_PREFIX)
+        .map_or(message, |(_, detail)| detail);
+    if opens_a_reason(detail) {
+        return (None, detail);
+    }
+    let mut splits = detail
+        .match_indices(": ")
+        .map(|(at, _)| (&detail[..at], &detail[at + 2..]));
+    let is_path_char =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '[' | ']' | '-');
+    match splits.next() {
+        Some((head, reason)) if !head.is_empty() && head.chars().all(is_path_char) => {
+            (Some(head), reason)
+        }
+        Some(first) => std::iter::once(first)
+            .chain(splits)
+            .find(|(_, reason)| opens_a_reason(reason))
+            .map_or((None, detail), |(head, reason)| (Some(head), reason)),
+        None => (None, detail),
+    }
+}
+
+/// The public API's `code` for a body the deserializer refused: the code of
+/// the first of [`SERDE_REASONS`] its reason opens with (see
+/// [`deserialize_detail`]), `json_parse_error` for anything else.
 #[cfg(feature = "axum")]
 fn deserialize_code(message: &str) -> &'static str {
-    let detail = message
-        .rsplit_once(DESERIALIZE_PREFIX)
-        .map_or(message, |(_, detail)| detail);
-    if detail.contains("missing field `") {
-        "missing_required_parameter"
-    } else if detail.contains("unknown field `") {
-        "unknown_parameter"
-    } else if detail.contains("unknown variant `") {
-        "invalid_value"
-    } else if detail.contains("invalid value: integer `-") {
-        "integer_below_min_value"
-    } else if detail.contains("invalid value") {
-        "invalid_value"
-    } else if detail.contains("invalid type")
-        || detail.contains("invalid length")
-        || detail.contains("did not match any variant")
-    {
-        "invalid_type"
-    } else {
-        "json_parse_error"
-    }
+    let (_, reason) = deserialize_detail(message);
+    SERDE_REASONS
+        .iter()
+        .find(|(words, _)| reason.starts_with(words))
+        .map_or("json_parse_error", |(_, code)| code)
 }
 
 /// The field a deserialization error is about, as the public API's `param`:
 /// the path serde recorded, the field a `missing field` / `unknown field`
-/// error names, or both (`items[0].role`); None for a syntax error.
+/// reason names, or both (`items[0].role`); None for a syntax error.
 #[cfg(feature = "axum")]
 fn param_from_deserialize_message(message: &str) -> Option<String> {
-    let detail = message
-        .rsplit_once(DESERIALIZE_PREFIX)
-        .map_or(message, |(_, detail)| detail);
-    let is_path_char =
-        |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '[' | ']' | '-');
-    let path = detail
-        .split_once(": ")
-        .map(|(head, _)| head)
-        .filter(|head| !head.is_empty() && head.chars().all(is_path_char));
+    let (path, reason) = deserialize_detail(message);
     let field = ["missing field `", "unknown field `"]
         .iter()
-        .find_map(|marker| detail.split_once(marker))
-        .and_then(|(_, rest)| rest.split_once('`'))
+        .find_map(|marker| reason.strip_prefix(marker))
+        .and_then(|rest| rest.split_once('`'))
         .map(|(field, _)| field);
     match (path, field) {
         // A refused unknown key is already the last segment of serde's path.
@@ -212,7 +255,7 @@ fn public_code(error: &ValidationError) -> String {
         | "credit_card"
         | "phone"
         | "non_control_character" => "invalid_value".to_string(),
-        // A rule whose "code" is a sentence ("messages cannot be empty") has
+        // A rule whose "code" is a sentence ("query cannot be empty") has
         // its text in the message already; the code stays an identifier.
         code if code.contains(char::is_whitespace) => "invalid_value".to_string(),
         code => code.to_string(),
@@ -532,6 +575,57 @@ mod tests {
         }
     }
 
+    /// A Messages body whose `thinking.display` is outside the documented
+    /// set is refused in place: `code` `invalid_value`, `param` the path
+    /// serde recorded, a message that names the field and lists the set.
+    /// One with a documented value goes through.
+    #[tokio::test]
+    async fn a_thinking_display_outside_its_set_is_refused_by_name() {
+        use crate::messages::{CreateMessageRequest, ThinkingConfig, ThinkingDisplay};
+
+        let extract = |display: &str| {
+            let body = json!({
+                "model": "m", "max_tokens": 64,
+                "thinking": {"type": "adaptive", "display": display},
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string();
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap_or_default();
+            ValidatedJson::<CreateMessageRequest>::from_request(request, &())
+        };
+        let Ok(ValidatedJson(accepted)) = extract("updates").await else {
+            panic!("`updates` is refused");
+        };
+        assert!(matches!(
+            accepted.thinking,
+            Some(ThinkingConfig::Adaptive {
+                display: Some(ThinkingDisplay::Updates)
+            })
+        ));
+        let Err(refused) = extract("full").await else {
+            panic!("`full` is accepted");
+        };
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(json["error"]["code"], "invalid_value", "{json}");
+        assert_eq!(json["error"]["param"], "thinking", "{json}");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(
+                "thinking: unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates`"
+            ),
+            "{message}"
+        );
+    }
+
     /// (status, type, code, param) of a rejection; `code` must be a string
     /// and `param` present (a string or null), as in the public API. A
     /// field of the wrong shape is reported in place, so the assertion that
@@ -755,6 +849,12 @@ mod tests {
                 "Invalid JSON data: Failed to deserialize the JSON body into the target type: include[0]: unknown variant `bogus.field`, expected one of `code_interpreter_call.outputs` at line 1 column 60",
                 "invalid_value",
             ),
+            // A custom error that opens with serde's words takes their code:
+            // a `thinking.display` outside its set is refused as a value.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: thinking: unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates` at line 1 column 71",
+                "invalid_value",
+            ),
             (
                 "Invalid JSON data: Failed to deserialize the JSON body into the target type: max_output_tokens: invalid value: integer `-1`, expected u32 at line 1 column 49",
                 "integer_below_min_value",
@@ -776,6 +876,63 @@ mod tests {
                 "invalid_type",
             ),
             ("Missing Content-Type: application/json header", "json_parse_error"),
+            // A value that repeats serde's words does not steer the code: the
+            // reason is read at its start, after the path.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: reasoning_effort: unknown variant `missing field `x`, expected one of `low`, `medium`, `high` at line 1 column 60",
+                "invalid_value",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: messages: invalid type: string \"an invalid value\", expected a sequence at line 1 column 42",
+                "invalid_type",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: invalid type: string \"unknown field `x`\", expected struct ChatCompletionRequest at line 1 column 20",
+                "invalid_type",
+            ),
+            // Nor does a value that repeats axum's prefix: the prefix is split
+            // at its first copy.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: truncation: unknown variant `Failed to deserialize the JSON body into the target type: missing field `x``, expected `auto` or `disabled` at line 1 column 110",
+                "invalid_value",
+            ),
+            // A key with a space, a colon or a letter outside ASCII is a path
+            // like any other: the reason is found by serde's words.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: max tokens: unknown field `max tokens`, expected one of `model`, `input` at line 1 column 19",
+                "unknown_parameter",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: températur: unknown field `températur`, expected one of `model`, `input` at line 1 column 15",
+                "unknown_parameter",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: metadata.user id: invalid type: integer `5`, expected a string at line 1 column 40",
+                "invalid_type",
+            ),
+            // A custom error opens with none of serde's words: no code of
+            // the table, as before.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: reasoning_effort: reasoning_effort must be a string, number, or null at line 1 column 42",
+                "json_parse_error",
+            ),
+            // A custom error that repeats the client's value does not hand
+            // the value the code: the reason starts after the path.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: invalid type\" at line 1 column 44",
+                "json_parse_error",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: missing field `y`\" at line 1 column 48",
+                "json_parse_error",
+            ),
+            // A key this order reads wrong: a colon and a space in it, after a
+            // part that reads as a path, is cut at the colon whatever follows;
+            // here what follows the cut is no reason of serde's.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: a: b: unknown field `a: b`, expected one of `model`, `input` at line 1 column 12",
+                "json_parse_error",
+            ),
         ] {
             assert_eq!(deserialize_code(message), code, "{message}");
         }
@@ -804,9 +961,58 @@ mod tests {
                 "Failed to deserialize the JSON body into the target type: messages[0].content: data did not match any variant of untagged enum Content at line 1 column 60",
                 Some("messages[0].content"),
             ),
+            // A field inside a tagged enum keeps the enum's path: the message
+            // names the field, the param is the path serde recorded.
+            (
+                "Failed to deserialize the JSON body into the target type: thinking: unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates` at line 1 column 71",
+                Some("thinking"),
+            ),
             (
                 "Failed to deserialize the JSON body into the target type: invalid type: integer `5`, expected a string at line 1 column 10",
                 None,
+            ),
+            // A value that repeats a field marker does not steer the param.
+            (
+                "Failed to deserialize the JSON body into the target type: reasoning_effort: unknown variant `missing field `x`, expected one of `low`, `medium`, `high` at line 1 column 60",
+                Some("reasoning_effort"),
+            ),
+            // Nor one that repeats axum's prefix.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: truncation: unknown variant `Failed to deserialize the JSON body into the target type: missing field `x``, expected `auto` or `disabled` at line 1 column 110",
+                Some("truncation"),
+            ),
+            // Keys with a space, a colon or a letter outside ASCII.
+            (
+                "Failed to deserialize the JSON body into the target type: max tokens: unknown field `max tokens`, expected one of `model`, `input` at line 1 column 19",
+                Some("max tokens"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: températur: unknown field `températur`, expected one of `model`, `input` at line 1 column 15",
+                Some("températur"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: metadata.user id: invalid type: integer `5`, expected a string at line 1 column 40",
+                Some("metadata.user id"),
+            ),
+            // A custom error keeps its path, and a value it repeats cannot
+            // move the split that reads the path.
+            (
+                "Failed to deserialize the JSON body into the target type: reasoning_effort: reasoning_effort must be a string, number, or null at line 1 column 42",
+                Some("reasoning_effort"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: invalid type\" at line 1 column 44",
+                Some("function_call"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: missing field `y`\" at line 1 column 48",
+                Some("function_call"),
+            ),
+            // A key read wrong: a colon and a space in it, after a part that
+            // reads as a path, is cut at the colon.
+            (
+                "Failed to deserialize the JSON body into the target type: a: b: unknown field `a: b`, expected one of `model`, `input` at line 1 column 12",
+                Some("a"),
             ),
             ("JSON syntax error: expected value at line 1 column 1", None),
             ("Missing Content-Type: application/json header", None),

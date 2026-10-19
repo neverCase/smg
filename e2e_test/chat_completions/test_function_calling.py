@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
+import httpx
 import openai
 import pytest
 import smg_client
+from infra.constants import get_parser
+from infra.streams import collect_streamed_chat
 
 logger = logging.getLogger(__name__)
 
@@ -216,24 +220,15 @@ class TestOpenAIServerFunctionCalling:
             tools=tools,
         )
 
-        chunks = list(response_stream)
+        streamed = collect_streamed_chat(response_stream)
+        chunks = streamed.chunks
         assert len(chunks) > 0, "Streaming should return at least one chunk"
 
-        found_function_name = False
-        for chunk in chunks:
-            choice = chunk.choices[0]
-            # Check whether the current chunk contains tool_calls
-            if choice.delta.tool_calls:
-                tool_call = choice.delta.tool_calls[0]
-                if tool_call.function.name:
-                    assert tool_call.function.name == "get_current_weather", (
-                        "Function name should be 'get_current_weather'"
-                    )
-                    found_function_name = True
-                    break
-
-        assert found_function_name, (
+        assert streamed.tool_calls, (
             "Target function name 'get_current_weather' was not found in the streaming chunks"
+        )
+        assert streamed.tool_calls[0].name == "get_current_weather", (
+            "Function name should be 'get_current_weather'"
         )
 
         finish_reason = chunks[-1].choices[0].finish_reason
@@ -291,21 +286,12 @@ class TestOpenAIServerFunctionCalling:
             tools=tools,
         )
 
-        argument_fragments = []
-        chunks = list(response_stream)
-        function_name = None
-        for chunk in chunks:
-            choice = chunk.choices[0]
-            if choice.delta.tool_calls:
-                tool_call = choice.delta.tool_calls[0]
-                # Record the function name on first occurrence
-                function_name = tool_call.function.name or function_name
-                # In case of multiple chunks, JSON fragments may need to be concatenated
-                if tool_call.function.arguments is not None:
-                    argument_fragments.append(tool_call.function.arguments)
+        streamed = collect_streamed_chat(response_stream)
+        chunks = streamed.chunks
+        function_name = streamed.tool_calls[0].name if streamed.tool_calls else None
 
         assert function_name == "add", "Function name should be 'add'"
-        joined_args = "".join(argument_fragments)
+        joined_args = streamed.tool_calls[0].arguments
         assert len(joined_args) > 0, "No parameter fragments were returned in the function call"
 
         finish_reason = chunks[-1].choices[0].finish_reason
@@ -970,6 +956,55 @@ def get_travel_messages():
     ]
 
 
+# Two tools whose `$defs` give one name, DataType, two definitions. The pair is valid, since each
+# tool's parameters is its own schema document. The legacy path merges every tool into one schema
+# and refuses the pair with a 400; a structural-tag path serves it with each tool's own definition.
+CONFLICTING_DEFS_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "tool1",
+            "description": "Tool 1 with conflicting $defs",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data": {"$ref": "#/$defs/DataType"},
+                },
+                "required": ["data"],
+                "$defs": {
+                    "DataType": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool2",
+            "description": "Tool 2 with conflicting $defs",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data": {"$ref": "#/$defs/DataType"},
+                },
+                "required": ["data"],
+                "$defs": {
+                    "DataType": {  # Different definition for DataType
+                        "type": "object",
+                        "properties": {"value": {"type": "number"}},
+                        "required": ["value"],
+                    },
+                },
+            },
+        },
+    },
+]
+
+
 class _TestToolChoiceBase:
     """Base class for tool_choice tests. Not collected by pytest (underscore prefix)."""
 
@@ -1108,9 +1143,8 @@ class _TestToolChoiceBase:
     def test_tool_choice_auto_streaming(self, model, api_client):
         """Test tool_choice='auto' semantics in streaming mode.
 
-        Same contract as the non-streaming variant, verified over accumulated
-        stream deltas (chunk collection mirrors
-        test_required_streaming_arguments_chunks_json).
+        Same contract as the non-streaming variant, verified over the
+        accumulated stream deltas.
         """
 
         tools = self._auto_decision_tools()
@@ -1126,35 +1160,17 @@ class _TestToolChoiceBase:
                 tool_choice="auto",
                 stream=True,
             )
-            content_parts = []
-            tool_calls_by_index = {}
-            finish_reason = None
-            for chunk in response:
-                choice = chunk.choices[0]
-                if choice.finish_reason:
-                    finish_reason = choice.finish_reason
-                if choice.delta.content:
-                    content_parts.append(choice.delta.content)
-                if choice.delta.tool_calls:
-                    for tc_delta in choice.delta.tool_calls:
-                        tool_call = tool_calls_by_index.setdefault(
-                            tc_delta.index, {"name": "", "arguments": ""}
-                        )
-                        if tc_delta.function:
-                            if tc_delta.function.name:
-                                tool_call["name"] = tc_delta.function.name
-                            if tc_delta.function.arguments:
-                                tool_call["arguments"] += tc_delta.function.arguments
-            return "".join(content_parts), list(tool_calls_by_index.values()), finish_reason
+            streamed = collect_streamed_chat(response)
+            return streamed.content, streamed.tool_calls, streamed.finish_reason
 
         def assert_streamed_calls_valid(tool_calls):
             # Name provenance is not asserted - see _assert_auto_tool_calls_valid.
             for tool_call in tool_calls:
-                assert tool_call["arguments"], (
-                    f"streamed tool call {tool_call['name']!r} produced no argument "
+                assert tool_call.arguments, (
+                    f"streamed tool call {tool_call.name!r} produced no argument "
                     "deltas - the call is unusable by the client"
                 )
-                args = json.loads(tool_call["arguments"])
+                args = json.loads(tool_call.arguments)
                 assert isinstance(args, dict)
 
         # --- Scenario 1: prompt that needs the weather tool ---
@@ -1163,7 +1179,7 @@ class _TestToolChoiceBase:
         )
         if tool_calls:
             assert_streamed_calls_valid(tool_calls)
-            assert flaky or any("tokyo" in tc["arguments"].lower() for tc in tool_calls), (
+            assert flaky or any("tokyo" in tc.arguments.lower() for tc in tool_calls), (
                 f"Expected the location (Tokyo) in streamed tool call args, got: {tool_calls}"
             )
             assert finish_reason == "tool_calls", (
@@ -1233,12 +1249,7 @@ class _TestToolChoiceBase:
             stream=True,
         )
 
-        # Collect streaming response
-        tool_call_chunks = []
-
-        for chunk in response:
-            if chunk.choices[0].delta.tool_calls:
-                tool_call_chunks.extend(chunk.choices[0].delta.tool_calls)
+        tool_call_chunks = collect_streamed_chat(response).tool_call_deltas
 
         # With required, we should get tool call chunks
         assert len(tool_call_chunks) > 0
@@ -1285,23 +1296,12 @@ class _TestToolChoiceBase:
             stream=True,
         )
 
-        # Collect streaming response
-        tool_call_chunks = []
-
-        for chunk in response:
-            if chunk.choices[0].delta.tool_calls:
-                tool_call_chunks.extend(chunk.choices[0].delta.tool_calls)
+        streamed = collect_streamed_chat(response)
 
         # Should get tool call chunks for the specific function
-        assert len(tool_call_chunks) > 0
+        assert len(streamed.tool_call_deltas) > 0
 
-        # Find function name in chunks
-        found_name = None
-        for chunk in tool_call_chunks:
-            if chunk.function and chunk.function.name:
-                found_name = chunk.function.name
-                break
-
+        found_name = streamed.tool_calls[0].name
         assert found_name == "get_weather"
 
     def test_required_streaming_arguments_chunks_json(self, model, api_client):
@@ -1322,47 +1322,21 @@ class _TestToolChoiceBase:
             stream=True,
         )
 
-        # Collect all tool call chunks and reconstruct complete tool calls
-        tool_calls_by_index = {}
-        for chunk in response:
-            if chunk.choices[0].delta.tool_calls:
-                for tool_call_delta in chunk.choices[0].delta.tool_calls:
-                    tool_index = tool_call_delta.index
+        tool_calls = collect_streamed_chat(response).tool_calls
 
-                    # Initialize tool call if not seen before
-                    tool_call = tool_calls_by_index.setdefault(
-                        tool_index,
-                        {
-                            "id": None,
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        },
-                    )
-
-                    # Update fields from the delta
-                    if tool_call_delta.id is not None:
-                        tool_call["id"] = tool_call_delta.id
-                    if tool_call_delta.function:
-                        if tool_call_delta.function.name:
-                            tool_call["function"]["name"] = tool_call_delta.function.name
-                        if tool_call_delta.function.arguments:
-                            tool_call["function"]["arguments"] += tool_call_delta.function.arguments
-
-        assert len(tool_calls_by_index) > 0
+        assert len(tool_calls) > 0
 
         # Validate that complete tool calls have valid JSON arguments
-        for tool_call in tool_calls_by_index.values():
-            assert tool_call["function"]["name"] is not None
-            assert tool_call["function"]["arguments"] is not None
+        for tool_call in tool_calls:
+            assert tool_call.name is not None
+            assert tool_call.arguments is not None
 
             # The complete arguments should be valid JSON
             try:
-                args = json.loads(tool_call["function"]["arguments"])
+                args = json.loads(tool_call.arguments)
                 assert isinstance(args, dict)
             except json.JSONDecodeError:
-                pytest.fail(
-                    f"Invalid JSON in complete tool call arguments: {tool_call['function']['arguments']}"
-                )
+                pytest.fail(f"Invalid JSON in complete tool call arguments: {tool_call.arguments}")
 
     def test_complex_parameters_required_non_streaming(self, model, api_client):
         """Validate complex nested parameter schemas in non-streaming required mode."""
@@ -1597,50 +1571,7 @@ class _TestToolChoiceBase:
     def test_conflicting_defs_required_tool_choice(self, model, api_client):
         """Test that conflicting $defs with required tool_choice returns 400 error."""
 
-        conflicting_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "tool1",
-                    "description": "Tool 1 with conflicting $defs",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "data": {"$ref": "#/$defs/DataType"},
-                        },
-                        "required": ["data"],
-                        "$defs": {
-                            "DataType": {
-                                "type": "object",
-                                "properties": {"value": {"type": "string"}},
-                                "required": ["value"],
-                            },
-                        },
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "tool2",
-                    "description": "Tool 2 with conflicting $defs",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "data": {"$ref": "#/$defs/DataType"},
-                        },
-                        "required": ["data"],
-                        "$defs": {
-                            "DataType": {  # Different definition for DataType
-                                "type": "object",
-                                "properties": {"value": {"type": "number"}},
-                                "required": ["value"],
-                            },
-                        },
-                    },
-                },
-            },
-        ]
+        conflicting_tools = CONFLICTING_DEFS_TOOLS
 
         messages = [
             {
@@ -1665,6 +1596,30 @@ class _TestToolChoiceBase:
         error_msg = str(exc_info.value).lower()
         assert "invalid tool configuration" in error_msg
         assert "conflicting" in error_msg
+
+    def _assert_conflicting_defs_served(self, model, api_client):
+        """Under a table whose forced call carries each tool's own `$defs`, the pair is served
+        and the call's arguments follow the called tool's definition (a string for tool1, a
+        number for tool2). The subclasses whose parser name Symphony answers to call this under
+        --parser symphony; the base test keeps the legacy path's refusal."""
+        response = api_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "Test the conflicting tools"}],
+            max_tokens=100,
+            temperature=0.1,
+            tools=CONFLICTING_DEFS_TOOLS,
+            tool_choice="required",
+            stream=False,
+        )
+        calls = response.choices[0].message.tool_calls
+        assert calls, "tool_choice=required forces a call"
+        call = calls[0]
+        value = json.loads(call.function.arguments)["data"]["value"]
+        expected = {"tool1": str, "tool2": (int, float)}[call.function.name]
+        # A bool is an int to Python: a `true` must not pass as tool2's number.
+        assert isinstance(value, expected) and not isinstance(value, bool), (
+            f"{call.function.name} got value {value!r}: not its own DataType definition"
+        )
 
 
 # =============================================================================
@@ -1692,6 +1647,15 @@ class TestToolChoiceLlama(_TestToolChoiceBase):
         "test_tool_choice_auto_streaming",
     }
 
+    def test_conflicting_defs_required_tool_choice(self, model, api_client):
+        """Under --parser symphony the pair is served: the `llama` name reads the json table,
+        whose forced call carries each tool's own `$defs`. On the legacy path the merged schema
+        refuses the pair, as the base test expects."""
+        if get_parser() != "symphony":
+            super().test_conflicting_defs_required_tool_choice(model, api_client)
+            return
+        self._assert_conflicting_defs_served(model, api_client)
+
 
 # =============================================================================
 # Tool Choice Tests - Qwen Model (qwen parser)
@@ -1711,6 +1675,15 @@ class TestToolChoiceQwen(_TestToolChoiceBase):
 
     # No flaky tests for Qwen
     FLAKY_TESTS: set[str] = set()
+
+    def test_conflicting_defs_required_tool_choice(self, model, api_client):
+        """Under --parser symphony the pair is served: the Qwen3 table gives the forced call a
+        structural tag that carries each tool's own `$defs`. On the legacy path the merged schema
+        refuses the pair, as the base test expects."""
+        if get_parser() != "symphony":
+            super().test_conflicting_defs_required_tool_choice(model, api_client)
+            return
+        self._assert_conflicting_defs_served(model, api_client)
 
 
 # =============================================================================
@@ -1891,3 +1864,86 @@ class TestMultiTurnToolCall:
                 content_parts.append(delta.content)
 
         assert "".join(content_parts), "Streaming follow-up should produce text content"
+
+
+@pytest.mark.engine("tokenspeed")
+@pytest.mark.gpu(1)
+@pytest.mark.model("Qwen/Qwen3-4B-Instruct-2507")
+@pytest.mark.gateway(
+    extra_args=["--parser", "symphony", "--tool-call-parser", "qwen", "--history-backend", "memory"]
+)
+@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+@pytest.mark.parametrize("api_client", ["openai"], indirect=True)
+class TestConstrainedDecodingAlways:
+    """A worker on ``constrained_decoding: always`` takes the table's grammar for
+    the calls a request allows under ``tool_choice: auto``, from the first token
+    (smg#3504, smg#3505). The TokenSpeed e2e workers run xgrammar and start
+    every grammar at the first token, so this proves the engine accepts the
+    triggered-tags grammar with no call required: the request succeeds, every
+    call it does make names a declared tool with JSON arguments, and a request
+    without tools, which the policy leaves free, succeeds as before.
+
+    Not a ``_TestToolChoiceBase`` subclass: pytest would collect that class's
+    tests under this gateway too. Its helpers are used directly.
+    """
+
+    def test_an_always_worker_is_constrained_under_auto(self, model, api_client, setup_backend):
+        gateway = setup_backend[3]
+        worker = gateway.list_workers(strict=True)[0]
+        # The policy arrives as a worker label through the update route, the way
+        # an operator sets it before the engine declares it itself; the update
+        # is applied asynchronously, so wait until the worker carries it.
+        resp = httpx.patch(
+            f"{gateway.base_url}/workers/{worker.id}",
+            json={"labels": {"constrained_decoding": "always"}},
+            timeout=10.0,
+        )
+        assert resp.status_code in (200, 202), f"PATCH /workers: {resp.status_code} {resp.text}"
+        deadline = time.perf_counter() + 30.0
+        labelled = None
+        while time.perf_counter() < deadline:
+            shown = httpx.get(f"{gateway.base_url}/workers/{worker.id}", timeout=10.0)
+            if (
+                shown.status_code == 200
+                and shown.json().get("labels", {}).get("constrained_decoding") == "always"
+            ):
+                labelled = shown.json()
+                break
+            time.sleep(1.0)
+        assert labelled is not None, "the constrained_decoding label never reached the worker"
+
+        helpers = _TestToolChoiceBase()
+        tools = helpers._auto_decision_tools()
+        response = api_client.chat.completions.create(
+            model=model,
+            messages=helpers.AUTO_TOOL_NEEDED_MESSAGES,
+            max_tokens=512,
+            temperature=0.0,
+            tools=tools,
+            tool_choice="auto",
+            stream=False,
+        )
+        choice = response.choices[0]
+        if choice.message.tool_calls:
+            # The grammar is what keeps every call to a declared tool with
+            # JSON-object arguments, so the name check is the property that
+            # shows it took effect (the unconstrained helper skips names).
+            declared = {tool["function"]["name"] for tool in tools}
+            for call in choice.message.tool_calls:
+                assert call.function.name in declared, call.function.name
+                arguments = json.loads(call.function.arguments)
+                assert isinstance(arguments, dict), call.function.arguments
+            assert choice.finish_reason == "tool_calls"
+        else:
+            # The grammar lets free text through; the model may answer instead.
+            assert (choice.message.content or "").strip()
+            assert choice.finish_reason == "stop"
+
+        plain = api_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "Reply with the single word hello."}],
+            max_tokens=16,
+            temperature=0.0,
+            stream=False,
+        )
+        assert (plain.choices[0].message.content or "").strip()

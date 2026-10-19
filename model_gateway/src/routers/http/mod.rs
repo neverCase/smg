@@ -8,6 +8,7 @@ pub mod router;
 pub(crate) mod chat_metrics;
 mod sse_observer;
 pub(crate) mod stream_failure;
+pub(crate) mod stream_relay;
 
 use axum::response::Response;
 use openai_protocol::messages::CreateMessageRequest;

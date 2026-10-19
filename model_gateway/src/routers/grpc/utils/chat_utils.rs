@@ -2,17 +2,22 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 
 use anyhow::anyhow;
-use axum::response::Response;
+use axum::{
+    http::{header::RETRY_AFTER, HeaderValue},
+    response::Response,
+};
 use bytes::Bytes;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
     stop::StopSequenceDecoderBuilder,
-    traits::{Encoding, PromptEncoding, Tokenizer},
+    traits::{Encoding, PromptEncoding, RendererCapabilities, Tokenizer},
     StopSequenceDecoder,
 };
 use openai_protocol::{
@@ -23,15 +28,26 @@ use openai_protocol::{
     },
     generate::GenerateFinishReason,
 };
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
-use tracing::{debug, error};
+use tool_parser::types::ToolCallItem;
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use crate::routers::{
-    common::sse,
-    error,
-    grpc::{context::RequestContext, multimodal::PlaceholderTokens, ProcessedMessages},
+use crate::{
+    middleware::ReportedRefusal,
+    observability::log_throttle::KeyedLogThrottle,
+    routers::{
+        common::sse,
+        error,
+        grpc::{
+            context::RequestContext,
+            multimodal::{anchor_rendered_markers, PlaceholderTokens},
+            ProcessedMessages,
+        },
+    },
+    workflow::TokenizerLoadFailure,
 };
 
 /// Type alias for the SSE channel sender used across streaming endpoints.
@@ -42,25 +58,59 @@ use crate::routers::{
 /// backpressure to a slow client.
 pub(crate) type SseSender = sse::SseSender;
 
-/// Send an SSE error event with a typed error body.
-///
-/// Produces `data: {"error":{"message":"...","type":"..."}}\n\n` using
-/// `serde_json` so that quotes, newlines, and other special characters in the
-/// error message are properly escaped.
+/// The body of an SSE error event, `{"error":{"message":...,"type":...}}`,
+/// serialized straight into its frame: the message is written through
+/// `Display` into the JSON escaper, so the frame is the one allocation.
+#[derive(Serialize)]
+#[serde(bound = "M: fmt::Display")]
+struct SseErrorFrame<'a, M: fmt::Display> {
+    error: SseErrorBody<'a, M>,
+}
+
+#[derive(Serialize)]
+#[serde(bound = "M: fmt::Display")]
+struct SseErrorBody<'a, M: fmt::Display> {
+    #[serde(serialize_with = "serialize_display")]
+    message: M,
+    #[serde(rename = "type")]
+    error_type: &'a str,
+}
+
+fn serialize_display<M: fmt::Display, S: serde::Serializer>(
+    message: &M,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(message)
+}
+
+/// Send an SSE error event with a typed error body:
+/// `data: {"error":{"message":"...","type":"..."}}\n\n`, the message
+/// JSON-escaped (quotes, newlines, control characters).
 ///
 /// `async` because the sender is bounded: awaits if the buffer is full so the
 /// terminal error frame still applies backpressure rather than being dropped.
-pub(crate) async fn send_error_sse(tx: &SseSender, message: impl ToString, error_type: &str) {
-    let chunk = format!(
-        "data: {}\n\n",
-        json!({
-            "error": {
-                "message": message.to_string(),
-                "type": error_type,
-            }
-        })
-    );
-    let _ = tx.send(Ok(Bytes::from(chunk))).await;
+pub(crate) async fn send_error_sse(tx: &SseSender, message: impl fmt::Display, error_type: &str) {
+    const PREFIX: &[u8] = b"data: ";
+    let mut frame = Vec::with_capacity(256);
+    frame.extend_from_slice(PREFIX);
+    let body = SseErrorFrame {
+        error: SseErrorBody {
+            message,
+            error_type,
+        },
+    };
+    // Unreachable in practice: a `Vec` writer never fails, and serde_json
+    // panics (as `to_string` did) on a `Display` that errors rather than
+    // returning the error; the fallback keeps the frame well-formed should
+    // either ever change.
+    if serde_json::to_writer(&mut frame, &body).is_err() {
+        frame.truncate(PREFIX.len());
+        frame.extend_from_slice(
+            br#"{"error":{"message":"the error message could not be serialized","type":"internal_error"}}"#,
+        );
+    }
+    frame.extend_from_slice(b"\n\n");
+    let _ = tx.send(Ok(Bytes::from(frame))).await;
 }
 
 /// Resolve tokenizer from registry and cache it in request context.
@@ -81,16 +131,14 @@ pub(crate) fn resolve_tokenizer(
         .get(model_id)
         .ok_or_else(|| {
             let served = ctx.components.worker_registry.contains_model(model_id);
-            if served {
-                error!(
-                    function = %stage_name,
-                    model = %model_id,
-                    "Tokenizer not found for model"
-                );
-            } else {
-                debug!(function = %stage_name, model = %model_id, "Unknown model");
-            }
-            Box::new(missing_tokenizer_response(model_id, served))
+            let failure = ctx.components.tokenizer_load_failures.get(model_id);
+            Box::new(missing_tokenizer_response(
+                stage_name,
+                model_id,
+                served,
+                ctx.components.tokenizer_autoload,
+                failure.as_ref(),
+            ))
         })?;
 
     // Cache tokenizer in context for reuse in response processing stage
@@ -99,18 +147,130 @@ pub(crate) fn resolve_tokenizer(
     Ok(tokenizer)
 }
 
-/// The error for a model without a registered tokenizer: a model nobody
-/// serves is the client's mistake (404), a served model with no tokenizer is
-/// a gateway fault (500).
-fn missing_tokenizer_response(model_id: &str, served: bool) -> Response {
-    if served {
-        error::internal_error(
-            "tokenizer_not_found",
-            format!("Tokenizer not found for model: {model_id}"),
-        )
-    } else {
-        error::model_not_found(model_id)
+/// Lines per second the tokenizer-window WARN admits per model, and the
+/// models the throttle tracks: the allowance of the worker-selection
+/// refusal line, for the same reason (a client retrying at once through the
+/// window is one condition, not a line per request).
+const TOKENIZER_NOT_READY_LINES_PER_SECOND: u32 = 10;
+const TOKENIZER_NOT_READY_LOG_MODELS: usize = 64;
+
+static TOKENIZER_NOT_READY_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    TOKENIZER_NOT_READY_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    TOKENIZER_NOT_READY_LOG_MODELS,
+);
+
+/// The client-visible code of [`tokenizer_not_ready`].
+pub(crate) const TOKENIZER_NOT_READY_CODE: &str = "tokenizer_not_ready";
+
+/// Seconds a client is asked to wait before retrying through the window: a
+/// tokenizer registration takes a fraction of a second on a warm cache.
+const TOKENIZER_NOT_READY_RETRY_AFTER_SECS: u32 = 1;
+
+/// The 503 for a served model whose tokenizer the gateway has not registered
+/// yet: the window between a worker turning healthy and the end of its
+/// tokenizer load, which `/readiness` reports as not ready ("tokenizer not
+/// yet registered"). A planned, transient state, so the answer is the
+/// retryable class with a `Retry-After`, like a pool with no available
+/// worker, not a 500. One WARN per request, capped per model at
+/// [`TOKENIZER_NOT_READY_LINES_PER_SECOND`] a second (the overflow is counted
+/// as `suppressed` on the next admitted line); the response is marked
+/// [`ReportedRefusal`], so the pipeline's and the access log's lines for it
+/// stay at DEBUG (three ERROR lines per request were the storm of the 500).
+/// A served model whose tokenizer load was skipped or failed for good is
+/// answered [`tokenizer_load_failed`] instead.
+pub(crate) fn tokenizer_not_ready(function: &str, model_id: &str) -> Response {
+    let mut response = error::service_unavailable(
+        TOKENIZER_NOT_READY_CODE,
+        format!("Tokenizer for model '{model_id}' is not registered yet; retry shortly"),
+    );
+    response.headers_mut().insert(
+        RETRY_AFTER,
+        HeaderValue::from(TOKENIZER_NOT_READY_RETRY_AFTER_SECS),
+    );
+    response.extensions_mut().insert(ReportedRefusal);
+    if let Some(admitted) = TOKENIZER_NOT_READY_LOG.admit(model_id) {
+        warn!(
+            function = %function,
+            model = %model_id,
+            suppressed = admitted.suppressed,
+            "Tokenizer not yet registered for a served model"
+        );
     }
+    response
+}
+
+/// The client-visible code of [`tokenizer_load_failed`].
+pub(crate) const TOKENIZER_LOAD_FAILED_CODE: &str = "tokenizer_load_failed";
+
+/// The 503 for a served model whose tokenizer the gateway will not register
+/// on its own: its load was skipped (no path to load it from) or failed for
+/// good, or its tokenizer was removed, as the registration recorded for the
+/// model (a load in flight is pending, not this). The envelope
+/// of [`tokenizer_not_ready`] without the `Retry-After`: a retry changes
+/// nothing until a tokenizer registers for the model (a worker re-registering
+/// with a usable path, an operator's `POST /v1/tokenizers`), which clears
+/// the record. The message names the reason class, not the path or the
+/// error: the gateway's log has those, in the one line written when the
+/// model entered the state, not per request. Marked [`ReportedRefusal`], so
+/// the pipeline's and the access log's lines for it stay at DEBUG.
+pub(crate) fn tokenizer_load_failed(
+    function: &str,
+    model_id: &str,
+    failure: &TokenizerLoadFailure,
+) -> Response {
+    debug!(
+        function = %function,
+        model = %model_id,
+        reason = failure.reason(),
+        "Tokenizer load failed for a served model"
+    );
+    let mut response = error::service_unavailable(
+        TOKENIZER_LOAD_FAILED_CODE,
+        format!(
+            "Tokenizer for model '{model_id}' could not be loaded: {}",
+            failure.reason()
+        ),
+    );
+    response.extensions_mut().insert(ReportedRefusal);
+    response
+}
+
+/// The error for a model without a registered tokenizer: a model nobody
+/// serves is the client's mistake (404); a served model whose tokenizer load
+/// was skipped or failed for good, or whose tokenizer was removed, gets none
+/// on its own (503 without a retry hint, [`tokenizer_load_failed`]); a
+/// served model whose tokenizer the
+/// gateway is still loading is not ready yet (503 with a `Retry-After`, the
+/// state `/readiness` reports); a served model with no tokenizer when the
+/// gateway does not load tokenizers itself (`--disable-tokenizer-autoload`)
+/// is a gateway fault (500): nothing will register one.
+pub(crate) fn missing_tokenizer_response(
+    function: &str,
+    model_id: &str,
+    served: bool,
+    tokenizer_autoload: bool,
+    failure: Option<&TokenizerLoadFailure>,
+) -> Response {
+    if !served {
+        debug!(function = %function, model = %model_id, "Unknown model");
+        return error::model_not_found(model_id);
+    }
+    if let Some(failure) = failure {
+        return tokenizer_load_failed(function, model_id, failure);
+    }
+    if tokenizer_autoload {
+        return tokenizer_not_ready(function, model_id);
+    }
+    error!(
+        function = %function,
+        model = %model_id,
+        "Tokenizer not found for model"
+    );
+    error::internal_error(
+        "tokenizer_not_found",
+        format!("Tokenizer not found for model: {model_id}"),
+    )
 }
 
 /// Below this input size (in bytes) the `spawn_blocking` + permit round-trip
@@ -180,7 +340,9 @@ pub(crate) async fn encode_prompt_blocking(
 }
 
 /// Process tool call arguments in messages
-/// Per Transformers docs, tool call arguments in assistant messages should be dicts
+/// Per Transformers docs, tool call arguments in assistant messages should be dicts. An empty
+/// `arguments` string is a call with no arguments, `{}`; any other text that is not JSON is
+/// refused.
 pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
     for msg in messages {
         let role = msg.get("role").and_then(|v| v.as_str());
@@ -202,6 +364,10 @@ pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), 
             let Some(args_str) = args.as_str() else {
                 continue;
             };
+            if args_str.trim().is_empty() {
+                *args = json!({});
+                continue;
+            }
 
             // Parse JSON string to object (like Python json.loads)
             match serde_json::from_str::<Value>(args_str) {
@@ -232,9 +398,21 @@ pub(crate) fn process_content_format(
     )
 }
 
-const REASONING_EFFORT_KEY: &str = "reasoning_effort";
+pub(super) const REASONING_EFFORT_KEY: &str = "reasoning_effort";
 const TOOL_CHOICE_KEY: &str = "tool_choice";
 const RESPONSE_FORMAT_KEY: &str = "response_format";
+
+/// The template kwarg both prompt paths tell the tool choice through: the
+/// chat value as sent, so a renderer reads one shape under
+/// `/v1/chat/completions`, `/v1/messages` and `count_tokens`.
+pub(crate) fn insert_tool_choice_kwarg(
+    kwargs: &mut HashMap<String, Value>,
+    tool_choice: &ToolChoice,
+) {
+    if let Ok(value) = serde_json::to_value(tool_choice) {
+        kwargs.insert(TOOL_CHOICE_KEY.to_string(), value);
+    }
+}
 
 /// Merge request-level reasoning, tool, and output-format controls with any
 /// request `chat_template_kwargs`, forwarding each verbatim. The chat template
@@ -247,9 +425,7 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     let kwargs_capacity = 3 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
     let mut combined = HashMap::with_capacity(kwargs_capacity);
     if let Some(tool_choice) = &request.tool_choice {
-        if let Ok(value) = serde_json::to_value(tool_choice) {
-            combined.insert(TOOL_CHOICE_KEY.to_string(), value);
-        }
+        insert_tool_choice_kwarg(&mut combined, tool_choice);
     }
     if let Some(response_format) = &request.response_format {
         if let Ok(value) = serde_json::to_value(response_format) {
@@ -268,11 +444,11 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     combined
 }
 
-/// Typed `thinking.type` first, else the OpenAI mapping of the effective effort.
+/// The thinking preference the prompt is rendered with: the typed toggle,
+/// else the effective effort, both as the request's provider profile reads
+/// them (`ChatCompletionRequest::template_thinking`).
 fn resolve_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
-    request.thinking_toggle().or_else(|| {
-        openai_protocol::chat::thinking_from_reasoning_effort(request.effective_reasoning_effort())
-    })
+    request.template_thinking()
 }
 
 /// gRPC backends require content parts the gateway knows how to render.
@@ -459,9 +635,9 @@ fn transform_content_field(
 }
 
 /// A popped assistant message's prefill: its string content, or its text parts joined in order.
-fn prefill_text(content: &Value) -> Option<String> {
+fn prefill_text(content: Value) -> Option<String> {
     match content {
-        Value::String(text) => Some(text.clone()),
+        Value::String(text) => Some(text),
         Value::Array(parts) => Some(
             parts
                 .iter()
@@ -506,7 +682,7 @@ pub(crate) fn filter_chat_request_by_tool_choice(
         if let Some(filtered_tools) = filter_tools_by_tool_choice(tools, body.tool_choice.as_ref())
         {
             let mut filtered_body = body.clone();
-            filtered_body.tools = Some(filtered_tools);
+            filtered_body.tools = Some(filtered_tools.into());
             return std::borrow::Cow::Owned(filtered_body);
         }
     }
@@ -518,13 +694,25 @@ pub(crate) fn filter_chat_request_by_tool_choice(
 /// The request whose tools the template renders. A named `tool_choice`
 /// renders every tool, as the engine's own server renders it (the named call
 /// is forced by the tool constraint, built from `callable_tools`); an
-/// `allowed_tools` choice renders its subset; any other request renders as
-/// it is.
-pub(crate) fn request_as_rendered(
+/// `allowed_tools` choice renders its subset; `none` renders no tool, as the
+/// Responses path renders it, so the model is not offered a call it may not
+/// make and answers in text, unless the renderer declares the tools under
+/// `none` itself and forbids the call in the prompt
+/// ([`RendererCapabilities::declares_tools_under_tool_choice_none`]); any
+/// other request renders as it is.
+pub fn request_as_rendered(
     request: &ChatCompletionRequest,
+    capabilities: RendererCapabilities,
 ) -> std::borrow::Cow<'_, ChatCompletionRequest> {
     match request.tool_choice {
         Some(ToolChoice::Function { .. }) => std::borrow::Cow::Borrowed(request),
+        Some(ToolChoice::Value(ToolChoiceValue::None))
+            if request.tools.is_some() && !capabilities.declares_tools_under_tool_choice_none =>
+        {
+            let mut rendered = request.clone();
+            rendered.tools = None;
+            std::borrow::Cow::Owned(rendered)
+        }
         _ => filter_chat_request_by_tool_choice(request),
     }
 }
@@ -535,25 +723,15 @@ pub(crate) fn request_as_rendered(
 /// Returns the flat prompt only. A renderer that must encode the prompt itself
 /// (Kimi-K3) cannot be honored through this entry point; the gRPC pipeline
 /// uses [`process_chat_messages_with_placeholders`] and encodes what it
-/// returns.
+/// returns, and a caller outside it takes
+/// [`process_chat_messages_with_encoding`].
 pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
     image_placeholder: Option<&str>,
 ) -> Result<ProcessedMessages, String> {
-    // Bindings call this entry point without the gRPC preparation stage.
-    validate_chat_content_parts(&request.messages)?;
-    let placeholder_tokens = image_placeholder.map(|token| {
-        let mut placeholders = PlaceholderTokens::default();
-        placeholders.insert(Modality::Image, token.to_string());
-        placeholders
-    });
-    let (processed, encoding) = process_chat_messages_with_placeholders(
-        request,
-        tokenizer,
-        placeholder_tokens.as_ref(),
-        MediaPartOrder::MediaFirst,
-    )?;
+    let (processed, encoding) =
+        process_chat_messages_with_encoding(request, tokenizer, image_placeholder)?;
     if matches!(encoding, PromptEncoding::Deferred(_)) {
         static WARNED: OnceLock<()> = OnceLock::new();
         WARNED.get_or_init(|| {
@@ -565,6 +743,30 @@ pub fn process_chat_messages(
         });
     }
     Ok(processed)
+}
+
+/// [`process_chat_messages`] with how the tokenize step must encode the
+/// prompt: [`PromptEncoding::FromText`] for every flat renderer, or the
+/// deferred encode a segment-aware renderer prepared, whose ids are the
+/// prompt the gateway sends.
+pub fn process_chat_messages_with_encoding(
+    request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+    image_placeholder: Option<&str>,
+) -> Result<(ProcessedMessages, PromptEncoding), String> {
+    // Bindings call this entry point without the gRPC preparation stage.
+    validate_chat_content_parts(&request.messages)?;
+    let placeholder_tokens = image_placeholder.map(|token| {
+        let mut placeholders = PlaceholderTokens::default();
+        placeholders.insert(Modality::Image, token.to_string());
+        placeholders
+    });
+    process_chat_messages_with_placeholders(
+        request,
+        tokenizer,
+        placeholder_tokens.as_ref(),
+        MediaPartOrder::MediaFirst,
+    )
 }
 
 /// Render the chat prompt. The second element says how the tokenize step must
@@ -615,14 +817,10 @@ pub(crate) fn process_chat_messages_with_placeholders(
             Some(&combined_template_kwargs)
         };
 
-        let continues_final_assistant = request.continue_final_message
-            && transformed_messages
-                .last()
-                .and_then(|msg| msg.get("role"))
-                .and_then(|v| v.as_str())
-                == Some("assistant");
+        let continues_final_assistant = request.continues_final_assistant();
         // Renderers that continue a trailing assistant message natively
-        // (DeepSeek-V4.1: rendered without EOS and without a generation
+        // (Jinja templates, cut right after the message as transformers
+        // does; DeepSeek-V4.1: rendered without EOS and without a generation
         // header) keep the message and are called without a generation
         // prompt; other templates get the message popped and its content
         // appended after the generation prompt as a prefix.
@@ -633,6 +831,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
 
         let params = ChatTemplateParams {
             add_generation_prompt: !native_continuation,
+            continue_final_message: native_continuation,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
             // The tokenizer applies the toggle under the template's own key.
@@ -645,17 +844,20 @@ pub(crate) fn process_chat_messages_with_placeholders(
             // Pop the last message to render it as the prefix. A trailing
             // assistant role implies a non-empty list, so the `else` arm is
             // only defensive.
-            let Some(last_msg) = transformed_messages.pop() else {
+            let Some(mut last_msg) = transformed_messages.pop() else {
                 return Ok((
                     ProcessedMessages {
                         text: String::new(),
-                        stop_sequences: request.stop.clone(),
                         unbilled_prompt_tokens: 0,
+                        continued_final_message: false,
                     },
                     PromptEncoding::FromText,
                 ));
             };
-            last_msg.get("content").and_then(prefill_text)
+            last_msg
+                .get_mut("content")
+                .map(Value::take)
+                .and_then(prefill_text)
         } else {
             None
         };
@@ -672,11 +874,12 @@ pub(crate) fn process_chat_messages_with_placeholders(
             .map_err(|e| format!("Failed to apply chat template: {e}"))?
     };
 
+    let text = anchor_rendered_markers(placeholder_tokens, &rendered.encoding, rendered.text);
     Ok((
         ProcessedMessages {
-            text: rendered.text,
-            stop_sequences: request.stop.clone(),
+            text,
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
+            continued_final_message: rendered.continued_final_message,
         },
         rendered.encoding,
     ))
@@ -732,6 +935,24 @@ pub fn create_stop_decoder(
     }
 
     builder.build()
+}
+
+/// With parallel tool calls turned off (`parallel_tool_calls: false`, or
+/// Messages `disable_parallel_tool_use: true`) a response returns only its
+/// first tool call; the calls a model writes after it are dropped.
+pub(crate) fn keep_first_tool_call(calls: &mut Option<Vec<ToolCall>>) {
+    if let Some(calls) = calls.as_mut().filter(|calls| calls.len() > 1) {
+        debug!(
+            dropped = calls.len() - 1,
+            "parallel tool calls are off: returning the first call"
+        );
+        calls.truncate(1);
+    }
+}
+
+/// The streamed form of [`keep_first_tool_call`].
+pub(crate) fn keep_first_tool_call_items(items: &mut Vec<ToolCallItem>) {
+    items.retain(|item| item.tool_index == 0);
 }
 
 /// Parse tool calls from JSON schema constrained response
@@ -812,22 +1033,6 @@ pub(crate) fn parse_json_schema_response(
     }
 }
 
-/// Count the number of tool calls in the request message history
-/// This is used for KimiK2 format which needs globally unique indices
-pub(crate) fn get_history_tool_calls_count(request: &ChatCompletionRequest) -> usize {
-    request
-        .messages
-        .iter()
-        .filter_map(|msg| {
-            if let ChatMessage::Assistant { tool_calls, .. } = msg {
-                tool_calls.as_ref().map(|calls| calls.len())
-            } else {
-                None
-            }
-        })
-        .sum()
-}
-
 /// Generate a tool call ID based on model format
 ///
 /// # Arguments
@@ -879,6 +1084,47 @@ pub(crate) fn generate_tool_call_id(
     }
 }
 
+/// The completion API's finish reason from the engine's: a local stop beats
+/// the engine's reason (which is "length" when stop strings are enforced
+/// gateway-side rather than by the backend); the API's words `stop`,
+/// `length` and `content_filter` pass, and so do the engines' own signals
+/// `abort`, `error` and `failed`, which the chat paths pass through too and
+/// clients read as the failure they are; each as a plain word or as a JSON
+/// object's `type`. Anything else (an empty reason, an unmapped type, an
+/// unrecognized word) is `stop`, logged once with the raw value. One table
+/// for the streamed and the non-streamed completion.
+pub(crate) fn completion_finish_reason(local_stop: bool, engine: &str) -> &'static str {
+    if local_stop {
+        return "stop";
+    }
+    let known = |word: &str| -> Option<&'static str> {
+        match word {
+            "stop" => Some("stop"),
+            "length" => Some("length"),
+            "content_filter" => Some("content_filter"),
+            "abort" => Some("abort"),
+            "error" => Some("error"),
+            "failed" => Some("failed"),
+            _ => None,
+        }
+    };
+    if let Some(reason) = known(engine) {
+        return reason;
+    }
+    if let Ok(json) = serde_json::from_str::<Value>(engine) {
+        if let Some(reason) = json.get("type").and_then(Value::as_str).and_then(known) {
+            return reason;
+        }
+    }
+    if !engine.is_empty() {
+        warn!(
+            unexpected_finish_reason = engine,
+            "Unrecognized finish_reason from backend, defaulting to stop"
+        );
+    }
+    "stop"
+}
+
 /// Parse finish_reason string into GenerateFinishReason enum
 ///
 /// Uses serde to deserialize the finish_reason, which handles all tagged variants automatically.
@@ -925,6 +1171,28 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// The error frame is `data: {"error":{"message":..,"type":..}}` with
+    /// the message escaped as JSON, whatever it carries.
+    #[tokio::test]
+    async fn an_sse_error_frame_carries_the_escaped_message_and_its_type() {
+        let (tx, mut rx) = sse::sse_channel();
+        send_error_sse(&tx, "a \"quoted\"\nline \u{1F600}", "stream_error").await;
+        send_error_sse(&tx, format!("built {}", 42), "internal_error").await;
+        drop(tx);
+        let mut frames = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            frames.push(String::from_utf8(bytes.to_vec()).unwrap());
+        }
+        assert_eq!(
+            frames,
+            [
+                "data: {\"error\":{\"message\":\"a \\\"quoted\\\"\\nline \u{1F600}\",\
+                 \"type\":\"stream_error\"}}\n\n",
+                "data: {\"error\":{\"message\":\"built 42\",\"type\":\"internal_error\"}}\n\n",
+            ]
+        );
+    }
 
     fn placeholders(entries: &[(Modality, &str)]) -> PlaceholderTokens {
         let mut tokens = PlaceholderTokens::default();
@@ -1566,15 +1834,17 @@ mod tests {
         let names = |request: &ChatCompletionRequest| -> Vec<String> {
             request
                 .tools
-                .iter()
+                .as_deref()
+                .into_iter()
                 .flatten()
                 .map(|tool| tool.function.name.clone())
                 .collect()
         };
 
         let named = request(json!({"type": "function", "function": {"name": "get_weather"}}));
+        let plain = RendererCapabilities::default();
         assert_eq!(
-            names(&request_as_rendered(&named)),
+            names(&request_as_rendered(&named, plain)),
             ["get_weather", "get_time"]
         );
         assert_eq!(
@@ -1590,12 +1860,57 @@ mod tests {
             "type": "allowed_tools", "mode": "auto",
             "tools": [{"type": "function", "name": "get_time"}]
         }));
-        assert_eq!(names(&request_as_rendered(&allowed)), ["get_time"]);
+        assert_eq!(names(&request_as_rendered(&allowed, plain)), ["get_time"]);
 
         let auto = request(json!("auto"));
         assert_eq!(
-            names(&request_as_rendered(&auto)),
+            names(&request_as_rendered(&auto, plain)),
             ["get_weather", "get_time"]
+        );
+    }
+
+    fn tool_choice_none_request() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "q"}],
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {}}}}
+            ],
+            "tool_choice": "none",
+        }))
+        .expect("chat request")
+    }
+
+    /// `tool_choice: none` renders no tool: the model is not offered a call
+    /// it may not make, and the request's other fields render as sent.
+    #[test]
+    fn tool_choice_none_renders_no_tool() {
+        let request = tool_choice_none_request();
+        let rendered = request_as_rendered(&request, RendererCapabilities::default());
+        assert!(rendered.tools.is_none());
+        assert_eq!(rendered.messages.len(), request.messages.len());
+        // The request itself keeps its tools for the rest of the pipeline.
+        assert!(request.tools.is_some());
+    }
+
+    /// A renderer that declares the tools under `tool_choice: none` itself
+    /// (and forbids the call in the prompt, as its reference does) gets them:
+    /// the request renders as sent.
+    #[test]
+    fn a_renderer_that_declares_tools_under_tool_choice_none_keeps_them() {
+        let request = tool_choice_none_request();
+        let rendered = request_as_rendered(
+            &request,
+            RendererCapabilities {
+                declares_tools_under_tool_choice_none: true,
+                ..RendererCapabilities::default()
+            },
+        );
+        assert!(matches!(rendered, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(
+            rendered.tools.as_deref().map(<[_]>::len),
+            Some(1),
+            "the tool declaration stays for the renderer to write"
         );
     }
 
@@ -1691,6 +2006,42 @@ mod tests {
         assert_eq!(
             resolve_template_thinking(&effort_request(Some("none"))),
             Some(false)
+        );
+    }
+
+    /// Under the MiniMax profile no effort value switches thinking off and an
+    /// explicit effort outranks `thinking.disabled`; the request renders the
+    /// template's default (thinking on, the model's own depth).
+    #[test]
+    fn minimax_effort_keeps_thinking_on() {
+        let minimax = |thinking: Option<Value>, reasoning_effort: Option<&str>| {
+            let mut request = effort_request(reasoning_effort);
+            request.model = "MiniMax-M3".to_string();
+            request.thinking = thinking.map(|value| serde_json::from_value(value).unwrap());
+            request
+        };
+        for effort in ["none", "minimal", "high"] {
+            assert_eq!(
+                resolve_template_thinking(&minimax(None, Some(effort))),
+                None,
+                "{effort}"
+            );
+            assert_eq!(
+                resolve_template_thinking(&minimax(
+                    Some(json!({"type": "disabled"})),
+                    Some(effort)
+                )),
+                None,
+                "{effort} outranks thinking.disabled"
+            );
+        }
+        assert_eq!(
+            resolve_template_thinking(&minimax(Some(json!({"type": "disabled"})), None)),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_template_thinking(&minimax(Some(json!({"type": "enabled"})), Some("none"))),
+            Some(true)
         );
     }
 
@@ -1911,10 +2262,7 @@ mod tests {
     /// observable without a checkpoint: which messages reach the template,
     /// whether a generation prompt was requested, and whether tool-call
     /// `arguments` arrive as written.
-    fn render_with(
-        capabilities: llm_tokenizer::traits::RendererCapabilities,
-        request: &ChatCompletionRequest,
-    ) -> Value {
+    fn render_with(capabilities: RendererCapabilities, request: &ChatCompletionRequest) -> Value {
         let tokenizer = llm_tokenizer::MockTokenizer::new()
             .with_renderer_capabilities(capabilities)
             .with_json_chat_template();
@@ -1935,18 +2283,22 @@ mod tests {
         value
     }
 
-    const NATIVE_CONTINUATION: llm_tokenizer::traits::RendererCapabilities =
-        llm_tokenizer::traits::RendererCapabilities {
-            enable_thinking_alias: false,
-            native_assistant_continuation: true,
-            raw_tool_call_arguments: false,
-        };
-    const RAW_ARGUMENTS: llm_tokenizer::traits::RendererCapabilities =
-        llm_tokenizer::traits::RendererCapabilities {
-            enable_thinking_alias: false,
-            native_assistant_continuation: false,
-            raw_tool_call_arguments: true,
-        };
+    const NATIVE_CONTINUATION: RendererCapabilities = RendererCapabilities {
+        media_handling: llm_tokenizer::traits::MediaHandling::Preprocess,
+        enable_thinking_alias: false,
+        native_assistant_continuation: true,
+        raw_tool_call_arguments: false,
+        declares_tools_under_tool_choice_none: false,
+        leading_system_only: false,
+    };
+    const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
+        media_handling: llm_tokenizer::traits::MediaHandling::Preprocess,
+        enable_thinking_alias: false,
+        native_assistant_continuation: false,
+        raw_tool_call_arguments: true,
+        declares_tools_under_tool_choice_none: false,
+        leading_system_only: false,
+    };
 
     /// Without the capability the trailing assistant message is popped and its
     /// content is appended after a generation prompt; with it the message
@@ -1968,6 +2320,74 @@ mod tests {
         assert_eq!(native["messages"][1]["content"], "Sure");
         assert_eq!(native["add_generation_prompt"], json!(false));
         assert_eq!(native["assistant_prefix"], json!(""));
+    }
+
+    /// A text-rendered prompt reaches the tokenizer with each rendered marker
+    /// already rewritten to its anchor; without placeholders it is left alone.
+    /// The mock's JSON template writes no marker, so the one here is typed.
+    #[test]
+    fn rendered_markers_are_anchored_before_tokenizing() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "video_url", "video_url": {"url": "https://a/v.mp4"}},
+                {"type": "text", "text": "What happens in <video>?"}
+            ]}]
+        }))
+        .unwrap();
+        let tokenizer = llm_tokenizer::MockTokenizer::new()
+            .with_content_format(ChatTemplateContentFormat::OpenAI)
+            .with_json_chat_template();
+        let mut placeholders = PlaceholderTokens::default();
+        placeholders.insert(Modality::Video, "<SPECIAL_30>".to_string());
+        placeholders.add_rendered_marker("<video>".to_string(), "<SPECIAL_30>".to_string());
+        let render = |placeholders| {
+            process_chat_messages_with_placeholders(
+                &request,
+                &tokenizer,
+                placeholders,
+                MediaPartOrder::MediaFirst,
+            )
+            .unwrap()
+            .0
+            .text
+        };
+        let anchored = render(Some(&placeholders));
+        assert!(anchored.contains("<SPECIAL_30>") && !anchored.contains("<video>"));
+        assert!(render(None).contains("<video>"));
+    }
+
+    /// An assistant turn that opens with a header the generation prompt
+    /// lacks: the continued text must follow the header.
+    const HEADER_TEMPLATE: &str = r"
+{%- for m in messages -%}
+{%- if m.role == 'assistant' -%}{{- '<|turn|>assistant<|to|>user<|body|>' + m.content + '<|end|>' -}}
+{%- else -%}{{- '<|turn|>' + m.role + '<|body|>' + m.content + '<|end|>' -}}{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<|turn|>assistant' -}}{%- endif -%}";
+
+    /// A Jinja template continues the trailing assistant message inside the
+    /// turn it renders for it, as transformers does.
+    #[test]
+    fn jinja_template_continues_inside_the_assistant_turn() {
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer
+            .set_chat_template(HEADER_TEMPLATE.to_string())
+            .unwrap();
+        let (processed, _) = process_chat_messages_with_placeholders(
+            &prefill_request(),
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        assert_eq!(
+            processed.text,
+            "<|turn|>user<|body|>Hello<|end|><|turn|>assistant<|to|>user<|body|>Sure"
+        );
+        assert!(processed.continued_final_message);
     }
 
     /// Under the OpenAI content format the popped assistant message keeps its
@@ -2066,6 +2486,42 @@ mod tests {
             raw["messages"][1]["tool_calls"][0]["function"]["arguments"],
             json!("{\"city\": \"Hangzhou\"}")
         );
+    }
+
+    /// An empty `arguments` string, which a call cut before it wrote any argument may carry back
+    /// in history, is a call with no arguments; other text that is not JSON keeps the 400.
+    #[test]
+    fn an_empty_arguments_string_in_history_is_no_arguments() {
+        let history = |arguments: &str| {
+            vec![json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "apply_patch", "arguments": arguments}
+                }]
+            })]
+        };
+        for empty in ["", "  \n"] {
+            let mut messages = history(empty);
+            process_tool_call_arguments(&mut messages).expect("an empty string is no arguments");
+            assert_eq!(
+                messages[0]["tool_calls"][0]["function"]["arguments"],
+                json!({}),
+                "{empty:?}"
+            );
+        }
+        let mut messages = history("{\"patch\": \"x\"}");
+        process_tool_call_arguments(&mut messages).expect("JSON arguments");
+        assert_eq!(
+            messages[0]["tool_calls"][0]["function"]["arguments"],
+            json!({"patch": "x"})
+        );
+        for invalid in ["{", "{\"patch\": \"x\""] {
+            let err = process_tool_call_arguments(&mut history(invalid)).unwrap_err();
+            assert!(err.contains("Failed to parse tool call arguments"), "{err}");
+        }
     }
 
     /// A renderer that parses `arguments` itself (K3) gets a malformed history
@@ -2206,15 +2662,100 @@ mod tests {
         assert_eq!(processed.text, "user: Hello\nassistant: Sure");
     }
 
+    /// A model nobody serves is a 404; a served model whose tokenizer is
+    /// still loading is a 503 with a `Retry-After`, marked as reported so it
+    /// logs once; a served model without a tokenizer when the gateway does
+    /// not load tokenizers itself is a 500.
     #[test]
-    fn missing_tokenizer_is_a_client_error_only_for_unknown_models() {
+    fn a_missing_tokenizer_is_a_404_a_503_while_it_loads_or_a_500_without_autoload() {
         assert_eq!(
-            missing_tokenizer_response("nonexistent-model", false).status(),
+            missing_tokenizer_response("stage", "nonexistent-model", false, true, None).status(),
             http::StatusCode::NOT_FOUND
         );
+        let not_ready = missing_tokenizer_response("stage", "served-model", true, true, None);
+        assert_eq!(not_ready.status(), http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            missing_tokenizer_response("served-model", true).status(),
+            error::extract_error_code_from_response(&not_ready),
+            TOKENIZER_NOT_READY_CODE
+        );
+        assert_eq!(
+            not_ready
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert!(not_ready.extensions().get::<ReportedRefusal>().is_some());
+        assert_eq!(
+            missing_tokenizer_response("stage", "served-model", true, false, None).status(),
             http::StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    /// A served model whose tokenizer load was skipped or failed for good is
+    /// a 503 of its own code without a `Retry-After`, marked as reported,
+    /// whether or not the gateway loads tokenizers itself; the message names
+    /// the reason class, never the path or the error.
+    #[tokio::test]
+    async fn a_served_model_whose_tokenizer_load_failed_is_a_503_without_retry_after() {
+        let failed = TokenizerLoadFailure::Failed(
+            "Workflow failed at step load_tokenizer: File not found: /models/secret".to_string(),
+        );
+        for (failure, autoload, reason) in [
+            (&TokenizerLoadFailure::NoSource, true, "no tokenizer path"),
+            (
+                &TokenizerLoadFailure::Removed,
+                true,
+                "the tokenizer was removed",
+            ),
+            (&failed, true, "the load failed"),
+            (&failed, false, "the load failed"),
+        ] {
+            let response =
+                missing_tokenizer_response("stage", "served-model", true, autoload, Some(failure));
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                error::extract_error_code_from_response(&response),
+                TOKENIZER_LOAD_FAILED_CODE
+            );
+            assert!(response.headers().get(RETRY_AFTER).is_none());
+            assert!(response.extensions().get::<ReportedRefusal>().is_some());
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let message = String::from_utf8_lossy(&body);
+            assert!(message.contains("served-model"), "{message}");
+            assert!(message.contains(reason), "{message}");
+            assert!(!message.contains("/models/secret"), "{message}");
+        }
+    }
+
+    /// One table for both completion paths: the API's words and the engines'
+    /// own signals pass, as a word or as a JSON `type`; anything else is
+    /// "stop"; a local stop beats all.
+    #[test]
+    fn the_completion_finish_reason_is_one_table() {
+        for (local_stop, engine, expected) in [
+            (false, "", "stop"),
+            (false, "stop", "stop"),
+            (false, "length", "length"),
+            (false, "content_filter", "content_filter"),
+            (false, r#"{"type":"stop"}"#, "stop"),
+            (false, r#"{"type":"length","length":7}"#, "length"),
+            (false, r#"{"type":"content_filter"}"#, "content_filter"),
+            (false, r#"{"type":"abort"}"#, "abort"),
+            (false, "abort", "abort"),
+            (false, "error", "error"),
+            (false, "failed", "failed"),
+            (false, r#"{"type":"timeout"}"#, "stop"),
+            (false, "whatever", "stop"),
+            (true, "length", "stop"),
+        ] {
+            assert_eq!(
+                completion_finish_reason(local_stop, engine),
+                expected,
+                "local_stop={local_stop} engine={engine:?}"
+            );
+        }
     }
 }

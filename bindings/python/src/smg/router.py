@@ -96,6 +96,14 @@ def build_control_plane_auth_config(
     jwt_audience = args_dict.get("jwt_audience")
     audit_enabled = args_dict.get("control_plane_audit_enabled", False)
 
+    # Half a JWT configuration is an error, not a silently disabled JWT auth:
+    # the control plane would start open where authentication was asked for.
+    if (jwt_issuer is None) != (jwt_audience is None):
+        raise ValueError(
+            "--jwt-issuer and --jwt-audience are required together: "
+            "control-plane JWT authentication would otherwise be silently disabled"
+        )
+
     # Check if any auth is configured
     has_api_keys = bool(api_keys)
     has_jwt = jwt_issuer is not None and jwt_audience is not None
@@ -125,6 +133,7 @@ def build_control_plane_auth_config(
             audience=jwt_audience,
             jwks_uri=args_dict.get("jwt_jwks_uri"),
             role_mapping=args_dict.get("jwt_role_mapping", {}),
+            role_claim=args_dict.get("jwt_role_claim", "roles"),
         )
 
     return PyControlPlaneAuthConfig(
@@ -191,12 +200,18 @@ class Router:
             a worker must also exceed before prefix_hash treats it as
             overloaded. Guards the load factor against sampling noise when each
             router replica sees only a share of a worker's load. Default: 10
-        balance_abs_threshold: Load balancing is triggered when (max_load - min_load) >
-            abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache
-            aware. Default: 32
-        balance_rel_threshold: Load balancing is triggered when (max_load - min_load) >
-            abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache
-            aware. Default: 1.0001
+        balance_abs_threshold: Spill gate, absolute part: a matched worker is skipped
+            for the least-loaded one when its load exceeds the healthy-fleet mean by
+            this many requests AND by balance_rel_threshold; the margin is capped at
+            the in-flight count's natural swing at the pool's current mean (two
+            standard deviations, never under four requests unless this value is
+            lower), so a small pool can spill at all; with the bucket policy the
+            pair keeps its own rule (balancing when (max_load - min_load) exceeds
+            this value and max_load exceeds min_load times the relative
+            threshold). Default: 64
+        balance_rel_threshold: Spill gate, relative part: the multiple of the
+            healthy-fleet mean a matched worker's load must exceed, together with
+            the absolute part. Default: 1.5
         eviction_interval_secs: Interval in seconds between cache eviction operations
             in cache-aware routing. Default: 60
         overlap_decay: Cache-aware anti-hotspot decay: each candidate's overlap score
@@ -225,6 +240,10 @@ class Router:
         log_dir: Directory to store log files. If None, logs are only output to
             console. Default: None
         log_level: Logging level. Options: 'debug', 'info', 'warn', 'error'.
+        access_log_fields: Optional fields of the access-log record, each written
+            once listed: 'client_addr', 'forwarded_for', 'user_agent', 'tenant',
+            'key_id', 'request_bytes', 'response_bytes', 'worker'. An empty list
+            keeps the record's fields as they have always been. Default: []
         service_discovery: Enable Kubernetes service discovery. When enabled, the
             router will automatically discover worker pods based on the selector.
             Default: False
@@ -296,8 +315,9 @@ class Router:
         rate_limit_tokens_per_second: Sustained admission rate (requests per
             second), bursting up to max_concurrent_requests, which keeps bounding
             standing concurrency. Unset or 0 = no rate limit. Default: None
-        cors_allowed_origins: List of allowed origins for CORS. Empty list allows all
-            origins. Default: []
+        cors_allowed_origins: Exact origins a browser may call the gateway from, or
+            ['*'] alone for any origin. An empty list sends no CORS headers (no
+            cross-origin allowance). Default: []
         health_failure_threshold: Number of consecutive health check failures before
             marking worker unhealthy. Default: 3
         health_success_threshold: Number of consecutive health check successes before
@@ -414,6 +434,7 @@ class Router:
             postgres_config = PyPostgresConfig(
                 db_url=args_dict.get("postgres_db_url"),
                 pool_max=args_dict.get("postgres_pool_max", 16),
+                op_timeout_secs=args_dict.get("postgres_op_timeout_secs", 5),
             )
         args_dict["postgres_config"] = postgres_config
 
@@ -421,13 +442,21 @@ class Router:
         redis_config = None
         if history_backend == HistoryBackendType.Redis:
             retention_days = args_dict.get("redis_retention_days", 30)
-            # If retention_days is negative, it means persistent storage (None in Rust)
-            retention_arg = None if retention_days < 0 else retention_days
+            # -1 is the one spelling of persistent records (None in Rust); 0
+            # and the other negatives are refused by name, as the command
+            # line refuses them.
+            if retention_days < -1 or retention_days == 0:
+                raise ValueError(
+                    "redis_retention_days must be at least 1 "
+                    f"(-1 keeps records persistent), got {retention_days}"
+                )
+            retention_arg = None if retention_days == -1 else retention_days
 
             redis_config = PyRedisConfig(
                 url=args_dict.get("redis_url"),
                 pool_max=args_dict.get("redis_pool_max", 16),
                 retention_days=retention_arg,
+                op_timeout_secs=args_dict.get("redis_op_timeout_secs", 5),
             )
         args_dict["redis_config"] = redis_config
 
@@ -447,9 +476,11 @@ class Router:
             "oracle_pool_timeout_secs",
             "postgres_db_url",
             "postgres_pool_max",
+            "postgres_op_timeout_secs",
             "redis_url",
             "redis_pool_max",
             "redis_retention_days",
+            "redis_op_timeout_secs",
             # Control plane auth fields (converted to control_plane_auth)
             "control_plane_api_keys",
             "control_plane_audit_enabled",
@@ -457,6 +488,7 @@ class Router:
             "jwt_audience",
             "jwt_jwks_uri",
             "jwt_role_mapping",
+            "jwt_role_claim",
         ]
         for field in fields_to_remove:
             args_dict.pop(field, None)

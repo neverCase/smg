@@ -1,5 +1,7 @@
-//! Gemma 4's calls, written from the table's markers as the template's `format_argument` macro
-//! writes them: `<|tool_call>call:NAME{`, the arguments, `}<tool_call|>`. The arguments are
+//! Gemma's calls, written from the table's markers as Gemma 4's `format_argument` macro writes
+//! them: `<|tool_call>call:NAME{`, the arguments, `}<tool_call|>`, in the table's spelling of the
+//! string token and the null word (FunctionGemma: `<escape>`, `None`, between its own markers).
+//! The arguments are
 //! `key:value` pairs joined by `,` with no space, one per property of the tool's schema, in the
 //! order of the keys ignoring case (the template's `dictsort`), each optional unless the schema
 //! requires it; the comma stands between two present pairs only, so the pairs take the [`joined`]
@@ -10,47 +12,53 @@
 //! `]`. A property whose `type` is a list, or an `anyOf` or `oneOf`, takes one of its branches'
 //! spellings. A property that pins no type takes a string or a bare literal, and a schema without
 //! properties any pairs of a bare key and such a value: nothing nested, since the tag format has
-//! no rule that names itself. For the same reason the tag is bounded three ways, each falling back
-//! to a string or a bare literal: a definition that names itself is written once (the `$ref`
-//! pointers on the way down are kept), a value nests at most [`DEPTH`] levels, unions included,
-//! a tag spells at most [`VALUES`] values in all, which bounds the work, and an object's members
-//! take at most [`NODES`] nodes of the tree once [`joined`] has copied each pair into the starts
-//! before it, or the object takes any pairs instead, which bounds the size (estimated from the
-//! pairs before the copies are made). The last two bound a schema whose definitions are distinct
-//! at every level or reused across one (a chain of unions, a wide DAG), where the first two do
-//! not, so a request's schema gives a finite tag of bounded size in bounded time.
+//! no rule that names itself. For the same reason the tag is bounded, each bound falling back to
+//! a string or a bare literal: a definition that names itself is written once (the `$ref`
+//! pointers on the way down are kept); a value nests at most [`DEPTH`] levels, which bounds the
+//! walk's recursion; a tag spells at most [`VALUES`] values, which bounds its work however wide
+//! the schema; and an object's members take the full spelling where it fits [`NODES`] once
+//! [`joined`] has copied each pair into the starts before it, estimated before the copies are
+//! made with a JSON schema leaf counting by its size, else any pairs. An object's members hold
+//! every object below it, so the cap is the whole tag's, and a request's schema gives a finite
+//! tag of bounded size in bounded time.
 
 use openai_protocol::common::Tool;
 use serde_json::Value;
 
 use super::{
     schema::{joined, joined_nodes, keyword, shape, Definitions},
-    CallMarkers, Grammar, Tag,
+    CallMarkers, Count, Grammar, Tag,
 };
-use crate::gemma::STRING;
+use crate::gemma::Spelling;
 
-/// A bare literal as the template writes one: a number as Python prints it, `true`, `false` or
-/// `null`.
-const LITERAL: &str = r"-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?|true|false|null";
+/// A bare literal as the template writes one, but for the null word: a number as Python prints
+/// it, `true` or `false`; [`Ends::literal`] adds the spelling's null word, which is letters.
+const LITERALS: &str = r"-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?|true|false";
 /// A key written as it is: anything but the bytes that end or open a member.
 const KEY: &str = r"[^:,{}\[\]<]+";
-/// How deep a value may nest before its spelling gives way to a string or a bare literal; no
-/// recorded tool nests further. The cap is small because [`joined`] clones each pair into every
-/// start before it, so each level of optional pairs multiplies the tree.
+/// How deep a value may nest before its spelling gives way to a string or a bare literal: the walk
+/// recurses once per level on the request's thread, and a chain of distinct definitions could
+/// otherwise nest as deep as the value budget, which overflows a two-megabyte stack in a debug
+/// build; no recorded tool nests further.
 const DEPTH: usize = 8;
-/// How many nodes an object's members may take once [`joined`] has copied each pair into the
-/// starts before it; past that the object takes any pairs. With ten optional properties a pair is
-/// copied up to ten times, so an object of objects multiplies by that at every level, and this
-/// bounds the whole tree whatever the schema's shape.
-const NODES: usize = 2_048;
+/// How many nodes an object's members may take, the objects below it included, so the whole tag
+/// stays within it: the full spelling copies each pair into the starts before it ([`joined`]), and
+/// an object of objects would multiply by that at every level without the bound. Twenty-nine
+/// optional strings still take the full spelling; thirty take any pairs.
+const NODES: usize = 4_096;
+/// The JSON schema types, once each: the branches a `type` list can have.
+const TYPES: [&str; 7] = [
+    "string", "integer", "number", "boolean", "null", "object", "array",
+];
 /// How many values a tag spells before the rest give way to a string or a bare literal: the walk
 /// down a schema is depth first and eager, so this bounds its work whatever the schema's shape.
 const VALUES: usize = 256;
 
 /// What the walk down a schema carries: the `$ref` pointers on the way down, so a definition that
-/// names itself is written once, and the values left to spell.
+/// names itself is written once, the levels left of [`DEPTH`] and the values left to spell.
 struct Walk {
     expanding: Vec<String>,
+    depth: usize,
     values: usize,
 }
 
@@ -58,16 +66,24 @@ impl Walk {
     fn new() -> Self {
         Self {
             expanding: Vec::new(),
+            depth: DEPTH,
             values: VALUES,
         }
     }
 }
 
 /// The calls for `tools`: one tag per tool, triggered by the call's opener, `call:NAME{` after it,
-/// the arguments, then `}` and the call's close.
-pub(super) fn calls(markers: &CallMarkers<'_>, tools: &[&Tool], at_least_one: bool) -> Grammar {
+/// the arguments in `spelling`, then `}` and the call's close; as many as `count` lets the model
+/// write.
+pub(super) fn calls(
+    markers: &CallMarkers<'_>,
+    spelling: Spelling,
+    tools: &[&Tool],
+    count: Count<'_>,
+) -> Grammar {
     let ends = Ends {
         call_exits: &markers.call_exits,
+        spelling,
     };
     let tags = tools
         .iter()
@@ -75,43 +91,30 @@ pub(super) fn calls(markers: &CallMarkers<'_>, tools: &[&Tool], at_least_one: bo
             let parameters = &tool.function.parameters;
             Tag::new(
                 format!("{}call:{}{{", markers.call_open, tool.function.name),
-                ends.members(
-                    parameters,
-                    Definitions::of(parameters),
-                    DEPTH,
-                    &mut Walk::new(),
-                ),
+                ends.members(parameters, Definitions::of(parameters), &mut Walk::new()),
                 format!("}}{}", markers.call_close),
             )
         })
         .collect();
-    Grammar::TriggeredTags {
-        triggers: vec![markers.call_open.to_string()],
-        tags,
-        at_least_one,
-    }
+    count.triggered(vec![markers.call_open.to_string()], tags)
 }
 
 /// What ends a string's text besides its own token: the terminals the table has a row for out of
-/// the arguments state, which the engine takes wherever they stand inside a call.
+/// the arguments state, which the engine takes wherever they stand inside a call; and the table's
+/// spelling of the token and the null word.
 struct Ends<'a> {
     call_exits: &'a [&'a str],
+    spelling: Spelling,
 }
 
 impl Ends<'_> {
     /// The members of the object `schema` describes: one `key:value` pair per property, the keys
-    /// in sorted order ignoring case, joined by `,`; any pairs for a schema without properties, or
-    /// whose pairs would take more than [`NODES`] nodes once joined. The properties are read
-    /// through the schema's `$ref`, as every keyword is. `depth` is what
-    /// is left of [`DEPTH`]; `walk` carries the `$ref` pointers on the way down and the values
-    /// left to spell.
-    fn members(
-        &self,
-        schema: &Value,
-        definitions: Definitions<'_>,
-        depth: usize,
-        walk: &mut Walk,
-    ) -> Grammar {
+    /// in sorted order ignoring case, joined by `,`, where the spelling fits [`NODES`], estimated
+    /// from the pairs' weights before [`joined`] copies them; any pairs where it does not, and
+    /// for a schema without properties. The properties are read through the schema's `$ref`, as
+    /// every keyword is; `walk` carries the `$ref` pointers on the way down and the values left
+    /// to spell.
+    fn members(&self, schema: &Value, definitions: Definitions<'_>, walk: &mut Walk) -> Grammar {
         let target = definitions.target_of(schema);
         let properties = keyword(schema, target, "properties")
             .and_then(Value::as_object)
@@ -130,31 +133,28 @@ impl Ends<'_> {
             .map(|(key, property)| {
                 let pair = Grammar::Sequence(vec![
                     Grammar::ConstString(format!("{key}:")),
-                    self.value(property, definitions, depth, walk),
+                    self.value(property, definitions, walk),
                 ]);
                 (pair, required.contains(&key.as_str()))
             })
             .collect();
-        if joined_nodes(&pairs) > NODES {
-            return self.any_members();
+        let weights: Vec<(usize, bool)> = pairs
+            .iter()
+            .map(|(pair, required)| (pair.nodes(), *required))
+            .collect();
+        if joined_nodes(&weights) <= NODES {
+            joined(&pairs, ",")
+        } else {
+            self.any_members()
         }
-        joined(&pairs, ",")
     }
 
     /// A value as the template spells one, or a string or a bare literal where the value nests
     /// deeper than [`DEPTH`], the tag has spelled [`VALUES`] values already, or its `$ref` is one
     /// on the way down: a definition that names itself is written once.
-    fn value(
-        &self,
-        schema: &Value,
-        definitions: Definitions<'_>,
-        depth: usize,
-        walk: &mut Walk,
-    ) -> Grammar {
-        let Some(depth) = depth.checked_sub(1) else {
-            return self.any_value();
-        };
-        let Some(values) = walk.values.checked_sub(1) else {
+    fn value(&self, schema: &Value, definitions: Definitions<'_>, walk: &mut Walk) -> Grammar {
+        let (Some(depth), Some(values)) = (walk.depth.checked_sub(1), walk.values.checked_sub(1))
+        else {
             return self.any_value();
         };
         walk.values = values;
@@ -165,38 +165,41 @@ impl Ends<'_> {
             }
             walk.expanding.push(pointer.to_string());
         }
-        let grammar = self.typed(schema, definitions, depth, walk);
+        walk.depth = depth;
+        let grammar = self.typed(schema, definitions, walk);
+        walk.depth += 1;
         if pointer.is_some() {
             walk.expanding.pop();
         }
         grammar
     }
 
-    /// A value by what its schema says: one of its branches where the `type` is a list (each the
-    /// schema with that one type and the `enum` members of that type) or an `anyOf` or `oneOf`
-    /// stands, a union level counting as one of nesting; a string `enum` as one of its values
-    /// between the tokens; a
-    /// string between the tokens; `true`, `false` and `null` as the words; a number as the JSON
-    /// the property's schema accepts; an object and a list in this same spelling; a string or a
-    /// bare literal where the schema pins no type, or a pointer in it resolves to nothing. Every
-    /// keyword is read through the property's `$ref`, as [`shape`] reads them.
-    fn typed(
-        &self,
-        schema: &Value,
-        definitions: Definitions<'_>,
-        depth: usize,
-        walk: &mut Walk,
-    ) -> Grammar {
+    /// A value by what its schema says: one of its branches where the `type` is a list (each known
+    /// type once, the schema with that one type and the `enum` members of that type, none where
+    /// the `enum` has no member of the type) or an `anyOf` or `oneOf` stands; a string `enum` as
+    /// one of its values between the tokens; a string between the tokens; `true`, `false` and
+    /// `null` as the words; a number as the JSON the property's schema accepts; an object and a
+    /// list in this same spelling; a string or a bare literal where the schema pins no type, or a
+    /// pointer in it resolves to nothing. Every keyword is read through the property's `$ref`, as
+    /// [`shape`] reads them.
+    fn typed(&self, schema: &Value, definitions: Definitions<'_>, walk: &mut Walk) -> Grammar {
         let target = definitions.target_of(schema);
         if let Some(types) = keyword(schema, target, "type").and_then(Value::as_array) {
             // Each branch is the schema with that one type, the property's own keyword winning,
             // and the `enum` narrowed to the members of that type (OpenAI's strict mode writes a
-            // nullable enum as `"type": ["string", "null"], "enum": ["F", "C", null]`).
+            // nullable enum as `"type": ["string", "null"], "enum": ["F", "C", null]`); a type
+            // no member has admits nothing, since `enum` constrains every value, and has no
+            // branch. The known types once each, so a list cannot cost more than seven clones.
             let options = keyword(schema, target, "enum").and_then(Value::as_array);
-            let branches: Vec<Grammar> = types
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|one| {
+            let mut names: Vec<&str> = Vec::new();
+            for one in types.iter().filter_map(Value::as_str) {
+                if TYPES.contains(&one) && !names.contains(&one) {
+                    names.push(one);
+                }
+            }
+            let branches: Vec<Grammar> = names
+                .into_iter()
+                .filter_map(|one| {
                     let mut single = schema.clone();
                     if let Value::Object(map) = &mut single {
                         map.insert("type".to_string(), Value::String(one.to_string()));
@@ -207,13 +210,12 @@ impl Ends<'_> {
                                 .cloned()
                                 .collect();
                             if narrowed.is_empty() {
-                                map.remove("enum");
-                            } else {
-                                map.insert("enum".to_string(), Value::Array(narrowed));
+                                return None;
                             }
+                            map.insert("enum".to_string(), Value::Array(narrowed));
                         }
                     }
-                    self.typed(&single, definitions, depth, walk)
+                    Some(self.typed(&single, definitions, walk))
                 })
                 .collect();
             return one_of(branches, || self.any_value());
@@ -222,7 +224,7 @@ impl Ends<'_> {
             if let Some(members) = keyword(schema, target, union).and_then(Value::as_array) {
                 let branches: Vec<Grammar> = members
                     .iter()
-                    .map(|member| self.value(member, definitions, depth, walk))
+                    .map(|member| self.value(member, definitions, walk))
                     .collect();
                 return one_of(branches, || self.any_value());
             }
@@ -233,7 +235,10 @@ impl Ends<'_> {
                     options
                         .iter()
                         .filter_map(Value::as_str)
-                        .map(|option| Grammar::ConstString(format!("{STRING}{option}{STRING}")))
+                        .map(|option| {
+                            let token = self.spelling.string;
+                            Grammar::ConstString(format!("{token}{option}{token}"))
+                        })
                         .collect(),
                 );
             }
@@ -245,10 +250,11 @@ impl Ends<'_> {
             ]),
             Some(("object", _)) => Grammar::Sequence(vec![
                 Grammar::ConstString("{".to_string()),
-                self.members(schema, definitions, depth, walk),
+                self.members(schema, definitions, walk),
                 Grammar::ConstString("}".to_string()),
             ]),
-            Some(("array", _)) => self.list(schema, definitions, depth, walk),
+            Some(("array", _)) => self.list(schema, definitions, walk),
+            Some(("null", _)) => Grammar::ConstString(self.spelling.null.to_string()),
             Some((_, value)) => value,
             None => self.any_value(),
         }
@@ -256,16 +262,10 @@ impl Ends<'_> {
 
     /// A list as the template spells one: `[`, its items in this spelling joined by `,`, `]`; an
     /// item is what the schema's `items` pins, or a string or a bare literal when it pins nothing.
-    fn list(
-        &self,
-        schema: &Value,
-        definitions: Definitions<'_>,
-        depth: usize,
-        walk: &mut Walk,
-    ) -> Grammar {
+    fn list(&self, schema: &Value, definitions: Definitions<'_>, walk: &mut Walk) -> Grammar {
         let target = definitions.target_of(schema);
         let item = match keyword(schema, target, "items") {
-            Some(items) if items.is_object() => self.value(items, definitions, depth, walk),
+            Some(items) if items.is_object() => self.value(items, definitions, walk),
             _ => self.any_value(),
         };
         Grammar::Sequence(vec![
@@ -278,18 +278,24 @@ impl Ends<'_> {
     /// A string: the token, any text without the token or a marker the engine takes inside a
     /// call, the token.
     fn string(&self) -> Grammar {
+        let token = self.spelling.string;
         Grammar::Sequence(vec![
-            Grammar::ConstString(STRING.to_string()),
+            Grammar::ConstString(token.to_string()),
             Grammar::AnyText {
-                excludes: self.excluding(&[STRING]),
+                excludes: self.excluding(&[token]),
             },
-            Grammar::ConstString(STRING.to_string()),
+            Grammar::ConstString(token.to_string()),
         ])
+    }
+
+    /// A bare literal in the table's spelling: a number, `true`, `false`, or the null word.
+    fn literal(&self) -> String {
+        format!("{LITERALS}|{}", self.spelling.null)
     }
 
     /// A value the schema does not type: a string, or a bare literal.
     fn any_value(&self) -> Grammar {
-        Grammar::Or(vec![self.string(), Grammar::Regex(LITERAL.to_string())])
+        Grammar::Or(vec![self.string(), Grammar::Regex(self.literal())])
     }
 
     /// The members of an object the schema gives no properties: pairs of a bare key, `:` and a
@@ -378,8 +384,13 @@ mod tests {
         ]})
     }
 
+    /// A bare literal in Gemma 4's spelling.
+    fn literal() -> String {
+        format!("{LITERALS}|null")
+    }
+
     fn untyped() -> Value {
-        value!({"type": "or", "elements": [text(), {"type": "regex", "pattern": LITERAL}]})
+        value!({"type": "or", "elements": [text(), {"type": "regex", "pattern": literal()}]})
     }
 
     fn pair(key: &str, value: Value) -> Value {
@@ -387,6 +398,21 @@ mod tests {
             {"type": "const_string", "value": format!("{key}:")},
             value,
         ]})
+    }
+
+    /// An object's members as the grammar writes them past the cap, and for a schema without
+    /// properties: pairs of a bare key and a string or a bare literal, in any order and number,
+    /// or none.
+    fn any_pairs() -> Value {
+        let pair = value!({"type": "sequence", "elements": [
+            {"type": "regex", "pattern": KEY},
+            {"type": "const_string", "value": ":"},
+            untyped(),
+        ]});
+        value!({"type": "optional", "content": {"type": "sequence", "elements": [
+            pair,
+            {"type": "star", "content": then(pair)},
+        ]}})
     }
 
     fn then(pair: Value) -> Value {
@@ -466,6 +492,59 @@ mod tests {
     }
 
     #[test]
+    fn function_gemma_spells_its_string_token_and_null_word() {
+        // functiongemma-270m-it: the tag between its own markers, a string between `<escape>`
+        // tokens, a null `None`, `true` and `false` as under Gemma 4; the untyped value's literal
+        // takes the same word.
+        let tools = [tool(
+            "note",
+            value!({"type": "object", "properties": {
+                "title": {"type": "string"},
+                "due": {"type": ["string", "null"]},
+                "done": {"type": "boolean"},
+                "extra": {},
+            }, "required": ["title", "due", "done", "extra"]}),
+        )];
+        let payload = formats::function_gemma()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        let string = value!({"type": "sequence", "elements": [
+            {"type": "const_string", "value": "<escape>"},
+            {"type": "any_text", "excludes": ["<escape>", "<end_function_call>"]},
+            {"type": "const_string", "value": "<escape>"},
+        ]});
+        let none = value!({"type": "const_string", "value": "None"});
+        let done = value!({"type": "or", "elements": [
+            {"type": "const_string", "value": "true"},
+            {"type": "const_string", "value": "false"},
+        ]});
+        let extra = value!({"type": "or", "elements": [
+            string,
+            {"type": "regex", "pattern": format!("{LITERALS}|None")},
+        ]});
+        assert_eq!(
+            payload,
+            value!({"format": {
+                "type": "triggered_tags",
+                "triggers": ["<start_function_call>"],
+                "tags": [{
+                    "type": "tag",
+                    "begin": "<start_function_call>call:note{",
+                    "content": {"type": "sequence", "elements": [
+                        pair("done", done),
+                        then(pair("due", value!({"type": "or", "elements": [string, none]}))),
+                        then(pair("extra", extra)),
+                        then(pair("title", string)),
+                    ]},
+                    "end": "}<end_function_call>",
+                }],
+                "at_least_one": true,
+            }})
+        );
+    }
+
+    #[test]
     fn an_object_and_a_list_take_the_same_spelling_and_an_enum_stands_between_the_tokens() {
         // Recorded: `new_preferences:{size:<|"|>large<|"|>,temperature:<|"|>hot<|"|>}` and
         // `recipients:[<|"|>admin@example.com<|"|>,<|"|>support@example.com<|"|>]`, `t0:null`.
@@ -536,7 +615,8 @@ mod tests {
     #[test]
     fn a_string_enum_behind_a_reference_takes_the_tokens_and_a_number_keeps_its_definitions() {
         // Pydantic writes an `Enum` field as a `$ref` to a definition holding the `enum`; a
-        // number's schema goes to the engine as a document of its own, its definitions attached.
+        // number's schema goes to the engine as a document of its own, the definition it reaches
+        // attached and no other.
         let root = value!({
             "type": "object",
             "properties": {
@@ -550,43 +630,29 @@ mod tests {
         });
         let ends = Ends {
             call_exits: &["<tool_call|>"],
+            spelling: Spelling::GEMMA4,
         };
         let definitions = Definitions::of(&root);
         assert_eq!(
-            ends.value(
-                &root["properties"]["unit"],
-                definitions,
-                DEPTH,
-                &mut Walk::new()
-            )
-            .to_json(),
+            ends.value(&root["properties"]["unit"], definitions, &mut Walk::new())
+                .to_json(),
             value!({"type": "or", "elements": [
                 {"type": "const_string", "value": "<|\"|>c<|\"|>"},
                 {"type": "const_string", "value": "<|\"|>f<|\"|>"},
             ]})
         );
         assert_eq!(
-            ends.value(
-                &root["properties"]["count"],
-                definitions,
-                DEPTH,
-                &mut Walk::new()
-            )
-            .to_json(),
+            ends.value(&root["properties"]["count"], definitions, &mut Walk::new())
+                .to_json(),
             value!({"type": "json_schema", "json_schema": {
                 "$ref": "#/$defs/Count",
-                "$defs": root["$defs"],
+                "$defs": {"Count": {"type": "integer"}},
             }})
         );
         // A list without an item schema takes strings or bare literals.
         assert_eq!(
-            ends.value(
-                &value!({"type": "array"}),
-                definitions,
-                DEPTH,
-                &mut Walk::new()
-            )
-            .to_json()["elements"][1]["content"]["elements"][0],
+            ends.value(&value!({"type": "array"}), definitions, &mut Walk::new())
+                .to_json()["elements"][1]["content"]["elements"][0],
             untyped()
         );
     }
@@ -617,11 +683,10 @@ mod tests {
         });
         let ends = Ends {
             call_exits: &["<tool_call|>"],
+            spelling: Spelling::GEMMA4,
         };
         let definitions = Definitions::of(&root);
-        let members = ends
-            .members(&root, definitions, DEPTH, &mut Walk::new())
-            .to_json();
+        let members = ends.members(&root, definitions, &mut Walk::new()).to_json();
         let members = members["elements"].as_array().expect("four pairs");
         let node = value!({"type": "sequence", "elements": [
             {"type": "const_string", "value": "{"},
@@ -686,10 +751,11 @@ mod tests {
         });
         let ends = Ends {
             call_exits: &["<tool_call|>"],
+            spelling: Spelling::GEMMA4,
         };
         let written = serde_json::to_string(
             &ends
-                .members(&chain, Definitions::of(&chain), DEPTH, &mut Walk::new())
+                .members(&chain, Definitions::of(&chain), &mut Walk::new())
                 .to_json(),
         )
         .expect("JSON");
@@ -697,8 +763,8 @@ mod tests {
 
         // Eight definitions, each ten optional properties referring to the next: distinct along
         // the path, within the depth, so the value budget bounds the walk (ten to the eighth
-        // values otherwise) and the node cap the tree (the pairs are copied into the starts before
-        // them, so an object of objects takes any pairs instead of its spelling).
+        // values otherwise) and the node cap the tree, the whole of it, since an object's members
+        // hold every object below.
         let mut defs = serde_json::Map::new();
         for i in 0..8 {
             let mut properties = serde_json::Map::new();
@@ -722,15 +788,14 @@ mod tests {
             "$defs": defs,
         });
         let mut walk = Walk::new();
-        let grammar = ends.members(&wide, Definitions::of(&wide), DEPTH, &mut walk);
-        let written = serde_json::to_string(&grammar.to_json()).expect("JSON");
+        let grammar = ends.members(&wide, Definitions::of(&wide), &mut walk);
         assert_eq!(walk.values, 0, "the budget is spent");
-        assert!(written.len() < 300_000, "{} bytes", written.len());
+        assert!(grammar.nodes() <= NODES, "{} nodes", grammar.nodes());
 
         // Ten optional properties, each an object of ten optional strings: 110 values, within the
         // budget, but the outer pairs would be copied into the starts before them (each with the
-        // inner object's own copies), past the node cap, so the outer object takes any pairs and
-        // the inner ones keep their spelling.
+        // inner object's own copies), past the node cap, so the object takes any pairs, the inner
+        // spellings with it: the fallback is one, and it is the whole object's.
         let mut inner = serde_json::Map::new();
         for j in 0..10 {
             inner.insert(format!("s{j}"), value!({"type": "string"}));
@@ -744,57 +809,114 @@ mod tests {
         }
         let two_levels = value!({"type": "object", "properties": outer});
         let mut walk = Walk::new();
-        let grammar = ends.members(&two_levels, Definitions::of(&two_levels), DEPTH, &mut walk);
-        let written = serde_json::to_string(&grammar.to_json()).expect("JSON");
-        assert_eq!(walk.values, VALUES - 110);
-        let key = serde_json::to_string(KEY).expect("JSON");
-        assert!(
-            written.contains(&key),
-            "the outer object takes any pairs: {written}"
+        let grammar = ends.members(&two_levels, Definitions::of(&two_levels), &mut walk);
+        assert_eq!(
+            walk.values,
+            VALUES - 110,
+            "the values are walked before the cap is read"
         );
-        assert!(written.len() < 10_000, "{} bytes", written.len());
+        assert_eq!(grammar.to_json(), any_pairs());
     }
 
     #[test]
     fn a_nullable_enum_keeps_its_members_in_the_string_branch() {
         // OpenAI's strict mode: `{"type": ["string", "null"], "enum": ["F", "C", null]}` is one
         // of the two strings between the tokens, or `null`; a list type whose enum lists no
-        // `null` takes its enum in the string branch alone.
+        // `null` admits none, so its null branch is dropped and the enum stands alone; a type
+        // listed twice is one branch.
         let ends = Ends {
             call_exits: &["<tool_call|>"],
+            spelling: Spelling::GEMMA4,
         };
         let root = value!({});
         let definitions = Definitions::of(&root);
-        for unit in [
-            value!({"type": ["string", "null"], "enum": ["F", "C", null]}),
-            value!({"type": ["string", "null"], "enum": ["F", "C"]}),
-        ] {
-            assert_eq!(
-                ends.value(&unit, definitions, DEPTH, &mut Walk::new())
-                    .to_json(),
-                value!({"type": "or", "elements": [
-                    {"type": "or", "elements": [
-                        {"type": "const_string", "value": "<|\"|>F<|\"|>"},
-                        {"type": "const_string", "value": "<|\"|>C<|\"|>"},
-                    ]},
-                    {"type": "const_string", "value": "null"},
-                ]}),
-                "{unit}"
-            );
-        }
+        let strings = value!({"type": "or", "elements": [
+            {"type": "const_string", "value": "<|\"|>F<|\"|>"},
+            {"type": "const_string", "value": "<|\"|>C<|\"|>"},
+        ]});
+        let nullable = value!({"type": ["string", "null"], "enum": ["F", "C", null]});
+        assert_eq!(
+            ends.value(&nullable, definitions, &mut Walk::new())
+                .to_json(),
+            value!({"type": "or", "elements": [
+                strings,
+                {"type": "const_string", "value": "null"},
+            ]})
+        );
+        let not_null = value!({"type": ["string", "null"], "enum": ["F", "C"]});
+        assert_eq!(
+            ends.value(&not_null, definitions, &mut Walk::new())
+                .to_json(),
+            strings
+        );
+        let repeated = value!({"type": ["null", "null", "null", "string", "unknown"]});
+        assert_eq!(
+            ends.value(&repeated, definitions, &mut Walk::new())
+                .to_json(),
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "null"},
+                text(),
+            ]})
+        );
     }
 
     #[test]
-    fn a_value_nested_past_the_depth_is_untyped_so_the_tag_stays_bounded() {
-        // Twelve objects, each the only property of the one above: the spelling stops at `DEPTH`.
+    fn past_the_node_cap_an_object_takes_any_pairs() {
+        // Twenty-nine optional strings take 3,859 nodes once joined (each pair copied into the
+        // starts before it, with its separator and option), within the cap: the eighth pair
+        // stands in eight starts. Thirty would take 4,127, past it: the object writes any pairs
+        // instead, each a bare key and a string or a bare literal, in any order and number.
+        let strings = |count: usize| {
+            let mut properties = serde_json::Map::new();
+            for i in 0..count {
+                properties.insert(format!("k{i:02}"), value!({"type": "string"}));
+            }
+            value!({"type": "object", "properties": properties})
+        };
+        let ends = Ends {
+            call_exits: &["<tool_call|>"],
+            spelling: Spelling::GEMMA4,
+        };
+        let fits = strings(29);
+        let grammar = ends.members(&fits, Definitions::of(&fits), &mut Walk::new());
+        assert_eq!(grammar.nodes(), 3_859);
+        let written = serde_json::to_string(&grammar.to_json()).expect("JSON");
+        assert_eq!(written.matches("\"k07:\"").count(), 8, "{written}");
+        let past = strings(30);
+        let grammar = ends.members(&past, Definitions::of(&past), &mut Walk::new());
+        assert_eq!(grammar.to_json(), any_pairs());
+
+        // A number behind a reference carries the definition it reaches in its JSON schema, which
+        // every copy repeats, and the leaf counts by its size: ten pairs reaching a definition of
+        // two thousand enum values pass the cap, and the object takes any pairs.
+        let mut properties = serde_json::Map::new();
+        for i in 0..10 {
+            properties.insert(format!("n{i}"), value!({"$ref": "#/$defs/Big"}));
+        }
+        let heavy = value!({
+            "type": "object",
+            "properties": properties,
+            "$defs": {"Big": {"type": "integer", "enum": (0..2000).collect::<Vec<i32>>()}},
+        });
+        let grammar = ends.members(&heavy, Definitions::of(&heavy), &mut Walk::new());
+        assert_eq!(grammar.to_json(), any_pairs());
+    }
+
+    #[test]
+    fn a_value_nested_past_the_depth_is_untyped_so_the_walk_stays_shallow() {
+        // Twelve objects, each the only property of the one above: the spelling stops at `DEPTH`,
+        // so the walk recurses no deeper whatever a request nests or chains through its
+        // definitions (left to the value budget, it went two hundred and fifty-seven levels down
+        // and overflowed the test thread's stack).
         let mut schema = value!({"type": "string"});
         for _ in 0..12 {
             schema = value!({"type": "object", "properties": {"n": schema}, "required": ["n"]});
         }
         let ends = Ends {
             call_exits: &["<tool_call|>"],
+            spelling: Spelling::GEMMA4,
         };
-        let grammar = ends.members(&schema, Definitions::of(&schema), DEPTH, &mut Walk::new());
+        let grammar = ends.members(&schema, Definitions::of(&schema), &mut Walk::new());
         let written = serde_json::to_string(&grammar.to_json()).expect("JSON");
         // The first `DEPTH` values are typed, each an object with its `n:` pair; the value below
         // the last of them is untyped, and the string at the bottom is never reached.

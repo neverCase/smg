@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +41,35 @@ type GrpcClient struct {
 	bufferSizes     ChannelBufferSizes
 	timeouts        Timeouts
 	requestCounter  uint64 // Atomic counter to ensure unique request IDs
+	// The engine's weight version, the chunks' system_fingerprint (the
+	// gateway's value); read once from the engine's model information at
+	// the first stream, blank when the engine reports none or does not
+	// answer in time (the converter then uses the gateway's default).
+	weightVersion     string
+	weightVersionOnce sync.Once
+}
+
+// modelInfoBound is how long the first stream waits for the engine's model
+// information before going on without a weight version.
+const modelInfoBound = 2 * time.Second
+
+// weightVersionOf reads the engine's weight version once, under its own
+// bound: the first caller's cancellation or deadline must not pin the value
+// for the client's lifetime, so the lookup detaches from the request context
+// and keeps only its values. A failure is logged, and the converter uses the
+// gateway's default from then on.
+func (c *GrpcClient) weightVersionOf(ctx context.Context) string {
+	c.weightVersionOnce.Do(func() {
+		infoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), modelInfoBound)
+		defer cancel()
+		info, err := c.client.GetModelInfo(infoCtx, &proto.GetModelInfoRequest{})
+		if err != nil {
+			log.Printf("smg: model info lookup failed; system_fingerprint is the default: %v", err)
+			return
+		}
+		c.weightVersion = info.GetWeightVersion()
+	})
+	return c.weightVersion
 }
 
 type ChannelBufferSizes struct {
@@ -152,13 +182,17 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 		RequireReasoning: requireReasoning,
 	}
 
-	// Set sampling parameters
+	// Set sampling parameters. Special tokens are skipped as the request
+	// asks, unless the response parser needs the engine's tool-call markers
+	// kept (tools under a choice that allows calls, no JSON-schema
+	// constraint): the preprocessor derives the flag the way the in-library
+	// request paths do, and the converter below decodes with the same one.
 	samplingParams := &proto.SamplingParams{
 		Temperature:                1.0,
 		TopP:                       1.0,
 		TopK:                       -1,
 		RepetitionPenalty:          1.0,
-		SkipSpecialTokens:          true,
+		SkipSpecialTokens:          preprocessed.SkipSpecialTokens,
 		SpacesBetweenSpecialTokens: true,
 	}
 
@@ -220,11 +254,10 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 	if err != nil {
 		return nil, fmt.Errorf("failed to create gRPC stream: %w", err)
 	}
-	toolsJSON := ""
-	if tools, ok := reqMap["tools"].([]interface{}); ok && len(tools) > 0 {
-		toolsBytes, _ := json.Marshal(tools)
-		toolsJSON = string(toolsBytes)
-	}
+	// The tools the response parser resolves calls against: the request-level
+	// tools and the tools declared on messages, as the preprocessor resolved
+	// them (the set its constraint was built from).
+	toolsJSON := preprocessed.ToolsJSON
 
 	toolChoiceJSON := ""
 	if toolChoice, ok := reqMap["tool_choice"]; ok {
@@ -247,11 +280,6 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 		}
 	}
 
-	skipSpecialTokens := true
-	if skipSpecialTokensVal, ok := reqMap["skip_special_tokens"].(bool); ok {
-		skipSpecialTokens = skipSpecialTokensVal
-	}
-
 	if c.tokenizerHandle == nil {
 		stream.CloseSend()
 		return nil, fmt.Errorf("tokenizer handle is nil (should be created at startup)")
@@ -265,8 +293,9 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 		toolChoiceJSON,
 		stopJSON,
 		stopTokenIDs,
-		skipSpecialTokens,
+		preprocessed.SkipSpecialTokens,
 		preprocessed.PromptTokens, // Pass initial prompt tokens from preprocessing
+		c.weightVersionOf(ctx),
 	)
 	if err != nil {
 		stream.CloseSend()

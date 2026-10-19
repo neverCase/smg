@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-    common::{ContentPart, ResponseFormat},
+    common::{invalid, ContentPart, ResponseFormat},
 };
 
 pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
@@ -53,7 +53,7 @@ fn validate_single_token_limit(
 /// them, naming the message. Historical `arguments` are not inspected (the
 /// public API takes any string there). Linear in the number of messages
 /// and calls.
-fn validate_tool_message_pairing(
+pub(super) fn validate_tool_message_pairing(
     messages: &[ChatMessage],
 ) -> Result<(), validator::ValidationError> {
     // The call ids of the last assistant `tool_calls` turn still unanswered
@@ -125,12 +125,6 @@ fn validate_tool_message_pairing(
     }
 }
 
-fn invalid(code: &'static str, message: String) -> validator::ValidationError {
-    let mut e = validator::ValidationError::new(code);
-    e.message = Some(message.into());
-    e
-}
-
 /// `response_format: {"type": "json_object"}` needs the word "json" somewhere
 /// in the messages, as the public API requires: without the instruction the
 /// model may stream whitespace until the token cap.
@@ -193,7 +187,7 @@ fn validate_strict_schemas(req: &ChatCompletionRequest) -> Result<(), validator:
             }
         }
     }
-    for (index, tool) in req.tools.iter().flatten().enumerate() {
+    for (index, tool) in req.tools.as_deref().into_iter().flatten().enumerate() {
         if tool.function.strict != Some(true) {
             continue;
         }

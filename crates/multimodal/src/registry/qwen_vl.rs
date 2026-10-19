@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
-
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
@@ -51,10 +49,6 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
         Ok(HashMap::from([(Modality::Image, 10)]))
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
-    }
-
     fn prompt_replacements(
         &self,
         metadata: &ModelMetadata,
@@ -64,14 +58,12 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
         let placeholder_token = self.placeholder_token(metadata)?;
         // The chat template already wraps each image with <|vision_start|> ... <|vision_end|>,
         // so we only expand the single <image> placeholder to N pad tokens.
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&num_tokens| {
-                let tokens = vec![pad_token_id; num_tokens];
-                PromptReplacement::sequence(Modality::Image, &placeholder_token, tokens)
-            })
-            .collect())
+        Ok(PromptReplacement::repeated_per_item(
+            Modality::Image,
+            &placeholder_token,
+            pad_token_id,
+            &preprocessed.feature_token_counts,
+        ))
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {

@@ -32,6 +32,53 @@ def _first_attr(obj: Any, names: tuple[str, ...], default: Any = 0) -> Any:
     return default
 
 
+def effective_running_window(snapshots: Iterable[Any], attention_dp_size: int = 1) -> int:
+    """The running window the schedulers enforce, in the units of the
+    ``--max-running-requests`` flag, read off their published load snapshots;
+    0 while no rank has published one.
+
+    The server argument of the same name is ``None`` unless the operator set
+    the flag; the scheduler then computes the bound itself (from its memory
+    pool, capped by its state cache) and the gateway, which reads the window
+    off the server arguments, saw none: its PD admission gate stayed off for
+    the worker and its fleet capacity fell back to an estimate. The snapshot
+    carries the computed figure, the one ``GetLoads`` already reports.
+
+    Each snapshot's figure is one attention-DP worker's bound: the engine
+    splits the flag across its attention-DP workers (``flag // attn_dp_size``)
+    and each scheduler publishes its own share, so the flag's units are the
+    smallest published share (one rank's bound is the bound a request meets)
+    times ``attention_dp_size`` (1 without attention DP, where every scheduler
+    runs the whole flag). Not clamped: the gateway saturates a figure wider
+    than its count instead of reading it as no window, and under dp-aware
+    routing divides an attention-DP engine's window per rank worker before it
+    does, so a clamp here would hand a large engine's ranks less than they
+    run.
+    """
+    windows = []
+    for snapshot in snapshots:
+        window = getattr(snapshot, "max_running_requests", 0)
+        if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+            continue
+        windows.append(window)
+    return min(windows, default=0) * max(1, int(attention_dp_size))
+
+
+def ranks_with_a_window(snapshots: Iterable[Any]) -> int:
+    """How many of the published snapshots carry a positive running window:
+    the snapshot reader skips the slots of ranks that have not published yet,
+    so a read with fewer than the engine's ranks is a partial one, whose
+    smallest figure may still be corrected by a rank with a smaller bound.
+    """
+    count = 0
+    for snapshot in snapshots:
+        window = getattr(snapshot, "max_running_requests", 0)
+        if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+            continue
+        count += 1
+    return count
+
+
 def convert_loads_to_protobuf(result: LoadSnapshot) -> sglang_scheduler_pb2.SchedulerLoad:
     """Convert a LoadSnapshot to a protobuf SchedulerLoad message."""
     scheduler_load = sglang_scheduler_pb2.SchedulerLoad(

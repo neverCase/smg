@@ -16,7 +16,7 @@
 
 use std::{error::Error as _, sync::Arc};
 
-use axum::http::StatusCode;
+use axum::{http::StatusCode, response::Response};
 use bytes::Bytes;
 use serde_json::json;
 use tracing::warn;
@@ -32,6 +32,25 @@ use crate::{
 
 /// The route whose streams end with the Messages API's own error event.
 const MESSAGES_ROUTE: &str = "/v1/messages";
+
+/// Response extension: the successful head of a streamed response was
+/// recorded on the worker's circuit breaker before the relay task was
+/// spawned, so the caller does not record it again (a second success sample
+/// would count twice toward closing a half-open breaker).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HeadSuccessRecorded;
+
+/// Mark `response` as a streamed response whose successful head was recorded
+/// before its relay was spawned (see [`HeadSuccessRecorded`]).
+pub(crate) fn mark_head_success_recorded(response: &mut Response) {
+    response.extensions_mut().insert(HeadSuccessRecorded);
+}
+
+/// Whether the successful head of `response` was recorded before its relay
+/// was spawned, so its caller must not record it again.
+pub(crate) fn head_success_recorded(response: &Response) -> bool {
+    response.extensions().get::<HeadSuccessRecorded>().is_some()
+}
 
 /// An upstream body error, classed the way a failed dispatch of it is: the
 /// client's timeout expiring mid-body is a gateway timeout, as it is when it
@@ -97,10 +116,10 @@ impl RelaySource {
         )
     }
 
-    /// The response to `route` for `model`, read from the decode leg `worker`
+    /// The response to `route` for `model`, read from the decode side `worker`
     /// of a disaggregated prefill/decode pair: a cut is the decode worker's
     /// failure, counted under the disaggregated router's labels.
-    pub(crate) fn decode_leg(model: &str, route: &'static str, worker: Arc<dyn Worker>) -> Self {
+    pub(crate) fn decode_side(model: &str, route: &'static str, worker: Arc<dyn Worker>) -> Self {
         Self::with_labels(
             model,
             route,
@@ -139,6 +158,14 @@ impl RelaySource {
     /// route, how far the response had come and
     /// the cause. The task runs under the request's span, so the line carries
     /// the request's id as every line of the request does.
+    ///
+    /// The breaker sample sits outside the request's attempt ledger on
+    /// purpose: the relay task outlives the attempt that produced the head.
+    /// The shared relay (`routers::http::stream_relay`) records a
+    /// successful head before it spawns its task, for the regular router and
+    /// the PD router's decode side alike, so the cut is sampled after the
+    /// head's success and never erased by it. A request retried onto the same worker
+    /// after a failed head is charged for that head and for the cut.
     pub(crate) fn account(&self, cut: &UpstreamCut, bytes_relayed: u64) {
         let error_type = error_type_from_status(cut.status);
         warn!(
@@ -188,6 +215,27 @@ impl RelaySource {
             let event = json!({"error": {"message": message, "type": STREAM_ERROR_TYPE}});
             Bytes::from(format!("data: {event}\n\ndata: [DONE]\n\n"))
         }
+    }
+
+    /// [`Self::error_event`] written on its own frame: when `sent_tail` (the
+    /// last bytes relayed, kept by [`note_sent`]) does not stand on a frame
+    /// boundary, a blank line opens one first, so a cut inside a frame
+    /// leaves the partial line as it is and the event parses on its own.
+    /// The regular relay and the disaggregated router's decode relay end a
+    /// cut SSE body with it.
+    pub(crate) fn error_event_on_its_own_frame(
+        &self,
+        cut: &UpstreamCut,
+        sent_tail: &[u8],
+    ) -> Bytes {
+        let event = self.error_event(cut);
+        if on_frame_boundary(sent_tail) {
+            return event;
+        }
+        let mut framed = Vec::with_capacity(event.len() + 2);
+        framed.extend_from_slice(b"\n\n");
+        framed.extend_from_slice(&event);
+        Bytes::from(framed)
     }
 }
 
@@ -332,15 +380,15 @@ mod tests {
         );
     }
 
-    /// The decode leg of a disaggregated pair is charged as the decode
+    /// The decode side of a disaggregated pair is charged as the decode
     /// worker's failure, under the disaggregated router's labels.
     #[test]
-    fn a_cut_on_the_decode_leg_is_counted_under_the_disaggregated_router_s_labels() {
+    fn a_cut_on_the_decode_side_is_counted_under_the_disaggregated_router_s_labels() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let worker = worker();
         let source =
-            RelaySource::decode_leg("relay-test", "/v1/chat/completions", Arc::clone(&worker));
+            RelaySource::decode_side("relay-test", "/v1/chat/completions", Arc::clone(&worker));
 
         metrics::with_local_recorder(&recorder, || {
             source.account(&cut(StatusCode::BAD_GATEWAY), 839);
@@ -420,6 +468,22 @@ mod tests {
             other => panic!("the protocol's error event, got {other:?}"),
         }
         assert!(!text.contains("[DONE]"), "{text:?}");
+    }
+
+    /// After a partial line the event opens a frame of its own; on a
+    /// boundary it is written as it is.
+    #[test]
+    fn the_event_that_ends_a_cut_opens_a_frame_after_a_partial_line() {
+        let (source, _worker) = source("/v1/chat/completions");
+        let cut = cut(StatusCode::BAD_GATEWAY);
+        let on_boundary = source.error_event_on_its_own_frame(&cut, b"}\n\n");
+        assert_eq!(on_boundary, source.error_event(&cut));
+        let after_partial = source.error_event_on_its_own_frame(&cut, b"\"con");
+        assert!(
+            after_partial.starts_with(b"\n\ndata: "),
+            "{after_partial:?}"
+        );
+        assert_eq!(&after_partial[2..], &source.error_event(&cut)[..]);
     }
 
     /// The boundary is read from the last bytes sent, across chunks.

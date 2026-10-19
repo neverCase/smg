@@ -10,7 +10,7 @@ use openai_protocol::{
     },
 };
 use smg::{
-    config::RouterConfig,
+    config::{RouterConfig, RouterConfigBuilder},
     endpoints::conversations,
     routers::RouterFactory,
     tenant::{RouteRequestMeta, TenantKey},
@@ -26,6 +26,41 @@ const TEST_INTERNAL_MCP_ERROR_MARKER: &str = "internal-mcp-failure-marker";
 
 fn test_tenant_meta() -> smg::middleware::TenantRequestMeta {
     RouteRequestMeta::new(TenantKey::from("test-tenant"))
+}
+
+/// What every router of these tests shares: OpenAI mode over `worker_urls`,
+/// the random policy, the loopback host on an ephemeral port, an 8 MiB
+/// payload cap, a one-minute request timeout, a one-second startup check
+/// interval and a five-second queue timeout.
+fn router_builder(worker_urls: Vec<String>) -> RouterConfigBuilder {
+    RouterConfig::builder()
+        .openai_mode(worker_urls)
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .queue_timeout_secs(5)
+}
+
+/// The router of a test that drives a mock worker at `worker_url`: five
+/// seconds for the worker to come up, 32 requests in flight.
+fn worker_router_config(worker_url: String) -> RouterConfig {
+    router_builder(vec![worker_url])
+        .worker_startup_timeout_secs(5)
+        .max_concurrent_requests(32)
+        .build_unchecked()
+}
+
+/// The router of the conversation tests: a worker address nothing calls, one
+/// second for it to come up, 8 requests in flight.
+fn conversation_router_config() -> RouterConfig {
+    router_builder(vec!["http://localhost".to_string()])
+        .worker_startup_timeout_secs(1)
+        .max_concurrent_requests(8)
+        .build_unchecked()
 }
 
 #[tokio::test]
@@ -52,20 +87,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    // Build router config (HTTP OpenAI mode)
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     // Create router and context with MCP config from file
     let ctx =
@@ -258,19 +280,7 @@ async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -407,19 +417,7 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -542,19 +540,7 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -676,19 +662,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -859,19 +833,7 @@ async fn test_final_response_hides_internal_mcp_error_details() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -959,19 +921,7 @@ async fn test_final_response_hides_internal_mcp_error_details() {
 #[tokio::test]
 async fn test_conversations_crud_basic() {
     // Router in OpenAI mode (no actual upstream calls in these tests)
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -979,7 +929,8 @@ async fn test_conversations_crud_basic() {
     // Create
     let create_body = serde_json::json!({ "metadata": { "project": "alpha" } });
     let create_resp =
-        conversations::create_conversation(&ctx.conversation_storage, create_body.clone()).await;
+        conversations::create_conversation(&ctx.conversation_storage, None, create_body.clone())
+            .await;
     assert_eq!(create_resp.status(), StatusCode::OK);
     let create_bytes = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
         .await
@@ -990,7 +941,7 @@ async fn test_conversations_crud_basic() {
     assert_eq!(create_json["object"], "conversation");
 
     // Get
-    let get_resp = conversations::get_conversation(&ctx.conversation_storage, conv_id).await;
+    let get_resp = conversations::get_conversation(&ctx.conversation_storage, None, conv_id).await;
     assert_eq!(get_resp.status(), StatusCode::OK);
     let get_bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
         .await
@@ -1000,9 +951,13 @@ async fn test_conversations_crud_basic() {
 
     // Update (merge)
     let update_body = serde_json::json!({ "metadata": { "owner": "alice" } });
-    let upd_resp =
-        conversations::update_conversation(&ctx.conversation_storage, conv_id, update_body.clone())
-            .await;
+    let upd_resp = conversations::update_conversation(
+        &ctx.conversation_storage,
+        None,
+        conv_id,
+        update_body.clone(),
+    )
+    .await;
     assert_eq!(upd_resp.status(), StatusCode::OK);
     let upd_bytes = axum::body::to_bytes(upd_resp.into_body(), usize::MAX)
         .await
@@ -1012,7 +967,8 @@ async fn test_conversations_crud_basic() {
     assert_eq!(upd_json["metadata"]["owner"], serde_json::json!("alice"));
 
     // Delete
-    let del_resp = conversations::delete_conversation(&ctx.conversation_storage, conv_id).await;
+    let del_resp =
+        conversations::delete_conversation(&ctx.conversation_storage, None, conv_id).await;
     assert_eq!(del_resp.status(), StatusCode::OK);
     let del_bytes = axum::body::to_bytes(del_resp.into_body(), usize::MAX)
         .await
@@ -1021,26 +977,8 @@ async fn test_conversations_crud_basic() {
     assert_eq!(del_json["deleted"], serde_json::json!(true));
 
     // Get again -> 404
-    let not_found = conversations::get_conversation(&ctx.conversation_storage, conv_id).await;
+    let not_found = conversations::get_conversation(&ctx.conversation_storage, None, conv_id).await;
     assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
-}
-
-/// The router configuration of the conversation tests: OpenAI mode, no
-/// upstream calls, the memory storage backends.
-fn conversation_router_config() -> RouterConfig {
-    RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked()
 }
 
 /// The JSON body of a response that must be a 200.
@@ -1066,14 +1004,16 @@ async fn a_conversation_without_metadata_answers_an_empty_metadata_object(
     let ctx = crate::common::create_test_context(conversation_router_config()).await;
 
     let created = ok_json(
-        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await,
+        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
+            .await,
     )
     .await?;
     assert_eq!(created["metadata"], serde_json::json!({}), "{created}");
 
     let conv_id = created["id"].as_str().expect("id missing");
     let fetched =
-        ok_json(conversations::get_conversation(&ctx.conversation_storage, conv_id).await).await?;
+        ok_json(conversations::get_conversation(&ctx.conversation_storage, None, conv_id).await)
+            .await?;
     assert_eq!(fetched["metadata"], serde_json::json!({}), "{fetched}");
     Ok(())
 }
@@ -1088,7 +1028,8 @@ async fn items_added_with_string_content_are_listed_as_typed_parts(
     let ctx = crate::common::create_test_context(conversation_router_config()).await;
 
     let created = ok_json(
-        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await,
+        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
+            .await,
     )
     .await?;
     let conv_id = created["id"].as_str().expect("id missing");
@@ -1099,6 +1040,7 @@ async fn items_added_with_string_content_are_listed_as_typed_parts(
         conversations::create_conversation_items(
             &ctx.conversation_storage,
             &ctx.conversation_item_storage,
+            None,
             conv_id,
             serde_json::json!({"items": [
                 {"type": "message", "role": "user", "content": "first"},
@@ -1118,6 +1060,7 @@ async fn items_added_with_string_content_are_listed_as_typed_parts(
         conversations::list_conversation_items(
             &ctx.conversation_storage,
             &ctx.conversation_item_storage,
+            None,
             conv_id,
             None,
             Some("asc"),
@@ -1159,6 +1102,7 @@ async fn items_added_with_string_content_are_listed_as_typed_parts(
         conversations::get_conversation_item(
             &ctx.conversation_storage,
             &ctx.conversation_item_storage,
+            None,
             conv_id,
             first_id,
             None,
@@ -1182,7 +1126,8 @@ async fn an_assistant_message_added_as_a_string_is_stored_as_an_output_text_part
     let ctx = crate::common::create_test_context(conversation_router_config()).await;
 
     let created = ok_json(
-        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await,
+        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
+            .await,
     )
     .await?;
     let conv_id = created["id"].as_str().expect("id missing");
@@ -1193,6 +1138,7 @@ async fn an_assistant_message_added_as_a_string_is_stored_as_an_output_text_part
         conversations::create_conversation_items(
             &ctx.conversation_storage,
             &ctx.conversation_item_storage,
+            None,
             conv_id,
             serde_json::json!({"items": [
                 {"type": "message", "role": "assistant", "content": "Hi there!"},
@@ -1209,6 +1155,7 @@ async fn an_assistant_message_added_as_a_string_is_stored_as_an_output_text_part
         conversations::get_conversation_item(
             &ctx.conversation_storage,
             &ctx.conversation_item_storage,
+            None,
             conv_id,
             item_id,
             None,
@@ -1222,6 +1169,7 @@ async fn an_assistant_message_added_as_a_string_is_stored_as_an_output_text_part
         conversations::list_conversation_items(
             &ctx.conversation_storage,
             &ctx.conversation_item_storage,
+            None,
             conv_id,
             None,
             Some("asc"),
@@ -1535,20 +1483,7 @@ async fn test_multi_turn_loop_with_mcp() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    // Build router config
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("info")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -1701,19 +1636,7 @@ async fn test_max_tool_calls_limit() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("info")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -1838,19 +1761,7 @@ async fn setup_streaming_mcp_test() -> (
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("info")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -2280,19 +2191,7 @@ async fn test_streaming_multi_turn_with_mcp() {
 #[tokio::test]
 async fn test_conversation_items_create_and_get() {
     // Test creating items and getting a specific item
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -2300,7 +2199,7 @@ async fn test_conversation_items_create_and_get() {
     // Create conversation
     let create_conv = serde_json::json!({});
     let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, create_conv).await;
+        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
     assert_eq!(conv_resp.status(), StatusCode::OK);
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
@@ -2327,6 +2226,7 @@ async fn test_conversation_items_create_and_get() {
     let items_resp = conversations::create_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         create_items,
     )
@@ -2346,6 +2246,7 @@ async fn test_conversation_items_create_and_get() {
     let get_resp = conversations::get_conversation_item(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         item_id,
         None,
@@ -2395,26 +2296,18 @@ async fn items_of_one_add_call_are_listed_in_request_order(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Items that share a stamp are listed by their random ids, which is request order about
     // half of the time: twenty rounds, each with two items in one call and a third in the next.
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     for round in 0..20 {
         let conv = conversation_json(
-            conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({}))
-                .await,
+            conversations::create_conversation(
+                &ctx.conversation_storage,
+                None,
+                serde_json::json!({}),
+            )
+            .await,
         )
         .await?;
         let conv_id = conv["id"].as_str().ok_or("conversation id")?;
@@ -2423,6 +2316,7 @@ async fn items_of_one_add_call_are_listed_in_request_order(
             conversations::create_conversation_items(
                 &ctx.conversation_storage,
                 &ctx.conversation_item_storage,
+                None,
                 conv_id,
                 serde_json::json!({"items": [user_message("first"), user_message("second")]}),
             )
@@ -2441,6 +2335,7 @@ async fn items_of_one_add_call_are_listed_in_request_order(
             conversations::create_conversation_items(
                 &ctx.conversation_storage,
                 &ctx.conversation_item_storage,
+                None,
                 conv_id,
                 serde_json::json!({"items": [user_message("third")]}),
             )
@@ -2458,6 +2353,7 @@ async fn items_of_one_add_call_are_listed_in_request_order(
             conversations::list_conversation_items(
                 &ctx.conversation_storage,
                 &ctx.conversation_item_storage,
+                None,
                 conv_id,
                 None,
                 Some("asc"),
@@ -2476,6 +2372,7 @@ async fn items_of_one_add_call_are_listed_in_request_order(
             conversations::list_conversation_items(
                 &ctx.conversation_storage,
                 &ctx.conversation_item_storage,
+                None,
                 conv_id,
                 None,
                 Some("desc"),
@@ -2496,6 +2393,7 @@ async fn items_of_one_add_call_are_listed_in_request_order(
             conversations::list_conversation_items(
                 &ctx.conversation_storage,
                 &ctx.conversation_item_storage,
+                None,
                 conv_id,
                 None,
                 Some("asc"),
@@ -2516,19 +2414,7 @@ async fn items_of_one_add_call_are_listed_in_request_order(
 #[tokio::test]
 async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
@@ -2539,6 +2425,7 @@ async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
             conversations::create_conversation_items(
                 &conversation_storage,
                 &item_storage,
+                None,
                 &conv_id,
                 serde_json::json!({ "items": items }),
             )
@@ -2552,6 +2439,7 @@ async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
             let listed = conversations::list_conversation_items(
                 &conversation_storage,
                 &item_storage,
+                None,
                 &conv_id,
                 None,
                 Some("asc"),
@@ -2565,7 +2453,8 @@ async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
     };
 
     let conv = conversation_json(
-        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await,
+        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
+            .await,
     )
     .await?;
     let conv_id = conv["id"].as_str().ok_or("conversation id")?.to_string();
@@ -2601,7 +2490,8 @@ async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
 
     // The same reference into another conversation links the item there, once.
     let other = conversation_json(
-        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await,
+        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
+            .await,
     )
     .await?;
     let other_id = other["id"].as_str().ok_or("conversation id")?.to_string();
@@ -2618,6 +2508,7 @@ async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
     let deleted = conversations::delete_conversation_item(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         &conv_id,
         &ids[0],
     )
@@ -2635,19 +2526,7 @@ async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
 #[tokio::test]
 async fn test_conversation_items_delete() {
     // Test deleting an item from a conversation
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -2655,7 +2534,7 @@ async fn test_conversation_items_delete() {
     // Create conversation
     let create_conv = serde_json::json!({});
     let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, create_conv).await;
+        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2676,6 +2555,7 @@ async fn test_conversation_items_delete() {
     let items_resp = conversations::create_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         create_items,
     )
@@ -2690,6 +2570,7 @@ async fn test_conversation_items_delete() {
     let list_resp = conversations::list_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         None,
         None,
@@ -2706,6 +2587,7 @@ async fn test_conversation_items_delete() {
     let del_resp = conversations::delete_conversation_item(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         item_id,
     )
@@ -2716,6 +2598,7 @@ async fn test_conversation_items_delete() {
     let list_resp2 = conversations::list_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         None,
         None,
@@ -2732,6 +2615,7 @@ async fn test_conversation_items_delete() {
     let get_resp = conversations::get_conversation_item(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         item_id,
         None,
@@ -2743,19 +2627,7 @@ async fn test_conversation_items_delete() {
 #[tokio::test]
 async fn test_conversation_items_max_limit() {
     // Test that creating > 20 items returns error
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -2763,7 +2635,7 @@ async fn test_conversation_items_max_limit() {
     // Create conversation
     let create_conv = serde_json::json!({});
     let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, create_conv).await;
+        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2784,6 +2656,7 @@ async fn test_conversation_items_max_limit() {
     let items_resp = conversations::create_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         create_items,
     )
@@ -2800,19 +2673,7 @@ async fn test_conversation_items_max_limit() {
 #[tokio::test]
 async fn test_conversation_items_unsupported_type() {
     // Test that unsupported item types return error
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -2820,7 +2681,7 @@ async fn test_conversation_items_unsupported_type() {
     // Create conversation
     let create_conv = serde_json::json!({});
     let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, create_conv).await;
+        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2840,6 +2701,7 @@ async fn test_conversation_items_unsupported_type() {
     let items_resp = conversations::create_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         create_items,
     )
@@ -2856,26 +2718,15 @@ async fn test_conversation_items_unsupported_type() {
 #[tokio::test]
 async fn test_conversation_items_multi_conversation_sharing() {
     // Test that items can be shared across conversations via soft delete
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create two conversations
     let conv_a_resp =
-        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await;
+        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
+            .await;
     let conv_a_bytes = axum::body::to_bytes(conv_a_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2883,7 +2734,8 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let conv_a_id = conv_a_json["id"].as_str().unwrap();
 
     let conv_b_resp =
-        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await;
+        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
+            .await;
     let conv_b_bytes = axum::body::to_bytes(conv_b_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2904,6 +2756,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let items_a_resp = conversations::create_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_a_id,
         create_items,
     )
@@ -2927,6 +2780,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let items_b_resp = conversations::create_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_b_id,
         reference_items,
     )
@@ -2937,6 +2791,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let list_a = conversations::list_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_a_id,
         None,
         None,
@@ -2952,6 +2807,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let list_b = conversations::list_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_b_id,
         None,
         None,
@@ -2968,6 +2824,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     conversations::delete_conversation_item(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_a_id,
         item_id,
     )
@@ -2977,6 +2834,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let list_a2 = conversations::list_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_a_id,
         None,
         None,
@@ -2993,6 +2851,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let list_b2 = conversations::list_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_b_id,
         None,
         None,
@@ -3009,6 +2868,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let get_resp = conversations::get_conversation_item(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_b_id,
         item_id,
         None,

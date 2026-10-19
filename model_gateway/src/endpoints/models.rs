@@ -86,6 +86,10 @@ impl ModelShape {
             .await
     }
 
+    /// The 503 of an inventory with no model in it (no worker registered, or
+    /// every worker gone): the gateway's error envelope with a typed code, as
+    /// every other refusal answers, in the caller's shape.
+
     async fn no_models(self, request_id: String) -> Response {
         self.error(
             error::service_unavailable("no_models_available", "No models available"),
@@ -93,6 +97,10 @@ impl ModelShape {
         )
         .await
     }
+
+    /// An OpenAI-shaped error response in the caller's shape: as it is for an
+    /// OpenAI client, re-shaped into the Messages envelope for a Messages
+    /// client.
 
     async fn error(self, response: Response, request_id: String) -> Response {
         match self {

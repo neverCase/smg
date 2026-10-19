@@ -3,28 +3,11 @@
 //! `</｜DSML｜ invoke>`, everything else content. The design's section 4 example, as recorded for
 //! `deepseek-ai/DeepSeek-V4.1-Flash`.
 //!
-//! What this table says beyond the Qwen ones:
-//!
-//! - **Two states for the calls.** `calls` is the template's wrapping between invokes (a newline,
-//!   dropped; anything else malformed), and `invoke` is one call's arguments, read by the DSML
-//!   assembler ([`tagged::dsml`](crate::tagged::dsml)). A block with several invokes gives several
-//!   calls, each with its own index, through the same two rows.
-//! - **The invoke tag's opening is the terminal** that enters the arguments state, so the
-//!   assembler starts inside the function's name; the closing tag is the terminal that leaves it,
-//!   and the call's end carries its bytes. A second invoke before the first closed ends the first
-//!   and starts the second (`invoke + invoke_open = invoke`), and the block's close ends an invoke
-//!   still open (`invoke + calls_close = content`), so the call closes into an object and the
-//!   prose after the block stays prose.
-//! - **A calls block ends the thought** (`reasoning + calls_open = calls`), as the design's table
-//!   and SMG's V4.1 reasoning parser have it; the recorded outputs close the thought first.
-//! - **The prompt opens the thought.** The template ends the generation prompt with `<think>`, and
-//!   an empty thought writes `</think>` at once, so most recorded outputs start with
-//!   `</think>\n\n`; the engine's prompt replay puts the output inside the thought first. The
-//!   turn opener is `<｜Assistant｜>`, so a marker quoted in an earlier turn moves nothing.
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::{
     format::{CallSyntax, Emits, Format},
-    tagged::dsml,
+    tagged::attributed::Tags,
 };
 
 /// The DeepSeek V4.1 table.
@@ -35,7 +18,7 @@ pub fn deepseek_v4_1() -> Format {
         .terminal("calls_open", "<｜DSML｜ calls>")
         .terminal("calls_close", "</｜DSML｜ calls>")
         .terminal("invoke_open", "<｜DSML｜ invoke name=\"")
-        .terminal("invoke_close", dsml::INVOKE_CLOSE)
+        .terminal("invoke_close", Tags::DSML.invoke_close)
         .state("content", Emits::Content)
         .state("reasoning", Emits::Reasoning)
         .state("calls", Emits::Wrapper)
@@ -49,19 +32,29 @@ pub fn deepseek_v4_1() -> Format {
         .transition("invoke", "invoke_open", "invoke")
         .transition("invoke", "calls_close", "content")
         .transition("calls", "calls_close", "content")
-        .calls(CallSyntax::Dsml)
+        .calls(CallSyntax::Attributed(Tags::DSML))
         .opens_turn("<｜Assistant｜>")
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::{
+        ids::CallIds,
+        testing::{arguments_of, bytes},
+    };
+
+    fn ids() -> CallIds {
+        CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
+    }
     use crate::{
         engine::Engine,
         event::{DropReason, Event, Events, Text},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
+        Declared,
     };
 
     /// A recorded output, qwen-style spacing and all: an empty thought, two invokes, a string and
@@ -78,7 +71,8 @@ mod tests {
     );
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::new(deepseek_v4_1(), Declared::default());
+        let mut parser =
+            Engine::with_call_ids(Arc::new(deepseek_v4_1()), Declared::default(), ids());
         let mut out = Events::new();
         parser
             .feed(
@@ -112,32 +106,6 @@ mod tests {
         out.drain()
     }
 
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn arguments_of(events: &[Event], call: u32) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
     fn dropped(text: &str) -> Event {
         Event::Dropped {
             text: Text::uncounted(text),
@@ -155,7 +123,11 @@ mod tests {
                 Event::ReasoningStart,
                 dropped("</think>"),
                 Event::ReasoningEnd,
-                Event::Content(Text::uncounted("\n\n")),
+                // The template's spacing before the block, held until the block's opener came.
+                Event::Dropped {
+                    text: Text::uncounted("\n\n"),
+                    why: DropReason::Whitespace,
+                },
                 dropped("<｜DSML｜ calls>"),
             ]
         );
@@ -169,7 +141,7 @@ mod tests {
             events[7],
             Event::ToolCallStart {
                 index: 0,
-                id: "call_0".into(),
+                id: ids().id(0),
                 name: "ChaDri_change_drink".into(),
                 source: Text::uncounted("ChaDri_change_drink\">"),
             }
@@ -309,8 +281,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // The newline after `</think>` is content too.
-        assert_eq!(content, "\n\nThe weather is sunny.");
+        // The newline after `</think>` is the template's spacing before the block, dropped; the
+        // one after the block comes before text, so it is the text's.
+        assert_eq!(content, "\nThe weather is sunny.");
     }
 
     #[test]
@@ -445,11 +418,17 @@ mod tests {
         );
         let events = run("<think>\n\n</think>\n\n", &[output]);
         assert_eq!(bytes(&events), output);
-        assert_eq!(arguments_of(&events, 0), r#"{"a": "x"}"#);
-        assert!(events.iter().any(|event| matches!(
-            event,
+        // The string the invoke's close cut stays open: nothing is made up for it, and the one
+        // word before the end carries the tag's bytes.
+        assert_eq!(arguments_of(&events, 0), r#"{"a": "x"#);
+        let ended = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+            .expect("the call ends");
+        assert!(matches!(
+            &events[ended - 1],
             Event::Malformed { text, .. } if text.text == "</｜DSML｜ par"
-        )));
+        ));
     }
 
     #[test]

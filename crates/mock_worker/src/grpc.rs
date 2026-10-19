@@ -112,6 +112,18 @@ pub async fn serve_with_listener_until(
         prefill_pending: Arc::new(AtomicU64::new(0)),
     };
     let server = async {
+        // tonic drains on incoming EOF when graceful shutdown is enabled,
+        // but retains the stream while waiting for existing connections.
+        // Drop the listener at EOF so the port closes before that wait.
+        let incoming = stream::unfold(
+            Box::pin(connections(listener).take_until(shutdown)),
+            |mut incoming| async move {
+                incoming
+                    .next()
+                    .await
+                    .map(|connection| (connection, incoming))
+            },
+        );
         // tonic's 4 MiB default would refuse the Generate of a long prompt (a
         // million token ids are a few megabytes as varints, more with the
         // prompt text alongside); the limit follows the config: none by
@@ -122,7 +134,7 @@ pub async fn serve_with_listener_until(
                     .max_decoding_message_size(max_message_bytes)
                     .max_encoding_message_size(max_message_bytes),
             )
-            .serve_with_incoming_shutdown(connections(listener), shutdown)
+            .serve_with_incoming_shutdown(incoming, pending())
             .await
         {
             tracing::error!("grpc worker {addr:?} stopped: {e}");
@@ -241,6 +253,7 @@ impl TokenSpeedScheduler for MockScheduler {
             // gateway and the engine, as a backlog in transit would hold it;
             // the load record does not see it until it lands.
             engine.admit().await;
+            let weight_version = self.cfg.weight_version.clone();
             let (tx, rx) = mpsc::unbounded_channel();
             let pending = (
                 Arc::clone(&self.prefill_pending),
@@ -253,7 +266,14 @@ impl TokenSpeedScheduler for MockScheduler {
                 max_new,
                 events: tx,
             });
-            let stream = generate_stream(rx, stream_chunks, request_id, Some(pending), cut);
+            let stream = generate_stream(
+                rx,
+                stream_chunks,
+                request_id,
+                Some(pending),
+                cut,
+                weight_version,
+            );
             return Ok(Response::new(Box::pin(in_flight.until_done(stream))));
         }
 
@@ -275,7 +295,7 @@ impl TokenSpeedScheduler for MockScheduler {
                     cached_tokens: 0,
                     output_logprobs: None,
                     index: 0,
-                    weight_version: None,
+                    weight_version: self.cfg.weight_version.clone(),
                 })),
             }));
         }
@@ -290,6 +310,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 output_logprobs: None,
                 matched_stop: None,
                 index: 0,
+                weight_version: self.cfg.weight_version.clone(),
                 ..Default::default()
             })),
         }));
@@ -311,8 +332,11 @@ impl TokenSpeedScheduler for MockScheduler {
 
     async fn abort(
         &self,
-        _request: Request<ts::AbortRequest>,
+        request: Request<ts::AbortRequest>,
     ) -> Result<Response<ts::AbortResponse>, Status> {
+        if let Some(engine) = &self.engine {
+            engine.abort(request.into_inner().request_id);
+        }
         Ok(Response::new(ts::AbortResponse {
             success: true,
             message: String::new(),
@@ -346,8 +370,23 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         _request: Request<ts::GetServerInfoRequest>,
     ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
+        let server_args = (!self.cfg.server_args.is_empty()).then(|| prost_types::Struct {
+            fields: self
+                .cfg
+                .server_args
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        prost_types::Value {
+                            kind: Some(prost_types::value::Kind::StringValue(v.clone())),
+                        },
+                    )
+                })
+                .collect(),
+        });
         Ok(Response::new(ts::GetServerInfoResponse {
-            server_args: None,
+            server_args,
             scheduler_info: None,
             active_requests: 0,
             is_paused: false,
@@ -355,6 +394,7 @@ impl TokenSpeedScheduler for MockScheduler {
             max_total_num_tokens: 1_000_000,
             tokenspeed_version: "mock".to_string(),
             start_time: None,
+            constrained_decoding: String::new(),
         }))
     }
 
@@ -461,8 +501,9 @@ impl TokenSpeedScheduler for MockScheduler {
 /// The gRPC status code closest to the HTTP status a request fault answers,
 /// chosen so the gateway's mapping of codes to HTTP statuses gives that status
 /// back where it can: 408 reads back as 504 and 502 as 503 (both still
-/// retryable), any other 4xx as 400 (not retryable, as on the HTTP worker),
-/// any other 5xx as 500.
+/// retryable), 499 as 502 (`cancelled`: the worker's side ending the call,
+/// retryable and charged to the worker), any other 4xx as 400 (not
+/// retryable, as on the HTTP worker), any other 5xx as 500.
 fn injected_status(status: u16) -> Status {
     const MESSAGE: &str = "injected";
     match status {
@@ -473,6 +514,9 @@ fn injected_status(status: u16) -> Status {
         408 | 504 => Status::deadline_exceeded(MESSAGE),
         409 => Status::aborted(MESSAGE),
         429 => Status::resource_exhausted(MESSAGE),
+        // The call the worker's side ended: what a connection that closed
+        // under it produces at the gateway.
+        499 => Status::cancelled(MESSAGE),
         501 => Status::unimplemented(MESSAGE),
         502 | 503 => Status::unavailable(MESSAGE),
         other if (400..=499).contains(&other) => Status::invalid_argument(MESSAGE),
@@ -503,6 +547,9 @@ struct Generating {
     /// The worker's pending-prefill counter and this request's share of it,
     /// settled at the first token (or at the end, if none came).
     pending: Option<(Arc<AtomicU64>, u64)>,
+    /// Stamped on every chunk and the completion; `None` leaves the field
+    /// unset, like an engine that predates it.
+    weight_version: Option<String>,
     ended: bool,
 }
 
@@ -529,13 +576,15 @@ impl Drop for Generating {
 /// stream ends. With `cut`, the stream ends with the given status or
 /// engine-failure `Complete` instead once the engine has produced more than
 /// the given number of tokens (the fault hook's `after_tokens`); an output no
-/// longer than that completes as usual.
+/// longer than that completes as usual. Every chunk and completion carries
+/// `weight_version`, as an engine stamps them.
 fn generate_stream(
     rx: mpsc::UnboundedReceiver<engine::GenEvent>,
     stream_chunks: bool,
     request_id: String,
     pending: Option<(Arc<AtomicU64>, u64)>,
     cut: Option<(u32, CutEnd, Arc<AtomicU64>)>,
+    weight_version: Option<String>,
 ) -> GenStream {
     let init = Generating {
         rx,
@@ -544,6 +593,7 @@ fn generate_stream(
         request_id,
         pending,
         cut,
+        weight_version,
         ended: false,
     };
     Box::pin(stream::unfold(init, |mut st| async move {
@@ -578,6 +628,7 @@ fn generate_stream(
                                             output_logprobs: None,
                                             matched_stop: None,
                                             index: 0,
+                                            weight_version: st.weight_version.clone(),
                                             ..Default::default()
                                         })),
                                     })
@@ -598,7 +649,7 @@ fn generate_stream(
                                 cached_tokens,
                                 output_logprobs: None,
                                 index: 0,
-                                weight_version: None,
+                                weight_version: st.weight_version.clone(),
                             })),
                         };
                         return Some((Ok(resp), st));
@@ -622,6 +673,7 @@ fn generate_stream(
                             output_logprobs: None,
                             matched_stop: None,
                             index: 0,
+                            weight_version: st.weight_version.clone(),
                             ..Default::default()
                         })),
                     };
@@ -997,7 +1049,7 @@ mod tests {
             CutEnd::Status(Status::unavailable("injected")),
             Arc::clone(&cuts),
         ));
-        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut);
+        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut, None);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         assert_eq!(chunk_ids(stream.next().await), vec![2]);
         let cut = stream.next().await.expect("the cut");
@@ -1016,7 +1068,7 @@ mod tests {
         drop(tx);
         let cuts = Arc::new(AtomicU64::new(0));
         let cut = Some((2, CutEnd::EngineError, Arc::clone(&cuts)));
-        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut);
+        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut, None);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         assert_eq!(chunk_ids(stream.next().await), vec![2]);
         let item = stream
@@ -1052,7 +1104,7 @@ mod tests {
             CutEnd::Status(Status::internal("injected")),
             Arc::clone(&cuts),
         ));
-        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut);
+        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut, None);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         let complete = stream.next().await.expect("complete").expect("ok");
         assert!(matches!(complete.response, Some(GenResp::Complete(_))));
@@ -1072,8 +1124,9 @@ mod tests {
         assert_eq!(injected_status(429).code(), tonic::Code::ResourceExhausted);
         assert_eq!(injected_status(504).code(), tonic::Code::DeadlineExceeded);
         assert_eq!(injected_status(400).code(), tonic::Code::InvalidArgument);
-        // The two non-inverse cases (read back as 504 and 503) and a 4xx
-        // without its own code (read back as 400).
+        assert_eq!(injected_status(499).code(), tonic::Code::Cancelled);
+        // The three non-inverse cases (408 and 502 read back as 504 and 503,
+        // 499 as 502) and a 4xx without its own code (read back as 400).
         assert_eq!(injected_status(408).code(), tonic::Code::DeadlineExceeded);
         assert_eq!(injected_status(502).code(), tonic::Code::Unavailable);
         assert_eq!(injected_status(422).code(), tonic::Code::InvalidArgument);

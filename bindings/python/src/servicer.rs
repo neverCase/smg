@@ -22,12 +22,12 @@ use std::{
 use bytes::Bytes;
 use engine_servicer::{
     BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia,
-    ServicerError, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
+    ServicerConfig, ServicerError, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
     TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo,
-    VllmServicerConfig, VllmServicerServer, DEFAULT_ENGINE_STARTUP_CEILING,
-    DEFAULT_ENGINE_STARTUP_TIMEOUT,
+    VllmServicerConfig, VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_STARTUP_CEILING,
+    DEFAULT_ENGINE_STARTUP_TIMEOUT, PIXEL_MODALITIES,
 };
-use llm_multimodal::Modality;
+use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, Modality};
 use prost::Message;
 use pyo3::{
     exceptions::{PyRuntimeError, PyTimeoutError, PyValueError},
@@ -156,6 +156,13 @@ impl MediaProcessor for PythonMediaProcessor {
 
     fn max_inflight(&self) -> usize {
         self.max_inflight
+    }
+
+    /// The engine's own processors take what the model takes, audio
+    /// included, as they do on the Python servicer; the bridge hands the
+    /// item over under the same modality name.
+    fn modalities(&self) -> &'static [&'static str] {
+        ALL_MODALITIES
     }
 
     fn probe(&self) -> BoxFuture<bool> {
@@ -426,6 +433,12 @@ impl MediaProcessor for SmgMediaProcessor {
         self.max_inflight
     }
 
+    /// The set `process` maps below: image and video, no audio (the
+    /// pipeline preprocesses no audio for this engine).
+    fn modalities(&self) -> &'static [&'static str] {
+        PIXEL_MODALITIES
+    }
+
     fn probe(&self) -> BoxFuture<bool> {
         // In-process and stateless between requests: serving whenever up.
         Box::pin(async { true })
@@ -459,9 +472,15 @@ impl MediaProcessor for SmgMediaProcessor {
                 .await
                 .map_err(|error| match error {
                     WorkerMediaError::Invalid(message) => MediaError::Invalid(message),
-                    WorkerMediaError::Media { fault, message } => {
-                        MediaError::Media { fault, message }
-                    }
+                    WorkerMediaError::Media {
+                        fault,
+                        code,
+                        message,
+                    } => MediaError::Media {
+                        fault,
+                        code: code.as_str(),
+                        message,
+                    },
                     WorkerMediaError::Internal(message) => MediaError::Internal(message),
                 })?;
             Ok(ProcessedMedia {
@@ -516,6 +535,10 @@ fn native_media_options(
     // `video_loader_rule` names a loader rule the pipeline cannot follow; the
     // pipeline refuses it for a spec that samples the way the loader does.
     let video_frame_budget = count("video_frame_budget")?;
+    // The engine's encoder budget, the most feature tokens one item may
+    // carry; absent when the launcher could not tell, which leaves an item's
+    // size to the engine, as before.
+    let encoder_budget = count("engine_encoder_budget")?.filter(|&budget| budget > 0);
     let fetch_timeout_ms: u64 = item("fetch_timeout_ms")?
         .map(|v| v.extract())
         .transpose()?
@@ -543,6 +566,15 @@ fn native_media_options(
             Some((modality, limit))
         })
         .collect();
+    // The TurboJPEG policy as the launcher resolved it (flag > env >
+    // `prefer`); a launcher without the setting leaves it to the pipeline's
+    // own fallback (`SMG_MM_TURBOJPEG`).
+    let turbojpeg = string("turbojpeg")?
+        .map(|raw| {
+            raw.parse::<TurboJpegPolicy>()
+                .map_err(PyValueError::new_err)
+        })
+        .transpose()?;
     Ok(NativeMediaOptions {
         settings: WorkerMediaSettings {
             model_dir: required("model_dir")?,
@@ -563,6 +595,8 @@ fn native_media_options(
             video_fetch_timeout: Duration::from_millis(video_fetch_timeout_ms),
             video_frame_budget,
             video_loader_rule: string("video_loader_rule")?,
+            encoder_budget,
+            turbojpeg,
         },
         source: string("source")?.unwrap_or_else(|| "default".to_string()),
         max_inflight: count("max_inflight")?.unwrap_or(4).max(1),
@@ -617,9 +651,10 @@ impl PyVllmGrpcServer {
         pooler_dimensions = None,
         mm_device_do_normalize = false,
         mm_item_limits = String::new(),
+        mm_encoder_budget = 0,
         max_num_seqs = 0,
         engine_reasoning_parser = String::new(),
-        structured_outputs_start = String::new(),
+        constrained_decoding_start = String::new(),
         log_stats = None,
         media_processor = None,
         smg_media_processor = None,
@@ -665,9 +700,10 @@ impl PyVllmGrpcServer {
         pooler_dimensions: Option<u32>,
         mm_device_do_normalize: bool,
         mm_item_limits: String,
+        mm_encoder_budget: i32,
         max_num_seqs: i32,
         engine_reasoning_parser: String,
-        structured_outputs_start: String,
+        constrained_decoding_start: String,
         log_stats: Option<bool>,
         media_processor: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
@@ -720,21 +756,25 @@ impl PyVllmGrpcServer {
             pooler_dimensions,
             mm_device_do_normalize,
             mm_item_limits,
+            mm_encoder_budget,
             max_num_seqs,
             engine_reasoning_parser,
-            structured_outputs_start,
+            constrained_decoding_start,
             log_stats,
         };
-        let mut config = VllmServicerConfig {
+        let servicer = ServicerConfig {
             bind_address,
             ipc_base_url,
             handshake_address,
             engine_count,
             tokenizer_dir,
-            model,
-            media_processor,
             engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
             engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
+        };
+        let mut config = VllmServicerConfig {
+            servicer,
+            model,
+            media_processor,
         };
         let inner = py.detach(|| -> PyResult<VllmServicerServer> {
             let Some(native) = native else {
@@ -742,7 +782,7 @@ impl PyVllmGrpcServer {
             };
             // The pipeline needs the tokenizer the servicer would load after
             // the engine connects; load it here and hand the same one over.
-            let dir = config.tokenizer_dir.clone().ok_or_else(|| {
+            let dir = config.servicer.tokenizer_dir.clone().ok_or_else(|| {
                 PyValueError::new_err("the smg media processor needs tokenizer_dir")
             })?;
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -772,6 +812,7 @@ impl PyVllmGrpcServer {
                 max_inflight = native.max_inflight,
                 item_limits = %pipeline.item_limits_summary(),
                 video_frame_budget = ?pipeline.video_frame_budget(),
+                encoder_budget = ?pipeline.encoder_budget(),
                 "smg media processor ready"
             );
             config.media_processor = Some(Arc::new(SmgMediaProcessor {
@@ -871,11 +912,13 @@ impl PyTokenSpeedGrpcServer {
         supports_vision = false,
         supports_multimodal = false,
         supported_modalities = None,
+        mrope_positions = None,
         model_dtype = String::new(),
         multimodal_encoder_dtype = String::new(),
         server_args_json = String::new(),
         scheduler_info_json = String::new(),
         tokenspeed_version = String::new(),
+        constrained_decoding = String::new(),
         max_running_requests = 0,
         data_parallel_size = 1,
         kv_events_endpoint = String::new(),
@@ -908,11 +951,13 @@ impl PyTokenSpeedGrpcServer {
         supports_vision: bool,
         supports_multimodal: bool,
         supported_modalities: Option<Vec<i32>>,
+        mrope_positions: Option<bool>,
         model_dtype: String,
         multimodal_encoder_dtype: String,
         server_args_json: String,
         scheduler_info_json: String,
         tokenspeed_version: String,
+        constrained_decoding: String,
         max_running_requests: i32,
         data_parallel_size: i32,
         kv_events_endpoint: String,
@@ -938,27 +983,29 @@ impl PyTokenSpeedGrpcServer {
             supports_vision,
             supports_multimodal,
             supported_modalities: supported_modalities.unwrap_or_default(),
+            mrope_positions,
             model_dtype,
             multimodal_encoder_dtype,
             server_args_json,
             scheduler_info_json,
             tokenspeed_version,
+            constrained_decoding,
             max_running_requests,
             data_parallel_size,
             kv_events_endpoint,
             kv_events_replay_endpoint,
             kv_events_topic,
         };
-        let config = TokenSpeedServicerConfig {
+        let servicer = ServicerConfig {
             bind_address,
             ipc_base_url,
             handshake_address,
             engine_count,
             tokenizer_dir,
-            model,
             engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
             engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
         };
+        let config = TokenSpeedServicerConfig { servicer, model };
         let inner = py
             .detach(|| TokenSpeedServicerServer::start(config))
             .map_err(to_py_err)?;
@@ -1131,16 +1178,16 @@ impl PySglangGrpcServer {
             kv_events_replay_endpoint,
             kv_events_topic,
         };
-        let config = SglangServicerConfig {
+        let servicer = ServicerConfig {
             bind_address,
             ipc_base_url,
             handshake_address,
             engine_count,
             tokenizer_dir,
-            model,
             engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
             engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
         };
+        let config = SglangServicerConfig { servicer, model };
         let inner = py
             .detach(|| SglangServicerServer::start(config))
             .map_err(to_py_err)?;

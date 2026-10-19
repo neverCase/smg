@@ -2,6 +2,8 @@
 //! deserialize→serialize round trip, and tool_choice validation must
 //! accept "auto"/"none" without tools.
 
+use std::borrow::Cow;
+
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage},
     common::{ImageUrl, ToolChoice, ToolChoiceValue, VideoUrl},
@@ -1322,11 +1324,53 @@ fn kimi_profile_stream_usage_default_is_kimi_wide() {
 }
 
 #[test]
-fn non_kimi_models_get_no_stream_usage_default() {
-    for model in ["gpt-4o-mini", "MiniMax-M3"] {
+fn models_without_a_stream_usage_default_get_none() {
+    for model in ["gpt-4o-mini", "self-hosted-model"] {
         let mut req = sampling_request(model, json!({"stream": true}));
         req.normalize();
         assert!(req.stream_options.is_none(), "{model}");
+    }
+}
+
+#[test]
+fn minimax_profile_defaults_stream_usage_on() {
+    for model in ["MiniMax-M3", "MiniMax-M2"] {
+        let mut req = sampling_request(model, json!({"stream": true}));
+        req.normalize();
+        assert_eq!(include_usage(&req), Some(true), "{model}");
+        assert!(req.validate().is_ok(), "{model}");
+    }
+}
+
+#[test]
+fn minimax_profile_keeps_explicit_stream_usage_opt_out() {
+    let mut req = sampling_request(
+        "MiniMax-M3",
+        json!({"stream": true, "stream_options": {"include_usage": false}}),
+    );
+    req.normalize();
+    assert_eq!(include_usage(&req), Some(false));
+}
+
+#[test]
+fn minimax_profile_stream_usage_default_preserves_other_stream_options() {
+    let mut req = sampling_request(
+        "MiniMax-M3",
+        json!({"stream": true, "stream_options": {"continuous_usage_stats": true}}),
+    );
+    req.normalize();
+    let opts = req.stream_options.as_ref().unwrap();
+    assert_eq!(opts.include_usage, Some(true));
+    assert_eq!(opts.continuous_usage_stats, Some(true));
+}
+
+#[test]
+fn minimax_profile_adds_no_stream_options_when_not_streaming() {
+    for fields in [json!({}), json!({"stream": false})] {
+        let mut req = sampling_request("MiniMax-M3", fields);
+        req.normalize();
+        assert!(req.stream_options.is_none());
+        assert!(!has_code(&req, "stream_options_requires_stream"));
     }
 }
 
@@ -1551,6 +1595,56 @@ fn callable_tool_names(value: Value) -> Vec<String> {
 }
 
 #[test]
+fn tool_lists_are_borrowed_from_the_request_where_nothing_narrows_them() {
+    let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {"type": "object"}}});
+    let request = |value: Value| -> ChatCompletionRequest {
+        serde_json::from_value(value).expect("request deserializes")
+    };
+
+    // Request-level tools and a choice that narrows nothing: the request's own list, as it is.
+    let plain = request(json!({
+        "model": "self-hosted-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [tool("a"), tool("b")],
+        "tool_choice": "auto"
+    }));
+    assert!(matches!(plain.effective_tool_list(), Cow::Borrowed(tools) if tools.len() == 2));
+    assert!(matches!(plain.callable_tools(), Cow::Borrowed(tools) if tools.len() == 2));
+
+    // A named choice narrows: the narrowed list is the request's subset.
+    let named = request(json!({
+        "model": "self-hosted-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [tool("a"), tool("b")],
+        "tool_choice": {"type": "function", "function": {"name": "b"}}
+    }));
+    assert!(matches!(named.effective_tool_list(), Cow::Borrowed(_)));
+    assert!(
+        matches!(named.callable_tools(), Cow::Owned(tools) if tools.len() == 1 && tools[0].function.name == "b")
+    );
+
+    // A tool declared on a message joins the request's: one list that chains both.
+    let dynamic = request(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather")]},
+            {"role": "user", "content": "hi"}
+        ],
+        "tools": [tool("a")]
+    }));
+    assert!(
+        matches!(dynamic.effective_tool_list(), Cow::Owned(tools) if tools.len() == 2 && tools[1].function.name == "get_weather")
+    );
+
+    // No tools anywhere: an empty list, borrowed.
+    let none = request(json!({
+        "model": "self-hosted-model",
+        "messages": [{"role": "user", "content": "hi"}]
+    }));
+    assert!(matches!(none.callable_tools(), Cow::Borrowed(tools) if tools.is_empty()));
+}
+
+#[test]
 fn callable_tools_follow_tool_choice_across_request_and_dynamic_tools() {
     let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {"type": "object"}}});
 
@@ -1599,4 +1693,97 @@ fn callable_tools_follow_tool_choice_across_request_and_dynamic_tools() {
         "tool_choice": "auto"
     }));
     assert!(none.is_empty());
+}
+
+/// `declares_tools` on a request as the HTTP layer hands it on (normalized).
+#[expect(clippy::expect_used, reason = "test helper")]
+fn declares_tools(value: Value) -> bool {
+    let mut req: ChatCompletionRequest =
+        serde_json::from_value(value).expect("request deserializes");
+    req.normalize();
+    req.declares_tools()
+}
+
+#[test]
+fn declares_tools_reads_request_and_message_declarations_alike() {
+    let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {"type": "object"}}});
+    let user = json!({"role": "user", "content": "hi"});
+
+    // Request-level only.
+    assert!(declares_tools(json!({
+        "model": "kimi-k3",
+        "messages": [user],
+        "tools": [tool("get_time")]
+    })));
+
+    // Message-level only: not a request without tools.
+    assert!(declares_tools(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather")]},
+            user
+        ]
+    })));
+
+    // Both.
+    assert!(declares_tools(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "developer", "content": "", "tools": [tool("get_weather")]},
+            user
+        ],
+        "tools": [tool("get_time")]
+    })));
+
+    // No declaration anywhere.
+    assert!(!declares_tools(
+        json!({"model": "kimi-k3", "messages": [user]})
+    ));
+}
+
+#[test]
+fn declares_tools_resolves_conflicting_declarations_as_effective_tools_does() {
+    let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {"type": "object"}}});
+    let user = json!({"role": "user", "content": "hi"});
+
+    // An empty request-level list beside a message's declaration still declares
+    // tools, and the message's tool is the effective set; the empty list
+    // switches the calls off through the normalizer's `tool_choice: none`, as
+    // it does without the message.
+    let mut empty_list: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather")]},
+            user
+        ],
+        "tools": []
+    }))
+    .expect("request deserializes");
+    empty_list.normalize();
+    assert!(empty_list.declares_tools());
+    assert_eq!(empty_list.effective_tools().count(), 1);
+    assert!(matches!(
+        empty_list.tool_choice,
+        Some(ToolChoice::Value(ToolChoiceValue::None))
+    ));
+
+    // A message's declaration under a profile that reads none widens nothing,
+    // with or without the normalizer's pass over foreign extensions.
+    let unread: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "self-hosted-model",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather")]},
+            user
+        ]
+    }))
+    .expect("request deserializes");
+    assert!(!unread.declares_tools());
+    assert_eq!(unread.effective_tools().count(), 0);
+    assert!(!declares_tools(json!({
+        "model": "self-hosted-model",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather")]},
+            user
+        ]
+    })));
 }

@@ -17,11 +17,16 @@
 //!
 //! The stored record is the shared truth, also between gateways that share a
 //! store: a status only moves forward ([`set_stored_status`] never rewrites a
-//! terminal record), the runner reads the record while the work runs and
-//! drops the work once the record was closed elsewhere, and every way a run
-//! can end leaves a terminal record ([`drive`]): the object the work stored,
-//! `failed` with the error of a work that answered one, ended without storing
-//! a result or panicked, or `cancelled`.
+//! terminal record: every transition is one conditional write of the stored
+//! object alone,
+//! `ResponseStorage::update_response_object_if_open`, and the terminal
+//! object the work persists one conditional write of the row,
+//! `ResponseStorage::store_response_if_open`, both refused once the record
+//! is closed), the runner reads the record while the work runs and drops the
+//! work once the record was closed elsewhere, and every way a run can end
+//! leaves a terminal record ([`drive`]): the object the work stored, `failed`
+//! with the error of a work that answered one, ended without storing a
+//! result or panicked, or `cancelled`.
 //!
 //! A response the client asked not to store (`store: false`) runs in the
 //! background the same way: its record is the run's control block and, once
@@ -46,7 +51,8 @@ use openai_protocol::responses::{ResponseStatus, ResponsesRequest, ResponsesResp
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg_data_connector::{
-    with_request_context, RequestContext as StorageRequestContext, ResponseId, ResponseStorage,
+    with_request_context, ConditionalStore, RequestContext as StorageRequestContext, ResponseId,
+    ResponseStorage, ResponseStorageError, StoredResponse, TERMINAL_RESPONSE_STATUSES,
 };
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -55,11 +61,24 @@ use tracing::{debug, info, warn};
 use super::ResponsesContext;
 use crate::routers::{
     common::{
-        persistence_utils::{build_stored_response, extract_input_items},
+        persistence_utils::{self, build_stored_response, extract_input_items},
         sse::{sse_channel, SseSender},
     },
     error,
 };
+
+/// Runs `fut`, a storage operation, under the request's storage context
+/// when the request has one, so the store sees the tenant and the request
+/// it serves; without one the operation runs as it is.
+async fn under_context<F: Future>(
+    request_context: Option<StorageRequestContext>,
+    fut: F,
+) -> F::Output {
+    match request_context {
+        Some(ctx) => with_request_context(ctx, fut).await,
+        None => fut.await,
+    }
+}
 
 /// How long a cancel request waits for the task to write its terminal record
 /// before answering from whatever the store holds.
@@ -68,7 +87,19 @@ const CANCEL_SETTLE: Duration = Duration::from_secs(5);
 /// How often the runner reads the stored record while the work runs: a
 /// cancel on another gateway sharing the store closes the record, and the
 /// gateway running the response drops its work within this interval.
-const STATUS_WATCH: Duration = Duration::from_secs(2);
+pub(crate) const STATUS_WATCH: Duration = Duration::from_secs(2);
+
+/// How many status-watch intervals a terminal write is retried for while the
+/// store answers with an error (60 s at the default [`STATUS_WATCH`]): a store
+/// that is unreachable for a moment at the end of a run must not leave the
+/// record `in_progress` behind a gateway that is still alive and holds the
+/// result.
+const TERMINAL_WRITE_RETRIES: u32 = 30;
+
+/// The window a terminal write is retried within, for a watch interval.
+pub(crate) fn terminal_write_window(watch: Duration) -> Duration {
+    watch.saturating_mul(TERMINAL_WRITE_RETRIES)
+}
 
 /// How long the record of a background response the client asked not to
 /// store (`store: false`) stays once it reached a terminal status: the public
@@ -76,12 +107,20 @@ const STATUS_WATCH: Duration = Duration::from_secs(2);
 /// that it can be polled, then deletes it.
 pub(crate) const UNSTORED_RETENTION: Duration = Duration::from_secs(10 * 60);
 
-/// The statuses a response does not leave any more.
-const TERMINAL_STATUSES: [&str; 4] = ["completed", "incomplete", "failed", "cancelled"];
-
-/// Whether `status` is one a response does not leave any more.
+/// Whether `status` is one a response does not leave any more: the store's
+/// list ([`TERMINAL_RESPONSE_STATUSES`]), so the gateway and the stores'
+/// conditional writes agree on what a closed record is.
 pub(crate) fn is_terminal(status: &str) -> bool {
-    TERMINAL_STATUSES.contains(&status)
+    TERMINAL_RESPONSE_STATUSES.contains(&status)
+}
+
+/// Whether `status` is a result only the work itself stores (a run that
+/// reached its end, whole or truncated): a record read in one of these while
+/// the work runs is the work's own terminal write, not a close from
+/// elsewhere. The persist's check for its own earlier write reads the same
+/// list ([`persistence_utils::is_result_status`]).
+fn is_result(status: &str) -> bool {
+    persistence_utils::is_result_status(status)
 }
 
 /// The in-flight background responses of this gateway.
@@ -208,27 +247,23 @@ pub(crate) fn queued_response(id: &str, request: &ResponsesRequest) -> Responses
 
 /// Stores `response` under its id with the request's input items, as the
 /// terminal record will carry them, so `GET /v1/responses/{id}` and its
-/// `input_items` answer from the first poll.
+/// `input_items` answer from the first poll; the record is scoped to the
+/// caller's `tenant`.
 pub(crate) async fn store_record(
     storage: &Arc<dyn ResponseStorage>,
     response: &ResponsesResponse,
     request: &ResponsesRequest,
+    tenant: Option<&str>,
     request_context: Option<StorageRequestContext>,
-) -> Result<(), String> {
-    let raw = serde_json::to_value(response).map_err(|e| e.to_string())?;
+) -> Result<(), ResponseStorageError> {
+    let raw = serde_json::to_value(response)?;
     let mut stored = build_stored_response(raw, request);
-    stored.input = Value::Array(extract_input_items(&request.input)?);
-    let store = async {
-        storage
-            .store_response(stored)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    };
-    match request_context {
-        Some(ctx) => with_request_context(ctx, store).await,
-        None => store.await,
-    }
+    stored.input = Value::Array(
+        extract_input_items(&request.input).map_err(ResponseStorageError::StorageError)?,
+    );
+    stored.tenant = tenant.map(str::to_string);
+    let store = async { storage.store_response(stored).await.map(|_| ()) };
+    under_context(request_context, store).await
 }
 
 /// The stored Response object moved to `status`: a terminal status stamps
@@ -259,17 +294,19 @@ pub(crate) enum Transition {
     Missing,
 }
 
-/// Moves the record stored under `id` to `status`. A status only moves
-/// forward: a record that is already terminal is left as it is (so a
-/// `cancelled` record is written once, and a result that arrives after a
-/// cancel does not revive the response), whichever gateway wrote it.
+/// Moves the record stored under `id` to `status`. A status only moves forward: a
+/// record that is already terminal is left as it is (so a `cancelled`
+/// record is written once, and a result that arrives after a cancel does
+/// not revive the response), whichever gateway wrote it. The record is read
+/// to build the moved object and written with one conditional write, which
+/// the store refuses if the record was closed in between, on any gateway.
 pub(crate) async fn set_stored_status(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
     status: &str,
     error: Option<Value>,
     request_context: Option<StorageRequestContext>,
-) -> Result<Transition, String> {
+) -> Result<Transition, ResponseStorageError> {
     transition(storage, id, request_context, |raw| {
         with_status(raw, status, error)
     })
@@ -318,41 +355,38 @@ pub(crate) async fn finish_unstored(
 }
 
 /// Moves the record under `id` forward to the object `next` makes of the
-/// stored one; a record that is already terminal stays as it is. The read
-/// and the write are two round trips to the store; the window between them
-/// is the one a cross-gateway race can fall into. A record moved to a
-/// terminal status whose object says `store: false` is retired after
-/// [`UNSTORED_RETENTION`] by the gateway that moved it.
+/// stored one; a record that is already terminal stays as it is. The record
+/// is read to build the moved object and written with one conditional write,
+/// which the store refuses if the record was closed in between, on any
+/// gateway. A record moved to a terminal status whose object says `store:
+/// false` is retired after [`UNSTORED_RETENTION`] by the gateway that moved
+/// it.
 async fn transition(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
     request_context: Option<StorageRequestContext>,
     next: impl FnOnce(Value) -> Value,
-) -> Result<Transition, String> {
+) -> Result<Transition, ResponseStorageError> {
     let update = async {
         let response_id = ResponseId::from(id);
-        let Some(mut stored) = storage
-            .get_response(&response_id)
-            .await
-            .map_err(|e| e.to_string())?
-        else {
+        let Some(stored) = storage.get_response(&response_id).await? else {
             return Ok(Transition::Missing);
         };
         if is_terminal(stored.raw_response["status"].as_str().unwrap_or("")) {
             return Ok(Transition::Terminal(stored.raw_response));
         }
-        stored.raw_response = next(stored.raw_response);
-        let raw = stored.raw_response.clone();
-        storage
-            .store_response(stored)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(Transition::Moved(raw))
+        let raw = next(stored.raw_response);
+        match storage
+            .update_response_object_if_open(&response_id, raw.clone())
+            .await?
+        {
+            ConditionalStore::Stored => Ok(Transition::Moved(raw)),
+            ConditionalStore::Closed(current) => Ok(Transition::Terminal(current.raw_response)),
+            ConditionalStore::Missing => Ok(Transition::Missing),
+        }
     };
-    let transition: Result<Transition, String> = match request_context.clone() {
-        Some(ctx) => with_request_context(ctx, update).await,
-        None => update.await,
-    };
+    let transition: Result<Transition, ResponseStorageError> =
+        under_context(request_context.clone(), update).await;
     let transition = transition?;
     if let Transition::Moved(raw) = &transition {
         retire_unstored(storage, request_context, id, raw);
@@ -382,16 +416,32 @@ fn retire_unstored(
     let storage = Arc::clone(storage);
     let id = id.to_string();
     tokio::spawn(async move {
+        // A store that keeps deadlines drops the record itself should this
+        // gateway be gone before the window ends; the stores that keep none
+        // are swept (see [`sweep_unstored`]).
+        let expire = async {
+            storage
+                .expire_response(&ResponseId::from(id.as_str()), UNSTORED_RETENTION)
+                .await
+        };
+        let expired = under_context(request_context.clone(), expire).await;
+        // The default answers Ok for a store that keeps no deadline: an error
+        // is a store that keeps them and failed to set one, which leaves this
+        // gateway's timer as the record's only retirement.
+        if let Err(e) = expired {
+            warn!(
+                response_id = %id,
+                error = %e,
+                "Failed to set the store's deadline on the unstored background response record; only this gateway's timer retires it"
+            );
+        }
         tokio::time::sleep(UNSTORED_RETENTION).await;
         let delete = async {
             storage
                 .delete_response(&ResponseId::from(id.as_str()))
                 .await
         };
-        let deleted = match request_context {
-            Some(ctx) => with_request_context(ctx, delete).await,
-            None => delete.await,
-        };
+        let deleted = under_context(request_context, delete).await;
         match deleted {
             Ok(()) => debug!(
                 response_id = %id,
@@ -406,35 +456,106 @@ fn retire_unstored(
     });
 }
 
-/// Whether the record under `id` has reached a terminal status (closed by a
-/// cancel, here or on another gateway sharing the store); the result of a
-/// work that ends after that is not stored over it.
-pub(crate) async fn is_closed(
+/// Deletes the records of unstored background responses whose polling window
+/// ended with no gateway there to retire them: a gateway stopped or lost
+/// inside the window, with a store that outlives the process. Returns how
+/// many records went. A store that keeps no query over the stored object
+/// answers 0 (see `ResponseStorage::delete_unstored_older_than`).
+pub(crate) async fn sweep_unstored(storage: &Arc<dyn ResponseStorage>) -> usize {
+    let window =
+        chrono::Duration::seconds(i64::try_from(UNSTORED_RETENTION.as_secs()).unwrap_or(i64::MAX));
+    match storage
+        .delete_unstored_older_than(chrono::Utc::now() - window)
+        .await
+    {
+        Ok(0) => 0,
+        Ok(deleted) => {
+            info!(
+                deleted,
+                "Retired the unstored background response records left past their polling window"
+            );
+            deleted
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to sweep the unstored background response records");
+            0
+        }
+    }
+}
+
+/// Runs [`sweep_unstored`] now, for the records an earlier gateway left in a
+/// store that outlives it, whatever this gateway's background setting; then,
+/// when `repeat` says so, once per polling window for the life of the gateway
+/// (background mode on: new unstored records can appear; off, none can, and
+/// the one sweep at start-up is all the store needs).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a periodic sweep over the store for the gateway's lifetime; nothing waits on it at shutdown"
+)]
+pub(crate) fn spawn_unstored_sweeper(
+    storage: Arc<dyn ResponseStorage>,
+    repeat: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            sweep_unstored(&storage).await;
+            if !repeat {
+                return;
+            }
+            tokio::time::sleep(UNSTORED_RETENTION).await;
+        }
+    })
+}
+
+/// [`set_stored_status`] retried every `every` within `window` while the store
+/// answers with an error: the write that ends a background run is not given up
+/// on a store blip. The first failure is logged once; the outcome is the
+/// caller's to log.
+pub(crate) async fn set_stored_status_retrying(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
+    status: &str,
+    error: Option<Value>,
     request_context: Option<StorageRequestContext>,
-) -> bool {
-    let read = async { storage.get_response(&ResponseId::from(id)).await };
-    let stored = match request_context {
-        Some(ctx) => with_request_context(ctx, read).await,
-        None => read.await,
-    };
-    matches!(
-        stored,
-        Ok(Some(stored)) if is_terminal(stored.raw_response["status"].as_str().unwrap_or(""))
-    )
+    every: Duration,
+    window: Duration,
+) -> Result<Transition, ResponseStorageError> {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut attempts = 0u32;
+    loop {
+        match set_stored_status(storage, id, status, error.clone(), request_context.clone()).await {
+            Ok(transition) => return Ok(transition),
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                if attempts == 0 {
+                    warn!(
+                        response_id = %id,
+                        status,
+                        error = %e,
+                        "Failed to write the background response record; retrying while the store is unreachable"
+                    );
+                } else {
+                    debug!(response_id = %id, status, attempts, error = %e, "The terminal write still fails");
+                }
+                attempts += 1;
+                tokio::time::sleep(every).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Moves the record under `id` to the terminal `status` (see
-/// [`set_stored_status`]); a record that is already terminal stays.
+/// [`set_stored_status`]); a record that is already terminal stays. The
+/// store's answer is logged here and returned for the caller that retries.
 async fn close(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
     status: &str,
     error: Option<Value>,
     request_context: Option<StorageRequestContext>,
-) {
-    match set_stored_status(storage, id, status, error, request_context).await {
+) -> Result<Transition, ResponseStorageError> {
+    let outcome = set_stored_status(storage, id, status, error, request_context).await;
+    match &outcome {
         Ok(Transition::Moved(_)) => {}
         Ok(Transition::Terminal(raw)) => debug!(
             response_id = %id,
@@ -450,6 +571,40 @@ async fn close(
             status,
             error = %e,
             "Failed to close the background response record"
+        ),
+    }
+    outcome
+}
+
+/// [`close`] for the end of a run: retried every `every` within the terminal
+/// write window while the store answers with an error.
+async fn close_retrying(
+    storage: &Arc<dyn ResponseStorage>,
+    id: &str,
+    status: &str,
+    error: Option<Value>,
+    request_context: Option<StorageRequestContext>,
+    every: Duration,
+) {
+    let window = terminal_write_window(every);
+    match set_stored_status_retrying(storage, id, status, error, request_context, every, window)
+        .await
+    {
+        Ok(Transition::Moved(_)) => {}
+        Ok(Transition::Terminal(raw)) => debug!(
+            response_id = %id,
+            status,
+            stored = raw["status"].as_str().unwrap_or(""),
+            "Background response record had already been closed"
+        ),
+        Ok(Transition::Missing) => {
+            warn!(response_id = %id, status, "No record to close under the background response id");
+        }
+        Err(e) => warn!(
+            response_id = %id,
+            status,
+            error = %e,
+            "Failed to close the background response record; the store stayed unreachable for the whole retry window"
         ),
     }
 }
@@ -506,7 +661,37 @@ pub(crate) async fn close_before_stream(
     let bytes = to_bytes(body, 1 << 20).await.unwrap_or_default();
     let error = error_object_from(parts.status, &bytes);
     info!(response_id = %id, status = %parts.status, "Background stream failed before it opened");
-    close(storage, id, "failed", Some(error), request_context).await;
+    if close(
+        storage,
+        id,
+        "failed",
+        Some(error.clone()),
+        request_context.clone(),
+    )
+    .await
+    .is_err()
+    {
+        // No run follows that would close the record, and the client is
+        // waiting for this answer: the close is retried in a task of its own
+        // while the store is unreachable.
+        let storage = storage.clone();
+        let id = id.to_string();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the error answer must not wait for the store; the task ends with the close, within the terminal write window"
+        )]
+        let _closing = tokio::spawn(async move {
+            close_retrying(
+                &storage,
+                &id,
+                "failed",
+                Some(error),
+                request_context,
+                STATUS_WATCH,
+            )
+            .await;
+        });
+    }
     Response::from_parts(parts, Body::from(bytes))
 }
 
@@ -556,7 +741,12 @@ pub(crate) fn spawn(
 /// with its error, or with a generic one when the work ended without
 /// storing a result or panicked; `cancelled` on a cancel here. A record
 /// closed on another gateway sharing the store (read every
-/// [`STATUS_WATCH`]) stops the work and is not written again.
+/// [`STATUS_WATCH`]) stops the work and is not written again; so does a
+/// record deleted while the work ran, which is not written back either: the
+/// delete holds. A record read in the work's own result (`completed` or
+/// `incomplete`, which only the work writes) is the work finishing: it links
+/// the response's items to its conversation after that write, so the run
+/// goes on until the work ends, for the terminal write window at most.
 pub(crate) async fn drive<F>(
     storage: Arc<dyn ResponseStorage>,
     request_context: Option<StorageRequestContext>,
@@ -581,8 +771,22 @@ pub(crate) async fn drive_watching<F>(
 {
     let id = slot.id().to_string();
     let token = slot.cancel_token();
-    match set_stored_status(&storage, &id, "in_progress", None, request_context.clone()).await {
-        Ok(Transition::Moved(_)) => {}
+    // Whether the record was there when the work started; the watch learns
+    // it from its own reads as well, so a store blip at this transition does
+    // not disarm it. Only a record seen is a deletion when it is gone later:
+    // a store that never shows the record (no history backend, or a record
+    // deleted before the start) runs the work to its end as before and
+    // stores nothing over the missing record.
+    let record_seen = match set_stored_status(
+        &storage,
+        &id,
+        "in_progress",
+        None,
+        request_context.clone(),
+    )
+    .await
+    {
+        Ok(Transition::Moved(_)) => true,
         Ok(Transition::Terminal(raw)) => {
             info!(
                 response_id = %id,
@@ -593,22 +797,29 @@ pub(crate) async fn drive_watching<F>(
             return;
         }
         Ok(Transition::Missing) => {
-            warn!(response_id = %id, "No record stored under the background response id");
+            warn!(response_id = %id, "No record stored under the background response id; its work runs and its result is not stored");
+            false
         }
         Err(e) => {
             warn!(response_id = %id, error = %e, "Failed to mark the background response in progress");
+            false
         }
-    }
-    let closed_elsewhere = watch_stored_status(&storage, &id, request_context.clone(), watch);
+    };
+    let closed_elsewhere =
+        watch_stored_status(&storage, &id, request_context.clone(), watch, record_seen);
     let work = AssertUnwindSafe(work).catch_unwind();
     tokio::select! {
         biased;
         () = token.cancelled() => {
             info!(response_id = %id, "Background response cancelled");
-            close(&storage, &id, "cancelled", None, request_context).await;
+            close_retrying(&storage, &id, "cancelled", None, request_context, watch).await;
         }
         status = closed_elsewhere => {
-            info!(response_id = %id, status = %status, "Background response was closed elsewhere; its work is dropped");
+            if is_result(&status) {
+                warn!(response_id = %id, status = %status, "Background response stored its result but its work did not end within the terminal write window; the work is dropped");
+            } else {
+                info!(response_id = %id, status = %status, "Background response was closed elsewhere; its work is dropped");
+            }
         }
         outcome = work => match outcome {
             Ok(Ok(())) => {
@@ -619,20 +830,25 @@ pub(crate) async fn drive_watching<F>(
                     "code": "server_error",
                     "message": "The response ended without a stored result",
                 });
-                match set_stored_status(&storage, &id, "failed", Some(error), request_context).await {
+                let window = terminal_write_window(watch);
+                match set_stored_status_retrying(&storage, &id, "failed", Some(error), request_context, watch, window).await {
                     Ok(Transition::Terminal(_)) => debug!(response_id = %id, "Background response finished"),
                     Ok(Transition::Moved(_)) => {
                         warn!(response_id = %id, "Background response ended without a stored result; marked failed");
                     }
                     Ok(Transition::Missing) => {
-                        warn!(response_id = %id, "Background response ended with no record under its id");
+                        info!(response_id = %id, "Background response ended with no record under its id (deleted while it ran); its result is not stored");
                     }
-                    Err(e) => warn!(response_id = %id, error = %e, "Failed to read the background response record back"),
+                    Err(e) => warn!(
+                        response_id = %id,
+                        error = %e,
+                        "Failed to read the background response record back; the store stayed unreachable for the whole retry window"
+                    ),
                 }
             }
             Ok(Err(error)) => {
                 info!(response_id = %id, error = %error, "Background response failed");
-                close(&storage, &id, "failed", Some(error), request_context).await;
+                close_retrying(&storage, &id, "failed", Some(error), request_context, watch).await;
             }
             Err(panic) => {
                 let message = panic_message(panic.as_ref());
@@ -641,33 +857,60 @@ pub(crate) async fn drive_watching<F>(
                     "code": "server_error",
                     "message": format!("The response's task panicked: {message}"),
                 });
-                close(&storage, &id, "failed", Some(error), request_context).await;
+                close_retrying(&storage, &id, "failed", Some(error), request_context, watch).await;
             }
         },
     }
     drop(slot);
 }
 
-/// Resolves with the status once the record under `id` reads terminal.
+/// The status the watch answers for a record that is gone: the response was
+/// deleted while its work ran (`DELETE /v1/responses/{id}`, here or on
+/// another gateway sharing the store); the work is dropped like a cancel and
+/// nothing is written under the id again, so the delete holds.
+pub(crate) const DELETED: &str = "deleted";
+
+/// Resolves with the status once the record under `id` reads terminal, or,
+/// once the record was seen (`record_seen` at the start, or by a read of
+/// this watch), with [`DELETED`] once it is gone. A store that never showed
+/// the record is not read as a deletion; a store that cannot be read is
+/// retried at the next tick. A record read in the work's own result (see
+/// [`is_result`]) is the work finishing, not a close from elsewhere: the
+/// work stores the terminal object first and links the response's items to
+/// its conversation after it (two or more store round trips later), and a
+/// run dropped between the two left a `completed` record whose conversation
+/// missed the items. The watch keeps reading for the terminal write window
+/// from that first read (a delete meanwhile still ends the run) and resolves
+/// with the result only once the window has passed, so the run ends with the
+/// work in the meantime.
 async fn watch_stored_status(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
     request_context: Option<StorageRequestContext>,
     every: Duration,
+    mut record_seen: bool,
 ) -> String {
+    let mut result_read_at: Option<tokio::time::Instant> = None;
     loop {
         tokio::time::sleep(every).await;
         let read = async { storage.get_response(&ResponseId::from(id)).await };
-        let stored = match request_context.clone() {
-            Some(ctx) => with_request_context(ctx, read).await,
-            None => read.await,
-        };
+        let stored = under_context(request_context.clone(), read).await;
         match stored {
             Ok(Some(stored)) => {
+                record_seen = true;
                 let status = stored.raw_response["status"].as_str().unwrap_or("");
                 if is_terminal(status) {
-                    return status.to_string();
+                    if !is_result(status) {
+                        return status.to_string();
+                    }
+                    let read_at = *result_read_at.get_or_insert_with(tokio::time::Instant::now);
+                    if read_at.elapsed() >= terminal_write_window(every) {
+                        return status.to_string();
+                    }
                 }
+            }
+            Ok(None) if record_seen => {
+                return DELETED.to_string();
             }
             Ok(None) => {
                 debug!(response_id = %id, "Background response record not found while its work runs");
@@ -744,15 +987,47 @@ impl BackgroundStream {
     }
 }
 
-/// `POST /v1/responses/{id}/cancel`: a response this gateway runs is stopped
-/// and answered as `cancelled` once its task has written the record; a
-/// `queued` or `in_progress` background record no task runs here (a response
-/// of another gateway sharing the store, or one lost with a restart) is
-/// closed as `cancelled`, which the gateway running it reads within
-/// [`STATUS_WATCH`] and drops its work on; a response that already ended, or
-/// one that never ran in the background, is refused.
-pub(crate) async fn cancel(ctx: &ResponsesContext, response_id: &str) -> Response {
-    if let Some(mut finished) = ctx.background.cancel(response_id) {
+/// `POST /v1/responses/{id}/cancel` for a caller of `tenant`: a response
+/// this gateway runs is stopped and answered as `cancelled` once its task has
+/// written the record; a `queued` or `in_progress` background record no task
+/// runs here (a response of another gateway sharing the store, or one lost
+/// with a restart) is closed as `cancelled`, which the gateway running it
+/// reads within [`STATUS_WATCH`] and drops its work on; a response that
+/// already ended, or one that never ran in the background, is refused. A
+/// response of another tenant answers as an unknown id does, and nothing
+/// running under its id is touched.
+pub(crate) async fn cancel(
+    ctx: &ResponsesContext,
+    tenant: Option<&str>,
+    response_id: &str,
+) -> Response {
+    cancel_with(
+        &ctx.background,
+        &ctx.response_storage,
+        ctx.request_context.clone(),
+        tenant,
+        response_id,
+    )
+    .await
+}
+
+/// [`cancel`] over the registry and the store it works on.
+pub(crate) async fn cancel_with(
+    registry: &BackgroundResponses,
+    storage: &Arc<dyn ResponseStorage>,
+    request_context: Option<StorageRequestContext>,
+    tenant: Option<&str>,
+    response_id: &str,
+) -> Response {
+    // The record first: the registry is touched only for a response the
+    // caller may see.
+    match visible_record(storage, request_context.clone(), tenant, response_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return response_not_found(response_id),
+        Err(response) => return response,
+    }
+
+    if let Some(mut finished) = registry.cancel(response_id) {
         let settled = tokio::time::timeout(CANCEL_SETTLE, async {
             while !*finished.borrow_and_update() {
                 if finished.changed().await.is_err() {
@@ -769,37 +1044,16 @@ pub(crate) async fn cancel(ctx: &ResponsesContext, response_id: &str) -> Respons
         }
     }
 
-    let stored = match ctx
-        .response_storage
-        .get_response(&ResponseId::from(response_id))
-        .await
-    {
+    let stored = match visible_record(storage, request_context.clone(), tenant, response_id).await {
         Ok(Some(stored)) => stored,
-        Ok(None) => {
-            return error::not_found(
-                "response_not_found",
-                format!("Response with id '{response_id}' not found"),
-            )
-        }
-        Err(e) => {
-            return error::internal_error(
-                "retrieve_response_failed",
-                format!("Failed to retrieve response: {e}"),
-            )
-        }
+        Ok(None) => return response_not_found(response_id),
+        Err(response) => return response,
     };
     let raw = stored.raw_response;
     let background = raw["background"].as_bool().unwrap_or(false);
     match raw["status"].as_str().unwrap_or("unknown") {
         "queued" | "in_progress" if background => {
-            match set_stored_status(
-                &ctx.response_storage,
-                response_id,
-                "cancelled",
-                None,
-                ctx.request_context.clone(),
-            )
-            .await
+            match set_stored_status(storage, response_id, "cancelled", None, request_context).await
             {
                 Ok(Transition::Moved(raw)) => {
                     info!(
@@ -813,14 +1067,42 @@ pub(crate) async fn cancel(ctx: &ResponsesContext, response_id: &str) -> Respons
                     "response_not_found",
                     format!("Response with id '{response_id}' not found"),
                 ),
-                Err(e) => error::internal_error(
+                Err(e) => error::storage_failure(
                     "cancel_response_failed",
-                    format!("Failed to cancel response: {e}"),
+                    "Failed to cancel response",
+                    &e,
                 ),
             }
         }
         _ => answer_for_closed(raw),
     }
+}
+
+/// The record under `id` as a caller of `tenant` may see it: `None` for an
+/// id that is not stored and for one stored under another tenant alike.
+async fn visible_record(
+    storage: &Arc<dyn ResponseStorage>,
+    request_context: Option<StorageRequestContext>,
+    tenant: Option<&str>,
+    id: &str,
+) -> Result<Option<StoredResponse>, Response> {
+    let read = async { storage.get_response(&ResponseId::from(id)).await };
+    let stored = under_context(request_context, read).await;
+    match stored {
+        Ok(stored) => Ok(stored.filter(|stored| stored.is_visible_to(tenant))),
+        Err(e) => Err(error::storage_failure(
+            "retrieve_response_failed",
+            "Failed to retrieve response",
+            &e,
+        )),
+    }
+}
+
+fn response_not_found(id: &str) -> Response {
+    error::not_found(
+        "response_not_found",
+        format!("Response with id '{id}' not found"),
+    )
 }
 
 /// The cancel answer for a record that is not running in the background:
@@ -842,10 +1124,10 @@ fn answer_for_closed(raw: Value) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use smg_data_connector::{MemoryResponseStorage, ResponseStorageError, StoredResponse};
+    use smg_data_connector::{MemoryResponseStorage, ResponseStorageError};
     use tokio::sync::oneshot;
 
     use super::*;
@@ -879,10 +1161,24 @@ mod tests {
     }
 
     async fn store_queued(storage: &Arc<dyn ResponseStorage>, id: &str) -> ResponsesRequest {
+        store_queued_for(storage, id, None).await
+    }
+
+    async fn store_queued_for(
+        storage: &Arc<dyn ResponseStorage>,
+        id: &str,
+        tenant: Option<&str>,
+    ) -> ResponsesRequest {
         let request = request();
-        store_record(storage, &queued_response(id, &request), &request, None)
-            .await
-            .unwrap();
+        store_record(
+            storage,
+            &queued_response(id, &request),
+            &request,
+            tenant,
+            None,
+        )
+        .await
+        .unwrap();
         request
     }
 
@@ -935,6 +1231,32 @@ mod tests {
             self.inner.store_response(response).await
         }
 
+        async fn store_response_if_open(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            let outcome = self.inner.store_response_if_open(response).await?;
+            if matches!(outcome, ConditionalStore::Stored) {
+                self.stores.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(outcome)
+        }
+
+        async fn update_response_object_if_open(
+            &self,
+            id: &ResponseId,
+            raw_response: Value,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            let outcome = self
+                .inner
+                .update_response_object_if_open(id, raw_response)
+                .await?;
+            if matches!(outcome, ConditionalStore::Stored) {
+                self.stores.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(outcome)
+        }
+
         async fn get_response(
             &self,
             response_id: &ResponseId,
@@ -952,19 +1274,490 @@ mod tests {
         async fn list_identifier_responses(
             &self,
             identifier: &str,
+            tenant: Option<&str>,
             limit: Option<usize>,
         ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
             self.inner
-                .list_identifier_responses(identifier, limit)
+                .list_identifier_responses(identifier, tenant, limit)
                 .await
         }
 
         async fn delete_identifier_responses(
             &self,
             identifier: &str,
+            tenant: Option<&str>,
         ) -> Result<usize, ResponseStorageError> {
-            self.inner.delete_identifier_responses(identifier).await
+            self.inner
+                .delete_identifier_responses(identifier, tenant)
+                .await
         }
+    }
+
+    /// A memory store that answers the next `failures` reads and writes of
+    /// responses with a storage error, then works again; it counts its calls.
+    struct FlakyStorage {
+        inner: MemoryResponseStorage,
+        failures_left: AtomicUsize,
+        calls: AtomicUsize,
+        stores_landed: AtomicUsize,
+        /// Answers every read with no record, as a store without history does.
+        hides_records: AtomicBool,
+        /// Fails every read while the writes go through, as a read that
+        /// times out does.
+        reads_fail: AtomicBool,
+    }
+
+    impl FlakyStorage {
+        fn new() -> Self {
+            Self {
+                inner: MemoryResponseStorage::new(),
+                failures_left: AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+                stores_landed: AtomicUsize::new(0),
+                hides_records: AtomicBool::new(false),
+                reads_fail: AtomicBool::new(false),
+            }
+        }
+
+        fn hide_records(&self) {
+            self.hides_records.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_reads(&self) {
+            self.reads_fail.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_next(&self, failures: usize) {
+            self.failures_left.store(failures, Ordering::SeqCst);
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn stores_landed(&self) -> usize {
+            self.stores_landed.load(Ordering::SeqCst)
+        }
+
+        fn unreachable(&self) -> Result<(), ResponseStorageError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let left = self.failures_left.load(Ordering::SeqCst);
+            if left > 0 {
+                self.failures_left.store(left - 1, Ordering::SeqCst);
+                return Err(ResponseStorageError::Unavailable(
+                    "connection refused".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ResponseStorage for FlakyStorage {
+        async fn store_response(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ResponseId, ResponseStorageError> {
+            self.unreachable()?;
+            self.stores_landed.fetch_add(1, Ordering::SeqCst);
+            self.inner.store_response(response).await
+        }
+
+        async fn get_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<Option<StoredResponse>, ResponseStorageError> {
+            self.unreachable()?;
+            if self.reads_fail.load(Ordering::SeqCst) {
+                return Err(ResponseStorageError::Timeout("read timed out".to_string()));
+            }
+            if self.hides_records.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            self.inner.get_response(response_id).await
+        }
+
+        async fn delete_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<(), ResponseStorageError> {
+            self.inner.delete_response(response_id).await
+        }
+
+        async fn list_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+            limit: Option<usize>,
+        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
+            self.inner
+                .list_identifier_responses(identifier, tenant, limit)
+                .await
+        }
+
+        async fn delete_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+        ) -> Result<usize, ResponseStorageError> {
+            self.inner
+                .delete_identifier_responses(identifier, tenant)
+                .await
+        }
+    }
+
+    /// A store whose conditional writes stop at a gate once the record was
+    /// read: the window between a transition's read and its write, held open
+    /// for the test.
+    struct GatedStorage {
+        inner: Arc<CountingStorage>,
+        reached: tokio::sync::Notify,
+        gate: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ResponseStorage for GatedStorage {
+        async fn store_response(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ResponseId, ResponseStorageError> {
+            self.inner.store_response(response).await
+        }
+
+        async fn store_response_if_open(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            self.reached.notify_one();
+            self.gate.notified().await;
+            self.inner.store_response_if_open(response).await
+        }
+
+        async fn update_response_object_if_open(
+            &self,
+            id: &ResponseId,
+            raw_response: Value,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            self.reached.notify_one();
+            self.gate.notified().await;
+            self.inner
+                .update_response_object_if_open(id, raw_response)
+                .await
+        }
+
+        async fn get_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<Option<StoredResponse>, ResponseStorageError> {
+            self.inner.get_response(response_id).await
+        }
+
+        async fn delete_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<(), ResponseStorageError> {
+            self.inner.delete_response(response_id).await
+        }
+
+        async fn list_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+            limit: Option<usize>,
+        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
+            self.inner
+                .list_identifier_responses(identifier, tenant, limit)
+                .await
+        }
+
+        async fn delete_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+        ) -> Result<usize, ResponseStorageError> {
+            self.inner
+                .delete_identifier_responses(identifier, tenant)
+                .await
+        }
+    }
+
+    /// A completed Response object under `id`, as a run's result, built from
+    /// the queued record.
+    fn completed_after_queued(id: &str, request: &ResponsesRequest) -> ResponsesResponse {
+        let mut raw = serde_json::to_value(queued_response(id, request)).unwrap();
+        raw["status"] = json!("completed");
+        serde_json::from_value(raw).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_run_that_ends_while_the_store_is_unreachable_is_closed_once_the_store_returns() {
+        let flaky = Arc::new(FlakyStorage::new());
+        let storage: Arc<dyn ResponseStorage> = flaky.clone();
+        store_queued(&storage, "resp_1").await;
+        let registry = Arc::new(BackgroundResponses::new(4));
+        let slot = registry.admit("resp_1").unwrap();
+        // The store refuses the next three calls: the in_progress write, then
+        // the terminal close's read; a work that stored nothing (its own
+        // persist failed the same way) returns at once.
+        flaky.fail_next(3);
+        drive_watching(
+            storage.clone(),
+            None,
+            slot,
+            async { Ok(()) },
+            Duration::from_millis(10),
+        )
+        .await;
+        let raw = stored_raw(&storage, "resp_1").await;
+        assert_eq!(
+            raw["status"], "failed",
+            "the record is closed once the store answers again"
+        );
+        assert_eq!(raw["error"]["code"], "server_error");
+        assert!(
+            flaky.calls() > 3,
+            "the close was retried: {} calls",
+            flaky.calls()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_background_result_that_finds_the_store_unreachable_is_stored_once_it_returns() {
+        let flaky = Arc::new(FlakyStorage::new());
+        let storage: Arc<dyn ResponseStorage> = flaky.clone();
+        let request = store_queued(&storage, "resp_1").await;
+        let response = completed_after_queued("resp_1", &request);
+        // Two refused calls: the is_closed read and the first persist.
+        flaky.fail_next(2);
+        super::super::utils::persist_response_if_needed(
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            storage.clone(),
+            &response,
+            &request,
+            None,
+            None,
+        )
+        .await
+        .expect("nothing is reported to the caller here");
+        assert_eq!(
+            stored_status(&storage, "resp_1").await,
+            "completed",
+            "the result landed after the retry"
+        );
+        assert!(
+            flaky.calls() > 2,
+            "the persist was retried: {} calls",
+            flaky.calls()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_error_before_the_stream_opens_outlasts_a_store_outage() {
+        let flaky = Arc::new(FlakyStorage::new());
+        let storage: Arc<dyn ResponseStorage> = flaky.clone();
+        store_queued(&storage, "resp_1").await;
+        // The store refuses the first close's read and the first retry.
+        flaky.fail_next(2);
+        let answer = close_before_stream(
+            &storage,
+            None,
+            "resp_1",
+            error::bad_request("bad_input", "the request was refused"),
+        )
+        .await;
+        assert_eq!(
+            answer.status(),
+            StatusCode::BAD_REQUEST,
+            "the answer is kept"
+        );
+        // Poll the store underneath the fault injection, so the test's own
+        // reads do not use up the failures meant for the close and its retry.
+        let mut raw = Value::Null;
+        for _ in 0..2000 {
+            if let Ok(Some(stored)) = flaky.inner.get_response(&ResponseId::from("resp_1")).await {
+                if stored.raw_response["status"] == "failed" {
+                    raw = stored.raw_response;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            raw["status"], "failed",
+            "the record is closed once the store answers again"
+        );
+        assert_eq!(raw["error"]["code"], "bad_input");
+        assert_eq!(
+            flaky.failures_left.load(Ordering::SeqCst),
+            0,
+            "the close's first read and its first retry met the injected failures"
+        );
+        assert!(
+            flaky.calls() > 2,
+            "the close was retried: {} calls",
+            flaky.calls()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_background_result_is_not_stored_over_a_record_closed_while_the_store_was_away() {
+        let flaky = Arc::new(FlakyStorage::new());
+        let storage: Arc<dyn ResponseStorage> = flaky.clone();
+        let request = store_queued(&storage, "resp_1").await;
+        let response = completed_after_queued("resp_1", &request);
+        // The record is cancelled (by a client, through another gateway) while
+        // the store refuses this gateway's calls.
+        set_stored_status(&storage, "resp_1", "cancelled", None, None)
+            .await
+            .unwrap();
+        let landed_before = flaky.stores_landed();
+        flaky.fail_next(2);
+        super::super::utils::persist_response_if_needed(
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            storage.clone(),
+            &response,
+            &request,
+            None,
+            None,
+        )
+        .await
+        .expect("nothing is reported to the caller here");
+        assert_eq!(
+            stored_status(&storage, "resp_1").await,
+            "cancelled",
+            "the cancel wins"
+        );
+        assert_eq!(
+            flaky.stores_landed(),
+            landed_before,
+            "no late result was written"
+        );
+    }
+
+    /// The queued record is scoped to the tenant that asked for the response.
+    #[tokio::test]
+    async fn the_queued_record_carries_the_callers_tenant() {
+        let storage = storage();
+        store_queued_for(&storage, "resp_t", Some("header:tenant-a")).await;
+        let stored = storage
+            .get_response(&ResponseId::from("resp_t"))
+            .await
+            .unwrap()
+            .expect("stored");
+        assert_eq!(stored.tenant.as_deref(), Some("header:tenant-a"));
+        store_queued(&storage, "resp_n").await;
+        assert_eq!(
+            storage
+                .get_response(&ResponseId::from("resp_n"))
+                .await
+                .unwrap()
+                .unwrap()
+                .tenant,
+            None
+        );
+    }
+
+    /// A cancel from another tenant answers as for an unknown id and stops
+    /// nothing: the task keeps running and the record stays open; the owner's
+    /// cancel then closes it.
+    #[tokio::test]
+    async fn a_cancel_from_another_tenant_answers_not_found_and_stops_nothing() {
+        let storage = storage();
+        store_queued_for(&storage, "resp_1", Some("header:tenant-a")).await;
+        let registry = Arc::new(BackgroundResponses::new(4));
+        let slot = registry.admit("resp_1").unwrap();
+        let token = slot.cancel_token();
+
+        for caller in [Some("header:tenant-b"), None] {
+            let answer = cancel_with(&registry, &storage, None, caller, "resp_1").await;
+            assert_eq!(answer.status(), StatusCode::NOT_FOUND, "{caller:?}");
+            assert!(!token.is_cancelled(), "{caller:?}: the run is untouched");
+            assert_eq!(stored_status(&storage, "resp_1").await, "queued");
+        }
+        let missing = cancel_with(
+            &registry,
+            &storage,
+            None,
+            Some("header:tenant-b"),
+            "resp_404",
+        )
+        .await;
+        assert_eq!(
+            missing.status(),
+            StatusCode::NOT_FOUND,
+            "the same answer as an unknown id"
+        );
+
+        // The owner's cancel fires the token; the record closes once the slot drops.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let owner = tokio::spawn(async move {
+            // The slot (the running task) ends when its token fires.
+            token.cancelled().await;
+            drop(slot);
+        });
+        let answer =
+            cancel_with(&registry, &storage, None, Some("header:tenant-a"), "resp_1").await;
+        owner.await.unwrap();
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert_eq!(stored_status(&storage, "resp_1").await, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_write_that_loses_the_race_to_a_close_elsewhere_is_refused() {
+        // Gateway X runs the response and writes its terminal object; gateway
+        // Y cancels it on the shared store between X's read and X's write.
+        let counting = Arc::new(CountingStorage::new());
+        let direct: Arc<dyn ResponseStorage> = counting.clone();
+        store_queued(&direct, "resp_1").await;
+        set_stored_status(&direct, "resp_1", "in_progress", None, None)
+            .await
+            .unwrap();
+        let gated = Arc::new(GatedStorage {
+            inner: counting.clone(),
+            reached: tokio::sync::Notify::new(),
+            gate: tokio::sync::Notify::new(),
+        });
+        let through_gate: Arc<dyn ResponseStorage> = gated.clone();
+        let writes = counting.stores();
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let x = tokio::spawn(async move {
+            set_stored_status(&through_gate, "resp_1", "completed", None, None)
+                .await
+                .unwrap()
+        });
+        // X has read the open record and stands at its write.
+        gated.reached.notified().await;
+
+        // Y's cancel lands first.
+        let Transition::Moved(raw) = set_stored_status(&direct, "resp_1", "cancelled", None, None)
+            .await
+            .unwrap()
+        else {
+            panic!("the open record is cancelled");
+        };
+        assert_eq!(raw["status"], "cancelled");
+
+        // X's write is refused: the record stays cancelled, completed is never written.
+        gated.gate.notify_one();
+        let Transition::Terminal(raw) = x.await.unwrap() else {
+            panic!("the late terminal write is refused");
+        };
+        assert_eq!(raw["status"], "cancelled");
+        assert_eq!(stored_status(&direct, "resp_1").await, "cancelled");
+        assert_eq!(
+            counting.stores(),
+            writes + 1,
+            "cancelled was written once; completed never"
+        );
     }
 
     #[test]
@@ -1067,7 +1860,6 @@ mod tests {
             panic!("a queued record is cancelled");
         };
         assert_eq!(raw["status"], "cancelled");
-        assert!(is_closed(&storage, "resp_1", None).await);
 
         for status in ["failed", "in_progress", "completed", "cancelled"] {
             let error = (status == "failed").then(|| json!({"code": "x", "message": "y"}));
@@ -1083,7 +1875,13 @@ mod tests {
         let raw = stored_raw(&storage, "resp_1").await;
         assert_eq!(raw["status"], "cancelled");
         assert!(raw["error"].is_null(), "{raw}");
-        assert!(!is_closed(&storage, "resp_404", None).await);
+        // A record that is gone takes no write: nothing is written under it.
+        assert!(matches!(
+            set_stored_status(&storage, "resp_404", "completed", None, None)
+                .await
+                .unwrap(),
+            Transition::Missing
+        ));
     }
 
     #[tokio::test]
@@ -1111,6 +1909,182 @@ mod tests {
         assert!(*finished.borrow_and_update());
         assert_eq!(stored_status(&storage, "resp_1").await, "cancelled");
         assert_eq!(registry.in_flight(), 0);
+    }
+
+    /// `DELETE /v1/responses/{id}` while the work runs, here or on another
+    /// gateway: the watch finds the record gone, the work is dropped and
+    /// nothing is written under the id again, so the delete holds.
+    #[tokio::test]
+    async fn a_record_deleted_while_the_work_runs_drops_the_work_and_stays_deleted() {
+        let storage = storage();
+        store_queued(&storage, "resp_1").await;
+        let registry = Arc::new(BackgroundResponses::new(4));
+        let slot = registry.admit("resp_1").unwrap();
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let flag = DropFlag(Some(dropped_tx));
+        let work = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let task = tokio::spawn(drive_watching(
+            storage.clone(),
+            None,
+            slot,
+            work,
+            Duration::from_millis(10),
+        ));
+        wait_for_status(&storage, "resp_1", "in_progress").await;
+        storage
+            .delete_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the run ends once its record is gone")
+            .unwrap();
+        dropped_rx.await.expect("the work was dropped");
+        assert_eq!(
+            stored_raw(&storage, "resp_1").await,
+            Value::Null,
+            "nothing is written under the deleted id"
+        );
+        assert_eq!(registry.in_flight(), 0);
+    }
+
+    /// A store that never shows the record (no history backend, or a record
+    /// deleted before the work began) is not read as a deletion: the work
+    /// runs to its end, as before, and stores nothing over the missing
+    /// record.
+    #[tokio::test]
+    async fn a_run_over_a_store_that_never_shows_its_record_reaches_its_end() {
+        let flaky = Arc::new(FlakyStorage::new());
+        let storage: Arc<dyn ResponseStorage> = flaky.clone();
+        store_queued(&storage, "resp_1").await;
+        flaky.hide_records();
+        let registry = Arc::new(BackgroundResponses::new(4));
+        let slot = registry.admit("resp_1").unwrap();
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let work = async move {
+            // Longer than several watch ticks: a watch that read the missing
+            // record as a deletion would drop this before it ends.
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = done_tx.send(());
+            Ok(())
+        };
+        drive_watching(storage.clone(), None, slot, work, Duration::from_millis(10)).await;
+        done_rx.await.expect("the work ran to its end");
+        assert_eq!(registry.in_flight(), 0);
+    }
+
+    /// A store blip at the in_progress transition does not disarm the watch:
+    /// the run learns from its first good read that its record exists, and a
+    /// record deleted after that ends the run.
+    #[tokio::test]
+    async fn a_run_that_started_during_a_store_blip_still_ends_when_its_record_is_deleted() {
+        let flaky = Arc::new(FlakyStorage::new());
+        let storage: Arc<dyn ResponseStorage> = flaky.clone();
+        store_queued(&storage, "resp_1").await;
+        let registry = Arc::new(BackgroundResponses::new(4));
+        let slot = registry.admit("resp_1").unwrap();
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let flag = DropFlag(Some(dropped_tx));
+        let work = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        // The in_progress write fails: the record stays queued and the run
+        // starts without having seen it.
+        flaky.fail_next(1);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let task = tokio::spawn(drive_watching(
+            storage.clone(),
+            None,
+            slot,
+            work,
+            Duration::from_millis(10),
+        ));
+        // A few good reads of the record, then the delete.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            flaky.calls() > 2,
+            "the watch read the record: {} calls",
+            flaky.calls()
+        );
+        storage
+            .delete_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the run ends once its record is gone")
+            .unwrap();
+        dropped_rx.await.expect("the work was dropped");
+        assert_eq!(
+            stored_raw(&storage, "resp_1").await,
+            Value::Null,
+            "nothing is written under the deleted id"
+        );
+        assert_eq!(registry.in_flight(), 0);
+    }
+
+    /// The guard of the terminal persist is the conditional write: an open
+    /// record takes it, a terminal one refuses it with what it closed with, a
+    /// record that is gone takes nothing (the delete holds), and a store that
+    /// cannot be read refuses it with an error, deciding nothing.
+    #[tokio::test]
+    async fn a_record_that_is_gone_reads_closed_and_an_unreadable_store_does_not() {
+        let storage = storage();
+        store_queued(&storage, "resp_open").await;
+        assert!(matches!(
+            set_stored_status(&storage, "resp_open", "in_progress", None, None)
+                .await
+                .unwrap(),
+            Transition::Moved(_)
+        ));
+        set_stored_status(&storage, "resp_open", "cancelled", None, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            set_stored_status(&storage, "resp_open", "completed", None, None)
+                .await
+                .unwrap(),
+            Transition::Terminal(_)
+        ));
+        assert!(
+            matches!(
+                set_stored_status(&storage, "resp_gone", "completed", None, None)
+                    .await
+                    .unwrap(),
+                Transition::Missing
+            ),
+            "a missing record is closed: nothing is written under it"
+        );
+
+        let flaky = Arc::new(FlakyStorage::new());
+        let flaky_storage: Arc<dyn ResponseStorage> = flaky.clone();
+        store_queued(&flaky_storage, "resp_1").await;
+        flaky.fail_next(1);
+        assert!(
+            set_stored_status(&flaky_storage, "resp_1", "in_progress", None, None)
+                .await
+                .is_err(),
+            "a store that cannot be read refuses the write and decides nothing"
+        );
+        assert!(matches!(
+            set_stored_status(&flaky_storage, "resp_1", "in_progress", None, None)
+                .await
+                .unwrap(),
+            Transition::Moved(_)
+        ));
     }
 
     #[tokio::test]
@@ -1352,6 +2326,88 @@ mod tests {
             .build()
     }
 
+    /// With background mode off the sweeper still runs once at start-up, for
+    /// the records an earlier gateway left, and then ends.
+    #[tokio::test]
+    async fn the_sweeper_runs_once_with_background_mode_off() {
+        let storage = storage();
+        let mut left = StoredResponse::new(None);
+        left.id = ResponseId::from("resp_left");
+        left.raw_response = json!({
+            "id": "resp_left",
+            "store": false,
+            "status": "completed",
+            "completed_at": chrono::Utc::now().timestamp() - 3 * UNSTORED_RETENTION.as_secs() as i64,
+        });
+        storage.store_response(left).await.unwrap();
+
+        spawn_unstored_sweeper(Arc::clone(&storage), false)
+            .await
+            .expect("the one-shot sweeper ends");
+
+        assert!(storage
+            .get_response(&ResponseId::from("resp_left"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// The sweep takes the unstored records whose window ended and leaves a
+    /// fresh one, a stored one and one still running.
+    #[tokio::test]
+    async fn the_sweep_retires_the_unstored_records_left_past_their_window() {
+        use smg_data_connector::{MemoryResponseStorage, StoredResponse};
+
+        let storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
+        let now = chrono::Utc::now().timestamp();
+        let past = now - i64::try_from(UNSTORED_RETENTION.as_secs()).unwrap() - 60;
+        for (id, raw) in [
+            (
+                "resp_old_unstored",
+                json!({"status": "completed", "store": false, "completed_at": past}),
+            ),
+            (
+                "resp_fresh_unstored",
+                json!({"status": "completed", "store": false, "completed_at": now}),
+            ),
+            (
+                "resp_old_stored",
+                json!({"status": "completed", "store": true, "completed_at": past}),
+            ),
+            (
+                "resp_old_running_unstored",
+                json!({"status": "in_progress", "store": false}),
+            ),
+        ] {
+            let mut stored = StoredResponse::new(None);
+            stored.id = ResponseId::from(id);
+            stored.raw_response = raw;
+            storage.store_response(stored).await.unwrap();
+        }
+
+        assert_eq!(sweep_unstored(&storage).await, 1);
+
+        assert!(storage
+            .get_response(&ResponseId::from("resp_old_unstored"))
+            .await
+            .unwrap()
+            .is_none());
+        for kept in [
+            "resp_fresh_unstored",
+            "resp_old_stored",
+            "resp_old_running_unstored",
+        ] {
+            assert!(
+                storage
+                    .get_response(&ResponseId::from(kept))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{kept}"
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn an_unstored_background_response_is_polled_through_its_window_then_retired() {
         let storage = storage();
@@ -1360,6 +2416,7 @@ mod tests {
             &storage,
             &queued_response("resp_u", &request),
             &request,
+            None,
             None,
         )
         .await
@@ -1419,9 +2476,15 @@ mod tests {
         let storage = storage();
         let request = unstored_request();
         for id in ["resp_cancelled", "resp_running"] {
-            store_record(&storage, &queued_response(id, &request), &request, None)
-                .await
-                .unwrap();
+            store_record(
+                &storage,
+                &queued_response(id, &request),
+                &request,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         }
         store_queued(&storage, "resp_stored").await;
 
@@ -1465,5 +2528,281 @@ mod tests {
             "cancelled",
             "a stored record is kept"
         );
+    }
+
+    /// The work's persistence stores the terminal object first and links the
+    /// response's items to its conversation after it (two or more store
+    /// round trips later). A watch tick between the two reads `completed`:
+    /// the object is the work's own, the work is not dropped there and
+    /// finishes its linking.
+    #[tokio::test]
+    async fn a_work_finishes_its_linking_after_the_watch_reads_its_own_result() {
+        let storage = storage();
+        let request = store_queued(&storage, "resp_1").await;
+        let registry = Arc::new(BackgroundResponses::new(4));
+        let slot = registry.admit("resp_1").unwrap();
+        // The linking waits at this gate until the watch has read the result.
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let (linked_tx, linked_rx) = oneshot::channel::<()>();
+        let work = {
+            let storage = storage.clone();
+            async move {
+                store_record(
+                    &storage,
+                    &completed_after_queued("resp_1", &request),
+                    &request,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                if gate_rx.await.is_ok() {
+                    let _ = linked_tx.send(());
+                }
+                Ok(())
+            }
+        };
+        let watch = Duration::from_millis(20);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let task = tokio::spawn(drive_watching(storage.clone(), None, slot, work, watch));
+        wait_for_status(&storage, "resp_1", "completed").await;
+        // Several watch ticks read the result before the linking goes on.
+        tokio::time::sleep(watch * 4).await;
+        let _ = gate_tx.send(());
+        task.await.unwrap();
+        assert!(
+            linked_rx.await.is_ok(),
+            "the linking after the result's write ran to its end"
+        );
+        assert_eq!(stored_status(&storage, "resp_1").await, "completed");
+        assert_eq!(registry.in_flight(), 0);
+    }
+
+    /// The run stays open on the work's own result for the terminal write
+    /// window at most: a work that never ends after its write is dropped at
+    /// the window's end, and the record keeps the result.
+    #[tokio::test]
+    async fn a_work_that_never_ends_after_its_result_is_dropped_at_the_windows_end() {
+        let storage = storage();
+        let request = store_queued(&storage, "resp_1").await;
+        let registry = Arc::new(BackgroundResponses::new(4));
+        let slot = registry.admit("resp_1").unwrap();
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let flag = DropFlag(Some(dropped_tx));
+        let work = {
+            let storage = storage.clone();
+            async move {
+                let _flag = flag;
+                store_record(
+                    &storage,
+                    &completed_after_queued("resp_1", &request),
+                    &request,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+        };
+        let watch = Duration::from_millis(10);
+        let started = tokio::time::Instant::now();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let task = tokio::spawn(drive_watching(storage.clone(), None, slot, work, watch));
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the run ends at the window's end")
+            .unwrap();
+        dropped_rx.await.expect("the work was dropped");
+        assert!(
+            started.elapsed() >= terminal_write_window(watch),
+            "dropped no sooner than the window: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(stored_status(&storage, "resp_1").await, "completed");
+        assert_eq!(registry.in_flight(), 0);
+    }
+
+    /// [`CountingStorage`] behind a read path that is down: every read fails
+    /// while the writes, the conditional ones included, go through.
+    struct ReadFailingStorage(Arc<CountingStorage>);
+
+    #[async_trait]
+    impl ResponseStorage for ReadFailingStorage {
+        async fn store_response(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ResponseId, ResponseStorageError> {
+            self.0.store_response(response).await
+        }
+
+        async fn store_response_if_open(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            self.0.store_response_if_open(response).await
+        }
+
+        async fn update_response_object_if_open(
+            &self,
+            id: &ResponseId,
+            raw_response: Value,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            self.0
+                .update_response_object_if_open(id, raw_response)
+                .await
+        }
+
+        async fn get_response(
+            &self,
+            _response_id: &ResponseId,
+        ) -> Result<Option<StoredResponse>, ResponseStorageError> {
+            Err(ResponseStorageError::Timeout("read timed out".to_string()))
+        }
+
+        async fn delete_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<(), ResponseStorageError> {
+            self.0.delete_response(response_id).await
+        }
+
+        async fn list_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+            limit: Option<usize>,
+        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
+            self.0
+                .list_identifier_responses(identifier, tenant, limit)
+                .await
+        }
+
+        async fn delete_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+        ) -> Result<usize, ResponseStorageError> {
+            self.0.delete_identifier_responses(identifier, tenant).await
+        }
+    }
+
+    /// A store whose reads fail while its writes go through (a read that
+    /// times out, a read path that is down): the guard of the terminal
+    /// persist is the store's own conditional write, so a result that arrives
+    /// after a cancel or a delete is refused by the store, and no failed read
+    /// on the gateway's side passes for an open record.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_result_is_refused_by_the_store_while_the_record_cannot_be_read() {
+        let counting = Arc::new(CountingStorage::new());
+        let direct: Arc<dyn ResponseStorage> = counting.clone();
+        let storage: Arc<dyn ResponseStorage> = Arc::new(ReadFailingStorage(counting.clone()));
+        let request = store_queued(&direct, "resp_1").await;
+        let response = completed_after_queued("resp_1", &request);
+        // Cancelled through another gateway; this gateway's reads fail from
+        // here on.
+        set_stored_status(&direct, "resp_1", "cancelled", None, None)
+            .await
+            .unwrap();
+        let writes = counting.stores();
+        super::super::utils::persist_response_if_needed(
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            storage.clone(),
+            &response,
+            &request,
+            None,
+            None,
+        )
+        .await
+        .expect("nothing is reported to the caller here");
+        assert_eq!(
+            stored_status(&direct, "resp_1").await,
+            "cancelled",
+            "the cancel wins"
+        );
+        assert_eq!(counting.stores(), writes, "no late result was written");
+
+        // The record is deleted while the work runs: the result does not
+        // re-create it.
+        direct
+            .delete_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap();
+        super::super::utils::persist_response_if_needed(
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            storage,
+            &response,
+            &request,
+            None,
+            None,
+        )
+        .await
+        .expect("nothing is reported to the caller here");
+        assert_eq!(
+            stored_raw(&direct, "resp_1").await,
+            Value::Null,
+            "the delete holds"
+        );
+        assert_eq!(
+            counting.stores(),
+            writes,
+            "nothing was written under the deleted id"
+        );
+    }
+
+    /// A store without an atomic conditional write of its own (the trait's
+    /// default reads the record, then writes) whose reads fail while its
+    /// writes go through: the failed read is an error the persist retries
+    /// for the terminal write window and then gives up on, never an open
+    /// record; nothing is written while the record's state is unknown.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_that_cannot_be_read_takes_no_late_result_without_an_atomic_check() {
+        let flaky = Arc::new(FlakyStorage::new());
+        let storage: Arc<dyn ResponseStorage> = flaky.clone();
+        let request = store_queued(&storage, "resp_1").await;
+        let response = completed_after_queued("resp_1", &request);
+        set_stored_status(&storage, "resp_1", "cancelled", None, None)
+            .await
+            .unwrap();
+        let landed_before = flaky.stores_landed();
+        let calls_before = flaky.calls();
+        flaky.fail_reads();
+        super::super::utils::persist_response_if_needed(
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            storage,
+            &response,
+            &request,
+            None,
+            None,
+        )
+        .await
+        .expect("nothing is reported to the caller here");
+        assert_eq!(
+            flaky.stores_landed(),
+            landed_before,
+            "no late result was written over the record that could not be read"
+        );
+        assert!(
+            flaky.calls() - calls_before > TERMINAL_WRITE_RETRIES as usize,
+            "the read was retried for the terminal write window: {} calls",
+            flaky.calls() - calls_before
+        );
+        let stored = flaky
+            .inner
+            .get_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap()
+            .expect("the record is still there");
+        assert_eq!(stored.raw_response["status"], "cancelled");
     }
 }

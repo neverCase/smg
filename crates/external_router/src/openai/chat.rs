@@ -11,6 +11,7 @@ use futures_util::StreamExt;
 use openai_protocol::{chat::ChatCompletionRequest, common::to_value_exact, model_type::Endpoint};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::warn;
 
 use super::{
     context::{ComponentRefs, PayloadState, RequestContext, SharedComponents, WorkerSelection},
@@ -25,6 +26,7 @@ use crate::{
     retry::{is_retryable_response, RetryExecutor},
     sse::SSE_CHANNEL_BUFFER,
     tenant::TenantRequestMeta,
+    upstream_body::{read_response_body_limited, ReadBodyResult, MAX_ERROR_RESPONSE_SIZE},
     worker::{SelectWorkerRequest, WorkerSource},
     RetryConfig,
 };
@@ -35,6 +37,133 @@ pub(super) struct ChatRouterContext<'a> {
     pub provider_registry: &'a ProviderRegistry,
     pub shared_components: &'a Arc<SharedComponents>,
     pub retry_config: &'a RetryConfig,
+}
+
+/// One attempt against the worker: the payload posted with the caller's auth
+/// and the provider's headers, as an event stream when the request streams.
+async fn send_attempt(
+    client: &reqwest::Client,
+    url: &str,
+    payload: &serde_json::Value,
+    headers: Option<&HeaderMap>,
+    worker_api_key: Option<&String>,
+    streaming: bool,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut req = client.post(url).json(payload);
+    let auth_header = extract_auth_header(headers, worker_api_key);
+    req = apply_provider_headers(req, url, auth_header.as_ref());
+    if streaming {
+        req = req.header("Accept", "text/event-stream");
+    }
+    req.send().await
+}
+
+/// The upstream's success stream relayed to the client frame by frame; an
+/// error on it aborts the client's stream (the error's text is not
+/// delivered). The content type is the upstream's, else `text/event-stream`.
+/// A refusal never comes here: [`error_body`] answers it whole.
+fn relayed_body(resp: reqwest::Response, status: StatusCode) -> Response {
+    let content_type = resp.headers().get(CONTENT_TYPE).cloned();
+    let stream = resp.bytes_stream();
+    let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
+    )]
+    tokio::spawn(async move {
+        let mut s = stream;
+        while let Some(chunk) = s.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(format!("Stream error: {e}"))).await;
+                    break;
+                }
+            }
+        }
+    });
+    let mut response = Response::new(Body::from_stream(ReceiverStream::new(rx)));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        content_type.unwrap_or_else(|| HeaderValue::from_static("text/event-stream")),
+    );
+    response
+}
+
+/// The upstream's success body read whole under its status and content type;
+/// a read failure is a 500. A refusal never comes here: [`error_body`]
+/// answers it.
+async fn buffered_body(resp: reqwest::Response, status: StatusCode) -> Response {
+    let content_type = resp.headers().get(CONTENT_TYPE).cloned();
+    match resp.bytes().await {
+        Ok(body) => {
+            let mut response = Response::new(Body::from(body));
+            *response.status_mut() = status;
+            if let Some(ct) = content_type {
+                response.headers_mut().insert(CONTENT_TYPE, ct);
+            }
+            response
+        }
+        Err(e) => error::internal_error("upstream_error", format!("Failed to read response: {e}")),
+    }
+}
+
+/// The upstream's error body, read whole within [`MAX_ERROR_RESPONSE_SIZE`],
+/// under its status and content type with the provider's account identifiers
+/// removed ([`error::sanitize_error_body`]); the provider's own words go to
+/// the log at warn. A body past the bound, or one that cannot be read, is
+/// answered under the upstream's status with the gateway's own envelope and
+/// none of it: the status is the provider's verdict and the retry layer reads
+/// it, a 500 would be retried.
+async fn error_body(resp: reqwest::Response, status: StatusCode, model: &str) -> Response {
+    let content_type = resp.headers().get(CONTENT_TYPE).cloned();
+    match read_response_body_limited(resp, MAX_ERROR_RESPONSE_SIZE).await {
+        ReadBodyResult::Ok(body) => {
+            warn!(
+                model = %model,
+                status = %status,
+                body_preview = %body.chars().take(200).collect::<String>(),
+                "Upstream error"
+            );
+            let mut response = Response::new(Body::from(error::sanitize_error_body(&body)));
+            *response.status_mut() = status;
+            if let Some(ct) = content_type {
+                response.headers_mut().insert(CONTENT_TYPE, ct);
+            }
+            response
+        }
+        ReadBodyResult::TooLarge => {
+            warn!(
+                model = %model,
+                status = %status,
+                max_size = MAX_ERROR_RESPONSE_SIZE,
+                "Upstream error body too large"
+            );
+            error::create_error(
+                status,
+                "upstream_error",
+                "Upstream error response too large",
+            )
+        }
+        ReadBodyResult::Error(e) => {
+            warn!(
+                model = %model,
+                status = %status,
+                error = %e,
+                "Failed to read upstream error body"
+            );
+            error::create_error(
+                status,
+                "upstream_error",
+                "Failed to read upstream error response",
+            )
+        }
+    }
 }
 
 /// Route a chat completion request to the appropriate upstream worker.
@@ -146,6 +275,7 @@ pub(super) async fn route_chat(
     let headers_cloned = Arc::new(ctx.headers().cloned());
     let worker_api_key = Arc::new(worker.api_key().cloned());
     let is_streaming = ctx.is_streaming();
+    let model_name: Arc<str> = Arc::from(model);
 
     let response = RetryExecutor::execute_response_with_retry(
         deps.retry_config,
@@ -156,18 +286,19 @@ pub(super) async fn route_chat(
             let headers = Arc::clone(&headers_cloned);
             let worker_api_key = Arc::clone(&worker_api_key);
             let worker = Arc::clone(&worker);
+            let model_name = Arc::clone(&model_name);
 
             async move {
-                let mut req = client.post(&url).json(&*payload);
-                let auth_header =
-                    extract_auth_header((*headers).as_ref(), (*worker_api_key).as_ref());
-                req = apply_provider_headers(req, &url, auth_header.as_ref());
-
-                if is_streaming {
-                    req = req.header("Accept", "text/event-stream");
-                }
-
-                let resp = match req.send().await {
+                let sent = send_attempt(
+                    &client,
+                    &url,
+                    &payload,
+                    (*headers).as_ref(),
+                    (*worker_api_key).as_ref(),
+                    is_streaming,
+                )
+                .await;
+                let resp = match sent {
                     Ok(r) => r,
                     Err(e) => {
                         worker.record_outcome(503);
@@ -186,56 +317,17 @@ pub(super) async fn route_chat(
                 // For non-streaming: we record here too — body read errors
                 // are connection issues, not worker health issues.
                 worker.record_outcome(status.as_u16());
-                let content_type = resp.headers().get(CONTENT_TYPE).cloned();
 
-                if is_streaming {
-                    let stream = resp.bytes_stream();
-                    let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
-                    #[expect(clippy::disallowed_methods, reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding")]
-                    tokio::spawn(async move {
-                        let mut s = stream;
-                        while let Some(chunk) = s.next().await {
-                            match chunk {
-                                Ok(bytes) => {
-                                    if tx.send(Ok(bytes)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(Err(format!("Stream error: {e}"))).await;
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                    let mut response =
-                        Response::new(Body::from_stream(ReceiverStream::new(rx)));
-                    *response.status_mut() = status;
-                    if let Some(ct) = content_type {
-                        response.headers_mut().insert(CONTENT_TYPE, ct);
-                    } else if status.is_success() {
-                        response
-                            .headers_mut()
-                            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-                    }
-                    response
+                if !status.is_success() {
+                    // A refusal is answered whole and sanitized whether or
+                    // not the request streams: the provider's account
+                    // identifiers in its message are the operator's, not
+                    // the caller's (as the Responses paths answer theirs).
+                    error_body(resp, status, &model_name).await
+                } else if is_streaming {
+                    relayed_body(resp, status)
                 } else {
-                    match resp.bytes().await {
-                        Ok(body) => {
-                            let mut response = Response::new(Body::from(body));
-                            *response.status_mut() = status;
-                            if let Some(ct) = content_type {
-                                response.headers_mut().insert(CONTENT_TYPE, ct);
-                            }
-                            response
-                        }
-                        Err(e) => {
-                            error::internal_error(
-                                "upstream_error",
-                                format!("Failed to read response: {e}"),
-                            )
-                        }
-                    }
+                    buffered_body(resp, status).await
                 }
             }
         },
@@ -277,4 +369,135 @@ pub(super) async fn route_chat(
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+
+    use super::*;
+
+    fn upstream(
+        status: u16,
+        content_type: Option<&str>,
+        body: impl Into<reqwest::Body>,
+    ) -> reqwest::Response {
+        let mut builder = http::Response::builder().status(status);
+        if let Some(ct) = content_type {
+            builder = builder.header(CONTENT_TYPE, ct);
+        }
+        reqwest::Response::from(builder.body(body.into()).expect("a response"))
+    }
+
+    async fn bytes_of(response: Response) -> Vec<u8> {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body")
+            .to_vec()
+    }
+
+    fn content_type_of(response: &Response) -> Option<String> {
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    #[tokio::test]
+    async fn a_buffered_body_keeps_the_upstreams_status_content_type_and_bytes() {
+        let response = buffered_body(
+            upstream(201, Some("application/json"), "{\"ok\":true}"),
+            StatusCode::CREATED,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            content_type_of(&response).as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(bytes_of(response).await, b"{\"ok\":true}");
+    }
+
+    #[tokio::test]
+    async fn a_relayed_body_forwards_the_bytes_and_is_an_event_stream_on_a_success_without_a_type()
+    {
+        let response = relayed_body(upstream(200, None, "data: x\n\n"), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            content_type_of(&response).as_deref(),
+            Some("text/event-stream")
+        );
+        assert_eq!(bytes_of(response).await, b"data: x\n\n");
+    }
+
+    const UPSTREAM_REFUSAL: &str = r#"{"error":{"message":"Rate limit reached for model in organization org-abc123 project proj_xyz789","type":"rate_limit","code":"rate_limit_exceeded"}}"#;
+
+    /// A provider's refusal reaches the chat caller under its status and
+    /// content type with the operator's organization and project gone, as
+    /// it reaches a Responses caller.
+    #[tokio::test]
+    async fn an_upstream_errors_body_loses_the_operators_identifiers() {
+        let response = error_body(
+            upstream(429, Some("application/json"), UPSTREAM_REFUSAL),
+            StatusCode::TOO_MANY_REQUESTS,
+            "m",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            content_type_of(&response).as_deref(),
+            Some("application/json")
+        );
+        let text = String::from_utf8(bytes_of(response).await).expect("utf-8");
+        assert!(!text.contains("org-abc123"), "{text}");
+        assert!(!text.contains("proj_xyz789"), "{text}");
+        assert!(text.contains("Rate limit reached for model"), "{text}");
+        assert!(text.contains(r#""code":"rate_limit_exceeded""#), "{text}");
+    }
+
+    /// An error body past the bound is not buffered or relayed: the caller
+    /// gets the upstream's status with the gateway's envelope and none of it.
+    #[tokio::test]
+    async fn an_upstream_error_body_past_the_bound_is_answered_without_it() {
+        let body = format!(
+            r#"{{"error":{{"message":"{}"}}}}"#,
+            "x".repeat(MAX_ERROR_RESPONSE_SIZE)
+        );
+        let response = error_body(
+            upstream(429, Some("application/json"), body),
+            StatusCode::TOO_MANY_REQUESTS,
+            "m",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let text = String::from_utf8(bytes_of(response).await).expect("utf-8");
+        assert!(!text.contains("xxxx"), "{text}");
+        assert!(text.contains("too large"), "{text}");
+    }
+
+    /// A refusal whose body cannot be read keeps the upstream's status: the
+    /// caller gets it with the gateway's envelope and without the transport
+    /// error's text, not a 500 the retry layer would act on.
+    #[tokio::test]
+    async fn an_upstream_error_body_that_cannot_be_read_keeps_the_upstreams_status() {
+        let chunks = vec![
+            Ok::<Vec<u8>, std::io::Error>(b"{\"error\":".to_vec()),
+            Err(std::io::Error::other("connection reset")),
+        ];
+        let body = reqwest::Body::wrap_stream(futures_util::stream::iter(chunks));
+        let response = error_body(
+            upstream(403, Some("application/json"), body),
+            StatusCode::FORBIDDEN,
+            "m",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let text = String::from_utf8(bytes_of(response).await).expect("utf-8");
+        assert!(
+            text.contains("Failed to read upstream error response"),
+            "{text}"
+        );
+        assert!(!text.contains("connection reset"), "{text}");
+    }
 }

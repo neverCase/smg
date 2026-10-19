@@ -1,81 +1,17 @@
 //! The gateway refuses to start on a priority-scheduler configuration file
-//! it cannot use: the configuration error names the field and the file, the
-//! process exits non-zero without a panic, and its port is never bound. The
-//! gateway runs as a process on purpose: the check belongs before the
-//! runtime and the listener exist.
+//! it cannot use, on a file with a key it does not know and on a default max
+//! class that is none of the four: the configuration error names the field
+//! and the value, the process exits non-zero without a panic, and its port
+//! is never bound. The gateway runs as a process on purpose: the check
+//! belongs before the runtime and the listener exist.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::allow_attributes)]
 
-use std::{
-    fs::{self, File},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
-    path::Path,
-    process::{Command, ExitStatus, Stdio},
-    thread,
-    time::{Duration, Instant},
-};
+#[path = "common/gateway_launch.rs"]
+mod gateway_launch;
 
-const IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
-/// How long the gateway gets to refuse; one that serves instead is killed as
-/// soon as its port answers, one that hangs at this deadline.
-const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
+use std::fs;
 
-/// What became of a gateway launched with a configuration it should refuse.
-struct Launch {
-    /// The exit status; `None` when the gateway had to be killed.
-    status: Option<ExitStatus>,
-    /// Whether its port accepted a connection at any point.
-    listened: bool,
-    /// Its stdout and stderr.
-    log: String,
-}
-
-/// Two distinct free ports: bound at once so the kernel hands out different
-/// ones, then released for the gateway to bind moments later.
-fn free_ports() -> [u16; 2] {
-    let listeners = [
-        TcpListener::bind((IP, 0)).expect("a free port"),
-        TcpListener::bind((IP, 0)).expect("a free port"),
-    ];
-    listeners.map(|listener| listener.local_addr().expect("the bound address").port())
-}
-
-/// Runs the gateway with `args` on fresh ports, its output in `log_path`,
-/// until it exits, binds its port or `EXIT_TIMEOUT` passes.
-fn launch(args: &[&str], log_path: &Path) -> Launch {
-    let [port, metrics_port] = free_ports();
-    let ip = IP.to_string();
-    let log = File::create(log_path).expect("log file");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_smg"))
-        .args(["--enable-igw", "--host", &ip, "--port", &port.to_string()])
-        .args(["--prometheus-host", &ip])
-        .args(["--prometheus-port", &metrics_port.to_string()])
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log.try_clone().expect("log handle")))
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn the gateway");
-    let deadline = Instant::now() + EXIT_TIMEOUT;
-    let address = SocketAddr::from((IP, port));
-    let mut listened = false;
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll the gateway") {
-            break Some(status);
-        }
-        listened = TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok();
-        if listened || Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-    Launch {
-        status,
-        listened,
-        log: fs::read_to_string(log_path).unwrap_or_default(),
-    }
-}
+use gateway_launch::{launch, Until, EXIT_TIMEOUT};
 
 /// A path that does not exist and a file that is not YAML: both are refused
 /// before anything listens, with the field and the file in the error.
@@ -93,12 +29,14 @@ fn an_unusable_priority_scheduler_config_refuses_to_start() {
                 "--priority-scheduler-config",
                 path,
             ],
+            Until::Bound,
             &dir.path().join(format!("{name}.log")),
         );
         let log = &launch.log;
         assert!(
-            !launch.listened,
-            "{name}: the gateway served with a scheduler config it cannot use\n{log}"
+            launch.bound.is_none(),
+            "{name}: the gateway bound port {:?} with a scheduler config it cannot use\n{log}",
+            launch.bound
         );
         let status = launch.status.unwrap_or_else(|| {
             panic!("{name}: the gateway neither exited nor listened within {EXIT_TIMEOUT:?}\n{log}")
@@ -116,4 +54,81 @@ fn an_unusable_priority_scheduler_config_refuses_to_start() {
             "{name}: the error names neither the field nor the file\n{log}"
         );
     }
+}
+
+/// A key the scheduler's YAML does not know and a default max class that is
+/// none of the four names are refused the same way: dropping the key, or
+/// mapping the name to `default` as the request header parser does, would
+/// hide an operator's typo behind a scheduler serving without the policy
+/// they wrote.
+#[test]
+fn an_unknown_key_or_default_max_class_name_refuses_to_start() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let unknown_key = dir.path().join("unknown-key.yaml");
+    fs::write(
+        &unknown_key,
+        "classes: {}\ntenant_policies: {}\nextra_field: 1\n",
+    )
+    .expect("write the file");
+    let unknown_key = unknown_key.to_str().expect("a UTF-8 path");
+    let cases = [
+        (
+            "unknown-key",
+            ["--priority-scheduler-config", unknown_key],
+            ["priority_scheduler_config", "extra_field"],
+        ),
+        (
+            "unknown-class",
+            ["--priority-scheduler-default-max-class", "gold"],
+            ["priority_scheduler_default_max_class", "gold"],
+        ),
+    ];
+    for (name, flags, named) in cases {
+        let mut args = vec!["--priority-scheduler-enabled"];
+        args.extend(flags);
+        let launch = launch(&args, Until::Bound, &dir.path().join(format!("{name}.log")));
+        let log = &launch.log;
+        assert!(
+            launch.bound.is_none(),
+            "{name}: the gateway bound port {:?} with a scheduler configuration it should refuse\n{log}",
+            launch.bound
+        );
+        let status = launch.status.unwrap_or_else(|| {
+            panic!("{name}: the gateway neither exited nor listened within {EXIT_TIMEOUT:?}\n{log}")
+        });
+        assert!(
+            !status.success(),
+            "{name}: the gateway exited successfully\n{log}"
+        );
+        assert!(
+            !log.contains("panicked"),
+            "{name}: a panic is not a configuration error\n{log}"
+        );
+        for word in named {
+            assert!(
+                log.contains(word),
+                "{name}: the error does not name `{word}`\n{log}"
+            );
+        }
+    }
+}
+
+/// A known class name is accepted in any case: the gateway comes up.
+#[test]
+fn a_known_default_max_class_name_in_any_case_starts() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let launch = launch(
+        &[
+            "--priority-scheduler-enabled",
+            "--priority-scheduler-default-max-class",
+            "Interactive",
+        ],
+        Until::Served,
+        &dir.path().join("known-class.log"),
+    );
+    assert!(
+        launch.served,
+        "the gateway did not serve its health route with a known class name (status {:?})\n{}",
+        launch.status, launch.log
+    );
 }

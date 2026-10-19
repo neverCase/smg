@@ -82,31 +82,22 @@ impl RgbSource for RgbFrameRef<'_> {
     }
 }
 
-/// Read a `usize` extra key strictly: absent falls back to `default`, but a
-/// present-yet-unusable value is a config error. `get_extra` swallows type
-/// mismatches into `None`, and a silent default here changes the alignment
-/// factor and token geometry — the gateway's placeholder count would then
-/// disagree with the serving engine with no trace. Integral JSON floats
-/// (`2.0`) are accepted for interop with float-serializing toolchains.
+/// A `usize` extra key under [`PreProcessorConfig::extra_usize`]'s rule (absent -> `default`,
+/// a present-yet-unusable value a config error, since a silent default would change the
+/// alignment factor and the token geometry).
 fn extra_usize(
     config: &PreProcessorConfig,
     key: &str,
     default: usize,
 ) -> Result<usize, TransformError> {
-    let Some(value) = config.extra.get(key) else {
-        return Ok(default);
-    };
-    if let Some(n) = value.as_u64() {
-        return Ok(n as usize);
-    }
-    if let Some(f) = value.as_f64() {
-        if f >= 0.0 && f.fract() == 0.0 && f <= u32::MAX as f64 {
-            return Ok(f as usize);
-        }
-    }
-    Err(shape(format!(
-        "GLM preprocessor key {key} must be a non-negative integer, got {value}"
-    )))
+    config
+        .extra_usize(key)
+        .map(|value| value.unwrap_or(default))
+        .map_err(|value| {
+            shape(format!(
+                "GLM preprocessor key {key} must be a non-negative integer, got {value}"
+            ))
+        })
 }
 
 /// `extra_usize`'s float sibling: absent -> default, wrong type -> error.
@@ -593,15 +584,18 @@ impl VisionPreProcessor for Glm53FlashProcessor {
         preprocess_video_frames(frames, config)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        let Ok(params) = Params::from_config(config, false) else {
-            return 0;
-        };
-        let Ok(geometry) = params.geometry(params.temporal, height as usize, width as usize) else {
-            return 0;
-        };
-        geometry.target.0 / params.patch * (geometry.target.1 / params.patch)
-            / (params.merge * params.merge)
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
+        let params = Params::from_config(config, false)?;
+        let geometry = params.geometry(params.temporal, height as usize, width as usize)?;
+        Ok(
+            geometry.target.0 / params.patch * (geometry.target.1 / params.patch)
+                / (params.merge * params.merge),
+        )
     }
 
     fn model_name(&self) -> &'static str {
@@ -632,6 +626,28 @@ mod tests {
             ModelSpecificValue::IntTensor { data, .. } => data.clone(),
             value => panic!("unexpected grid value: {value:?}"),
         }
+    }
+
+    #[test]
+    fn token_count_reports_an_unusable_expand_factor() {
+        // A present but unusable `patch_expand_factor` is the configuration
+        // error the parameters report, not a count of zero.
+        let mut config = PreProcessorConfig::default();
+        config
+            .extra
+            .insert("patch_expand_factor".to_string(), serde_json::json!("x"));
+        let processor = Glm53FlashProcessor::new();
+        let counted = processor
+            .calculate_num_tokens(448, 448, &config)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            counted,
+            Params::from_config(&config, false)
+                .err()
+                .unwrap()
+                .to_string()
+        );
     }
 
     /// The video processor config this family's checkpoint ships, the keys

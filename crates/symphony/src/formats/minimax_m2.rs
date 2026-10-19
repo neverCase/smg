@@ -1,16 +1,8 @@
 //! MiniMax M2: reasoning between `<think>` and `</think>`, the calls of one turn between
 //! `<minimax:tool_call>` and `</minimax:tool_call>`, each call between `<invoke name="…">` and
 //! `</invoke>` as `<parameter name="…">` tags whose key is the attribute and whose value the
-//! request's tools type, everything else content. The prompt opens the thought
-//! (`]~b]ai\n<think>\n`, whatever the request says: the template has no thinking switch), and a
-//! turn opens with `]~b]ai`, so the prompt's replay starts there. The template writes the thought
-//! as `<think>\n`,
-//! the reasoning, `\n</think>\n\n`, then the content, then `\n<minimax:tool_call>\n`, each invoke
-//! as `<invoke name="NAME">\n`, each parameter on its own line, `</invoke>\n`, and the block's
-//! close; the newlines around the thought and before the block are the model's to write and reach
-//! the reasoning and content streams (bellwether #17's question, as for Qwen3), the ones inside the
-//! block are its wrapping. Recorded as `minimax-m2` (MiniMaxAI/MiniMax-M2) and `minimax-m2.7`
-//! (MiniMaxAI/MiniMax-M2.7), whose templates write the same turn:
+//! request's tools type, everything else content. Recorded as `minimax-m2` (MiniMaxAI/MiniMax-M2)
+//! and `minimax-m2.7` (MiniMaxAI/MiniMax-M2.7), whose templates write the same turn:
 //!
 //! ```text
 //! The user asks about Paris.
@@ -27,9 +19,10 @@
 //! MiniMax M3 writes its arguments as an XML tree under its own markers ([`minimax_m3()`]);
 //! MiniCPM5 writes this syntax with its own tags and no block ([`minicpm5()`]).
 //!
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
+//!
 //! [`minimax_m3()`]: super::minimax_m3()
 //! [`minicpm5()`]: super::minicpm5()
-
 use crate::{
     format::{CallSyntax, Emits, Format},
     tagged::attributed,
@@ -69,10 +62,9 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, Text},
-        input::{EngineFinish, Input},
-        parser::Parser,
-        tagged::Declared,
+        event::{DropReason, Event, Text},
+        testing::{arguments_of, bytes, content, drive, reasoning},
+        Declared,
     };
 
     fn declared() -> Declared {
@@ -105,84 +97,7 @@ mod tests {
     );
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::new(minimax_m2(), declared());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        for piece in pieces {
-            parser
-                .feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: piece,
-                        spans: &[],
-                    },
-                    &mut out,
-                )
-                .expect("delta");
-        }
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn arguments_of(events: &[Event], call: u32) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
+        drive(&mut Engine::new(minimax_m2(), declared()), prompt, pieces)
     }
 
     fn dropped(text: &str) -> Event {
@@ -208,9 +123,9 @@ mod tests {
             ]
         );
         assert_eq!(reasoning(&events), "The user asks about Paris.\n");
-        // The newlines between the thought and the block are content; the block's own are
-        // wrapping.
-        assert_eq!(content(&events), "\n\n\n");
+        // The newlines between the thought and the block are the template's spacing, dropped
+        // when the block's opener came; the block's own are wrapping.
+        assert_eq!(content(&events), "");
         assert_eq!(
             events[5..8],
             [

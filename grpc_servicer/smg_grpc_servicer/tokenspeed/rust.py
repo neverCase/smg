@@ -29,35 +29,41 @@ import dataclasses
 import json
 import logging
 import multiprocessing
-import os
 import signal
 import threading
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Mapping
 from typing import Any
 
-from smg_grpc_servicer.hostport import host_port
+from smg_grpc_servicer.constrained_decoding import (
+    grammar_start_labels,
+    tokenspeed_constrained_decoding_start,
+)
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
-from smg_grpc_servicer.rust_lifecycle import (
+
+# The lifecycle's defaults and the switch's flag and choices, re-exported:
+# this launcher's own documented values.
+from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_DRAIN_SECS,
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
+    IMPLS,
+    SERVICER_IMPL_FLAG,
     EngineProcess,
     EngineProcessGroup,
     FaultLatch,
+    RustLauncher,
     SchedulerProcesses,
-    default_socket_dir,
+    apply_kv_events_default,
     ensure_spawn_start_method,
-    env_float,
-    free_port,
     on_fault_signal,
     resolve_tokenizer_dir,
-    supervise,
+    servicer_switch,
     wait_for_ready_reports,
 )
-from smg_grpc_servicer.structured_outputs import (
-    grammar_start_labels,
-    tokenspeed_structured_outputs_start,
+from smg_grpc_servicer.servicer_impl_flag import (
+    add_servicer_impl_argument as _add_servicer_impl_argument,
 )
+from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import running_window
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
@@ -72,37 +78,26 @@ STARTUP_CEILING_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS"
 # Set to 0/false/no/off to keep TokenSpeed's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_TOKENSPEED_SERVICER_KV_EVENTS"
-_OFF_VALUES = ("0", "false", "no", "off")
-# What a launcher without --kv-events-config gets under the Rust servicer:
-# the ZMQ publisher, with TokenSpeed's own defaults for the rest (the
-# endpoint, the topic).
-DEFAULT_KV_EVENTS_CONFIG = '{"enable_kv_cache_events": true, "publisher": "zmq"}'
-IMPLS = ("python", "rust")
-SERVICER_IMPL_FLAG = "--servicer-impl"
-# Where the implementation choice came from, for the startup log line.
-SOURCE_FLAG = "flag"
-SOURCE_ENV = "env"
-SOURCE_DEFAULT = "default"
+
+
+def default_kv_events_json(endpoint: str) -> str:
+    """What a launcher without --kv-events-config gets under the Rust servicer,
+    as TokenSpeed's server args carry it (JSON text): the ZMQ publisher at
+    ``endpoint``, with TokenSpeed's own defaults for the rest (the topic)."""
+    return json.dumps({"enable_kv_cache_events": True, "publisher": "zmq", "endpoint": endpoint})
 
 
 def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     """Add ``--servicer-impl`` to a launcher's parser that lacks it; returns
     whether it was added."""
-    actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
-    if SERVICER_IMPL_FLAG in actions:
-        return False
-    parser.add_argument(
-        SERVICER_IMPL_FLAG,
-        dest="servicer_impl",
-        choices=list(IMPLS),
-        default=None,
+    return _add_servicer_impl_argument(
+        parser,
         help=(
             "Which implementation serves the gRPC contract: the Python servicer (default) "
             "or the Rust one (smg.servicer.TokenSpeedGrpcServer, with the scheduler(s) "
             f"headless). Unset falls back to ${SERVICER_IMPL_ENV}."
         ),
     )
-    return True
 
 
 def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = None) -> str:
@@ -116,24 +111,10 @@ def servicer_impl_source(
     args: Any = None, environ: Mapping[str, str] | None = None
 ) -> tuple[str, str]:
     """:func:`resolve_servicer_impl`'s answer with where it came from:
-    ``flag``, ``env`` or ``default``.
-
-    A decision made with the launcher's flag in hand is written back to the
-    environment, so the scheduler processes this process starts and anything
-    that reads only the variable agree with it when ``--servicer-impl python``
-    overrides an exported ``rust``."""
-    source = os.environ if environ is None else environ
-    value = getattr(args, "servicer_impl", None) if args is not None else None
-    origin = SOURCE_FLAG
-    if not value:
-        value = source.get(SERVICER_IMPL_ENV)
-        origin = SOURCE_ENV if value else SOURCE_DEFAULT
-    value = str(value or "python").strip().lower()
-    if value not in IMPLS:
-        raise ValueError(f"{SERVICER_IMPL_ENV} must be one of {IMPLS}, got {value!r}")
-    if origin == SOURCE_FLAG and isinstance(source, MutableMapping):
-        source[SERVICER_IMPL_ENV] = value
-    return value, origin
+    ``flag``, ``env`` or ``default`` (the shared
+    :func:`~smg_grpc_servicer.rust_lifecycle.servicer_switch`, which writes a
+    flag decision back to the environment the scheduler processes inherit)."""
+    return servicer_switch(SERVICER_IMPL_ENV, args, environ)
 
 
 # ---------------------------------------------------------------------------
@@ -165,45 +146,76 @@ def _dtype_name(dtype: Any) -> str:
     return text.removeprefix("torch.")
 
 
+def _config_section(config: Any, name: str) -> Any:
+    """``config[name]`` or ``config.name``, ``None`` when absent."""
+    if isinstance(config, Mapping):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def mrope_positions(hf_config: Any) -> bool | None:
+    """Whether the language model's rotary positions are MRoPE, read off the
+    checkpoint's text rope config: ``rope_scaling`` / ``rope_parameters`` (on the
+    text config when the checkpoint nests one, and the top level) with an
+    ``mrope_section``, or a rope type named ``mrope``. A checkpoint whose rope
+    config is plain (``rope_type: default`` with no section) uses 1-D positions,
+    so its vision grid tensors only lay out the patches. ``None`` when the
+    config carries no rope section at all."""
+    if hf_config is None:
+        return None
+    # Both the nested text config and the top level are read: a config class
+    # may fill a plain rope default on one while the checkpoint declares its
+    # MRoPE section on the other, and either declaration means MRoPE.
+    sections = [hf_config]
+    text = _config_section(hf_config, "text_config")
+    if text is not None:
+        sections.insert(0, text)
+    found = False
+    for section in sections:
+        for key in ("rope_scaling", "rope_parameters"):
+            rope = _config_section(section, key)
+            if rope is None:
+                continue
+            found = True
+            if _config_section(rope, "mrope_section") is not None:
+                return True
+            kind = _config_section(rope, "rope_type") or _config_section(rope, "type")
+            if isinstance(kind, str) and "mrope" in kind:
+                return True
+    return False if found else None
+
+
 def model_facts(server_args: Any, model_config: Any | None = None) -> dict[str, Any]:
     """``TokenSpeedGrpcServer`` keyword arguments for ``GetModelInfo``: the
     Python servicer's ``GetModelInfo`` fields, computed up front."""
     from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer
 
     model_config = model_config if model_config is not None else _model_config(server_args)
-    hf_config = getattr(model_config, "hf_config", None)
-    eos = getattr(hf_config, "eos_token_id", None) if hf_config is not None else None
-    if isinstance(eos, int):
-        eos_token_ids = [eos]
-    elif isinstance(eos, list):
-        eos_token_ids = [int(value) for value in eos]
-    else:
-        eos_token_ids = []
+    view = EngineConfigView(server_args, model_config)
+    args, model = view.server_args, view.model
     supported_modalities = TokenSpeedSchedulerServicer._static_supported_modalities(
-        model_config, hf_config
+        model_config, model.hf_config
     )
-    dtype = _dtype_name(getattr(model_config, "dtype", None))
-    model_path = getattr(server_args, "model", None) or getattr(server_args, "model_path", "")
-    tokenizer_path = getattr(server_args, "tokenizer", None) or getattr(
-        server_args, "tokenizer_path", ""
-    )
+    dtype = _dtype_name(model.dtype)
     return {
-        "model_path": str(model_path),
-        "tokenizer_path": str(tokenizer_path or model_path),
-        "served_model_name": str(getattr(server_args, "served_model_name", None) or model_path),
-        "model_type": str((getattr(hf_config, "model_type", "") or "") if hf_config else ""),
-        "architectures": list((getattr(hf_config, "architectures", []) or []) if hf_config else []),
-        "max_context_length": int(getattr(model_config, "context_len", 0) or 0),
-        "vocab_size": int(getattr(model_config, "vocab_size", 0) or 0),
-        "eos_token_ids": eos_token_ids,
-        "pad_token_id": int((getattr(hf_config, "pad_token_id", 0) or 0) if hf_config else 0),
-        "bos_token_id": int((getattr(hf_config, "bos_token_id", 0) or 0) if hf_config else 0),
-        "default_sampling_params_json": str(
-            getattr(server_args, "preferred_sampling_params", None) or ""
-        ),
+        "model_path": args.model,
+        "tokenizer_path": args.tokenizer or args.model,
+        "served_model_name": str(args.served_model_name or args.model),
+        "model_type": model.model_type,
+        "architectures": model.architectures,
+        "max_context_length": model.context_len,
+        "vocab_size": model.vocab_size,
+        "eos_token_ids": model.eos_token_ids,
+        "pad_token_id": model.pad_token_id,
+        "bos_token_id": model.bos_token_id,
+        # The engine's declared constrained-decoding policy: off the server args,
+        # else the model config, as the Python servicer reads it.
+        "constrained_decoding": view.constrained_decoding,
+        "default_sampling_params_json": str(args.preferred_sampling_params or ""),
         "supports_vision": any(modality in (1, 3) for modality in supported_modalities),
         "supports_multimodal": bool(supported_modalities),
         "supported_modalities": [int(modality) for modality in supported_modalities],
+        "mrope_positions": mrope_positions(model.hf_config),
         "model_dtype": dtype,
         "multimodal_encoder_dtype": dtype,
     }
@@ -220,15 +232,15 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         args_dict = dataclasses.asdict(server_args)
     else:
         args_dict = dict(getattr(server_args, "__dict__", {}))
-    dp_size = getattr(getattr(getattr(server_args, "mapping", None), "attn", None), "dp_size", None)
-    if isinstance(dp_size, int) and dp_size > 1:
+    dp_size = EngineConfigView(server_args).server_args.attention_dp_size
+    if dp_size is not None and dp_size > 1:
         args_dict["dp_size"] = dp_size
     pairing_protocol = pairing_protocol_from_env()
     if pairing_protocol:
         args_dict["pairing_protocol"] = pairing_protocol
     # The engine's reasoning parser and where it starts a grammar on a thinking
     # prompt, as the Python servicer adds them.
-    args_dict.update(grammar_start_labels(server_args, tokenspeed_structured_outputs_start()))
+    args_dict.update(grammar_start_labels(server_args, tokenspeed_constrained_decoding_start()))
     kv_events = resolve_kv_events_config(server_args)
     try:
         from tokenspeed.version import __version__ as tokenspeed_version
@@ -241,7 +253,7 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         "scheduler_info_json": json.dumps({"shm_namespace_id": _shm_namespace_id()}),
         "tokenspeed_version": str(tokenspeed_version),
         "max_running_requests": running_window(server_args),
-        "data_parallel_size": int(dp_size) if isinstance(dp_size, int) and dp_size > 0 else 1,
+        "data_parallel_size": dp_size or 1,
         "kv_events_endpoint": kv_events.endpoint if kv_events else "",
         "kv_events_replay_endpoint": kv_events.replay_endpoint if kv_events else "",
         "kv_events_topic": kv_events.topic if kv_events else "",
@@ -252,33 +264,19 @@ def default_kv_events_config(
     server_args: Any, environ: Mapping[str, str] | None = None
 ) -> str | None:
     """Turn TokenSpeed's KV event publisher on when the launcher was given no
-    ``--kv-events-config``; returns the configuration applied, or None.
-
-    Cache-aware routing lives on the events ``SubscribeKvEvents`` relays, and
-    TokenSpeed publishes none unless started with ``--kv-events-config
-    '{"enable_kv_cache_events": true, "publisher": "zmq"}'``: a launcher
-    without it got a router that routed blind, with one WARN per worker as
-    the only trace. Under the Rust servicer the server args that lack the
-    option get exactly that configuration before the facts and the headless
-    scheduler are built from them, so publisher and relay agree. An explicit
-    ``--kv-events-config`` is kept as given, off included;
-    ``SMG_TOKENSPEED_SERVICER_KV_EVENTS=0`` keeps the publisher off without
-    one.
-    """
-    source = os.environ if environ is None else environ
-    if getattr(server_args, "kv_events_config", None):
-        return None
-    if str(source.get(KV_EVENTS_ENV, "")).strip().lower() in _OFF_VALUES:
-        return None
-    try:
-        server_args.kv_events_config = DEFAULT_KV_EVENTS_CONFIG
-    except AttributeError:  # frozen server args: left as they are
-        logger.warning(
-            "kv_events_config cannot be set on %s; KV event publishing stays as configured",
-            type(server_args).__name__,
-        )
-        return None
-    return DEFAULT_KV_EVENTS_CONFIG
+    ``--kv-events-config``; returns the configuration applied, or None: the
+    shared rule (``rust_lifecycle.apply_kv_events_default``) with
+    :func:`default_kv_events_json` at a free port of this host, one per
+    attention-DP rank (each publishes at the port after its predecessor's),
+    applied to the server args before the facts and the schedulers are built
+    from them."""
+    return apply_kv_events_default(
+        server_args,
+        default_kv_events_json,
+        env_name=KV_EVENTS_ENV,
+        environ=environ,
+        ranks=EngineConfigView(server_args).server_args.attention_dp_size or 1,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -430,8 +428,8 @@ def launch_scheduler_ranks(server_args: Any) -> EngineProcessGroup | EngineProce
 
 def tokenizer_dir_for(server_args: Any) -> str | None:
     """The local tokenizer directory for the served model, or ``None``."""
-    tokenizer = getattr(server_args, "tokenizer", None) or getattr(server_args, "model", "")
-    return resolve_tokenizer_dir(str(tokenizer), getattr(server_args, "revision", None))
+    args = EngineConfigView(server_args).server_args
+    return resolve_tokenizer_dir(args.tokenizer or args.model, args.revision)
 
 
 # ---------------------------------------------------------------------------
@@ -439,68 +437,39 @@ def tokenizer_dir_for(server_args: Any) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+class TokenSpeedLauncher(RustLauncher):
+    """The TokenSpeed launcher's lifecycle: the facts come from TokenSpeed's
+    model config and server args, and the scheduler rank processes start
+    from this process on the headless server args."""
+
+    engine = "TokenSpeed"
+    started = "scheduler"
+    counted = "DP rank"
+    server_class = "TokenSpeedGrpcServer"
+    ipc_prefix = "tokenspeed-servicer"
+    handshake_port_env = HANDSHAKE_PORT_ENV
+    drain_secs_env = DRAIN_SECS_ENV
+    startup_timeout_secs_env = STARTUP_TIMEOUT_SECS_ENV
+    startup_ceiling_secs_env = STARTUP_CEILING_SECS_ENV
+    kv_events_env = KV_EVENTS_ENV
+    without_tokenizer = "string stops will be refused"
+
+    def kv_events_default(self, args: Any) -> str | None:
+        return default_kv_events_config(args)
+
+    def facts(self, args: Any) -> dict[str, Any]:
+        return {**model_facts(args), **server_facts(args)}
+
+    def tokenizer_dir(self, args: Any) -> str | None:
+        return tokenizer_dir_for(args)
+
+    def launch(self, args: Any, handshake_port: int, facts: Mapping[str, Any]) -> Any:
+        return launch_scheduler_ranks(headless_server_args(args, handshake_port=handshake_port))
+
+
 async def serve_rust(server_args: Any) -> int:
     """Serve this process's gRPC contract from Rust: start the Rust server,
     start the scheduler ranks against its handshake, and supervise both
-    until a signal or a failure. Returns the process exit code."""
-    from smg.servicer import TokenSpeedGrpcServer, init_servicer_tracing
-
-    init_servicer_tracing(os.environ.get("RUST_LOG") and None)
-    if default_kv_events_config(server_args) is not None:
-        logger.info(
-            "KV event publishing enabled: no --kv-events-config was given, so TokenSpeed's ZMQ "
-            "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
-            "--kv-events-config to configure it, or set %s=0 to leave it off",
-            KV_EVENTS_ENV,
-        )
-    handshake_port = int(os.environ.get(HANDSHAKE_PORT_ENV) or 0) or free_port()
-    socket_dir = default_socket_dir()
-    os.makedirs(socket_dir, mode=0o700, exist_ok=True)
-    host = getattr(server_args, "host", None) or "0.0.0.0"
-    port = int(getattr(server_args, "port", 0) or 0)
-    facts = {**model_facts(server_args), **server_facts(server_args)}
-    if facts.get("kv_events_endpoint"):
-        logger.info(
-            "SubscribeKvEvents relays TokenSpeed's KV events from %s", facts["kv_events_endpoint"]
-        )
-    else:
-        logger.warning(
-            "SubscribeKvEvents is off (KV cache events disabled, or a publisher other than "
-            "zmq): a cache-aware router sees nothing of this engine's cache"
-        )
-    engine_count = facts["data_parallel_size"]
-    tokenizer_dir = tokenizer_dir_for(server_args)
-    if tokenizer_dir is None:
-        logger.warning(
-            "No local tokenizer directory for %s; string stops will be refused",
-            getattr(server_args, "model", ""),
-        )
-    startup_timeout_secs = env_float(STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS)
-    startup_ceiling_secs = env_float(STARTUP_CEILING_SECS_ENV, DEFAULT_STARTUP_CEILING_SECS)
-    server = TokenSpeedGrpcServer(
-        bind_address=host_port(host, port),
-        ipc_base_url=f"ipc://{socket_dir}/tokenspeed-servicer-{os.getpid()}",
-        handshake_address=f"tcp://127.0.0.1:{handshake_port}",
-        engine_count=engine_count,
-        tokenizer_dir=tokenizer_dir,
-        engine_startup_timeout_secs=startup_timeout_secs,
-        engine_startup_ceiling_secs=startup_ceiling_secs,
-        **facts,
-    )
-    logger.info(
-        "Rust TokenSpeed servicer listening on %s; scheduler ranks dial handshake port %d",
-        server.address,
-        handshake_port,
-    )
-    logger.info(
-        "Scheduler startup bounds: %.0fs without a sign of life (%s), ceiling %s (%s); "
-        "the handshake waits while the scheduler process is alive",
-        startup_timeout_secs,
-        STARTUP_TIMEOUT_SECS_ENV,
-        f"{startup_ceiling_secs:.0f}s" if startup_ceiling_secs else "none",
-        STARTUP_CEILING_SECS_ENV,
-    )
-    engine = launch_scheduler_ranks(
-        headless_server_args(server_args, handshake_port=handshake_port)
-    )
-    return await supervise(server, engine, drain_secs=env_float(DRAIN_SECS_ENV, DEFAULT_DRAIN_SECS))
+    until a signal or a failure (:class:`TokenSpeedLauncher`). Returns the
+    process exit code."""
+    return await TokenSpeedLauncher().serve(server_args)

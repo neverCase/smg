@@ -32,15 +32,14 @@ use openai_protocol::responses::{ResponsesRequest, ResponsesResponse};
 use tracing::debug;
 use uuid::Uuid;
 
-use super::{
-    common::{load_conversation_history, ResponsesCallContext},
-    conversions, non_streaming, streaming,
-};
+use super::{common::ResponsesCallContext, conversions, non_streaming, streaming};
 use crate::{
     middleware::TenantRequestMeta,
     routers::{
         error,
-        grpc::common::responses::{ensure_mcp_connection, BackgroundStream, ResponsesContext},
+        grpc::common::responses::{
+            ensure_mcp_connection, load_history, BackgroundStream, ResponsesContext,
+        },
     },
 };
 
@@ -141,11 +140,13 @@ async fn route_responses_streaming(
     params: ResponsesCallContext,
     background: Option<BackgroundStream>,
 ) -> Response {
-    // 1. Load conversation history
-    let modified_request = match load_conversation_history(ctx, &request).await {
-        Ok(req) => req,
-        Err(response) => return response, // Already a Response with proper status code
-    };
+    // 1. Load conversation history, as the caller's tenant may see it
+    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+    let modified_request =
+        match load_history(ctx.history_stores(), &request, tenant.as_deref()).await {
+            Ok(req) => req,
+            Err(response) => return response, // Already a Response with proper status code
+        };
 
     // 2. Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = match ensure_mcp_connection(

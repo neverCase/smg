@@ -42,6 +42,24 @@ impl Text {
     }
 }
 
+/// The runs of `text` in order, each all whitespace or none of it as `char::is_whitespace` says,
+/// with whether it is whitespace. Every run ends on a character boundary, and the runs join back
+/// into `text`. The parsers read the text between a format's structure by it: whitespace is the
+/// template's wrapping, anything else is reported.
+pub(crate) fn runs(text: &str) -> impl Iterator<Item = (&str, bool)> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        let space = rest.chars().next()?.is_whitespace();
+        let length = rest
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace() != space)
+            .map_or(rest.len(), |(at, _)| at);
+        let (run, after) = rest.split_at(length);
+        rest = after;
+        Some((run, space))
+    })
+}
+
 /// Why text was dropped rather than shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,20 +70,141 @@ pub enum DropReason {
     Wrapper,
     /// Whitespace the format treats as structural.
     Whitespace,
+    /// A call after the first, where the request takes one call only ([`first_call_only`]).
+    LaterCall,
+    /// Bytes of a call block the call syntax could not read as the call, for a syntax whose block
+    /// is never prose (the keyed syntax: the block's markers and its four tags are the format's
+    /// own tokens, and what stands between them where the syntax has no place for text is the
+    /// model's failed call). A `Malformed` event of no bytes with the reason stands right before
+    /// them, or, for a call the end of the stream or a marker cut, right after them and before
+    /// its `ToolCallEnd` (`tagged::end_cut_call`), so the failure is counted; the bytes
+    /// themselves never reach a client as content.
+    MalformedCall,
 }
 
-/// Why a region could not be parsed. Its text is returned, never lost.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Why a region could not be parsed. Its text is returned, never lost: with the event, or, for a
+/// call syntax whose block is never prose, as `Dropped { MalformedCall }` beside an event of no
+/// bytes, right after it, or right before it and the call's end where a cut ended the call
+/// ([`DropReason::MalformedCall`]).
+///
+/// The set is closed: every reason a parser gives is one of these, so a reader can count them
+/// and a client can match on them; a new reason is a new variant. [`Display`](std::fmt::Display)
+/// writes the sentence a log or a report shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MalformedReason {
     /// The stream ended inside a region that never closed.
     UnterminatedRegion,
-    /// Tool-call arguments did not parse under the format's argument syntax.
+    /// Tool-call arguments did not parse under the format's argument syntax. From a JSON syntax
+    /// the event carries no bytes and stands where the arguments stopped being JSON; the call's
+    /// fragments carry every byte the model wrote.
     InvalidArguments,
     /// A tool call named a function the request did not declare.
     UnknownTool,
-    /// Anything else, described.
-    Other(String),
+    /// Text where the call's syntax has only tags: between a tag and the next, outside a value.
+    TextBetweenTags,
+    /// A tag of the syntax where it has no place: a value's close with no value open, a
+    /// parameter tag before the function's.
+    TagOutOfPlace,
+    /// A tag another tag, or the call's end, cut short before it closed.
+    TagCutShort,
+    /// Text between a tag's name and its close, where the syntax has none.
+    TagTail,
+    /// A tag with no name between its opener and its close.
+    EmptyName,
+    /// A call (an object, a block, an invoke) that names no function.
+    CallWithoutName,
+    /// A call region with no function tag in it.
+    CallWithoutFunctionTag,
+    /// A second function tag inside a call that has one.
+    SecondFunctionTag,
+    /// A call that closed before its name's tag closed.
+    ClosedBeforeTheName,
+    /// Text where the call's name should be: a name holds no whitespace, quote or bracket.
+    TextWhereTheNameShouldBe,
+    /// Text where the syntax has a call or nothing: between a block's or a list's calls, or
+    /// where a call should begin.
+    TextBetweenCalls,
+    /// Text where an argument should begin.
+    TextWhereAnArgumentShouldBegin,
+    /// Text where the list of calls should be.
+    TextInPlaceOfTheList,
+    /// Text after a call's arguments and before the terminal that closes the call.
+    TextAfterTheArguments,
+    /// Text after the list of calls closed.
+    TextAfterTheList,
+    /// A call that names a function and writes no arguments.
+    NameWithoutArguments,
+    /// A name with no call after it: a message that names a tool and writes none, a Python
+    /// name without its parenthesis.
+    NameWithoutACall,
+    /// A parameter whose key the call already wrote.
+    KeyWrittenTwice,
+    /// A key with no value after it.
+    KeyWithoutAValue,
+    /// A key the call's end cut short.
+    KeyCutShort,
+    /// A value the call's end cut short.
+    ValueCutShort,
+    /// An argument the call's end cut short.
+    ArgumentCutShort,
+    /// A key with no text.
+    EmptyKey,
+    /// A tool-call block that closed without a complete call in it.
+    BlockWithoutACompleteCall,
+    /// Arguments with no forced function to name them.
+    NoForcedFunction,
+    /// A marker of the table in a content state no row leads out of on it, kept as that state's
+    /// text where the model put it (an answer's opener written again inside the answer, a close
+    /// with nothing open). The event carries no bytes and stands before the marker's text: a frame
+    /// the table did not read is counted without a byte moving.
+    MarkerOutOfPlace,
+}
+
+impl MalformedReason {
+    /// The sentence a log or a report shows for the reason.
+    pub fn sentence(self) -> &'static str {
+        match self {
+            Self::UnterminatedRegion => "the stream ended inside a region that never closed",
+            Self::InvalidArguments => "arguments that did not parse under the call's syntax",
+            Self::UnknownTool => "a call to a function the request did not declare",
+            Self::TextBetweenTags => "text between a call's tags",
+            Self::TagOutOfPlace => "a tag where the call's syntax has none",
+            Self::TagCutShort => "a tag that another tag or the call's end cut short",
+            Self::TagTail => "text after a tag's name",
+            Self::EmptyName => "a tag without a name",
+            Self::CallWithoutName => "a call without a name",
+            Self::CallWithoutFunctionTag => "a tool call without a function tag",
+            Self::SecondFunctionTag => "a second function tag inside a call",
+            Self::ClosedBeforeTheName => "a call that closed before its name closed",
+            Self::TextWhereTheNameShouldBe => "text where the call's name should be",
+            Self::TextBetweenCalls => "text between calls",
+            Self::TextWhereAnArgumentShouldBegin => "text where an argument should begin",
+            Self::TextInPlaceOfTheList => "text where the list of calls should be",
+            Self::TextAfterTheArguments => "text after a call's arguments",
+            Self::TextAfterTheList => "text after the list's end",
+            Self::NameWithoutArguments => "a call that names a tool and writes no arguments",
+            Self::NameWithoutACall => "a name without a call",
+            Self::KeyWrittenTwice => "a parameter whose key the call already wrote",
+            Self::KeyWithoutAValue => "a key without a value",
+            Self::KeyCutShort => "a key the call's end cut short",
+            Self::ValueCutShort => "a value the call's end cut short",
+            Self::ArgumentCutShort => "an argument the call's end cut short",
+            Self::EmptyKey => "a key with no text",
+            Self::BlockWithoutACompleteCall => {
+                "a tool-call block that closed without a complete call"
+            }
+            Self::NoForcedFunction => "arguments with no forced function to name them",
+            Self::MarkerOutOfPlace => "a marker of the table where no row leads, kept as text",
+        }
+    }
+}
+
+impl std::fmt::Display for MalformedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.sentence())
+    }
 }
 
 /// The finish reason the parser reports after refining the engine's.
@@ -107,8 +246,12 @@ pub enum Event {
         /// The output bytes this event accounts for: the opening marker and the name as written.
         source: Text,
     },
-    /// A fragment of the call's arguments. Concatenated fragments for one index are always a
-    /// valid JSON prefix and equal the final arguments when the call ends.
+    /// A fragment of the call's arguments. Concatenated fragments for one index are a prefix of
+    /// JSON a strict reader accepts (a number out of the reader's range excepted: the prefix judge
+    /// reads a number's grammar, not its size) until a `Malformed { InvalidArguments }` event of
+    /// no bytes says where they stopped being one, from which the fragments are the model's bytes
+    /// as written (`json` equal to `source`), and equal the final arguments when the call ends: a
+    /// call whose arguments are no whole JSON says so by a `Malformed` event before its end.
     ToolCallArguments {
         /// Which call the fragment belongs to.
         index: u32,
@@ -241,9 +384,121 @@ impl IntoIterator for Events {
     }
 }
 
+/// The engine tokens the reasoning text among `events` cost.
+pub fn reasoning_text_tokens(events: &[Event]) -> u32 {
+    events
+        .iter()
+        .map(|event| match event {
+            Event::Reasoning(text) => text.tokens.unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// One call only (`parallel_tool_calls: false`, `disable_parallel_tool_use`): the events of
+/// every call after the first become its dropped text, so every byte of the output still lands
+/// in one event and the content ranges after the call hold
+/// ([`content_spans`](crate::adapt::chat::content_spans)); the finish counts at most one. A
+/// table's grammar limits a forced call; this limits a free one.
+pub fn first_call_only(events: &mut [Event]) {
+    for event in events {
+        match event {
+            Event::ToolCallStart { index, source, .. }
+            | Event::ToolCallArguments { index, source, .. }
+            | Event::ToolCallEnd { index, source, .. }
+                if *index > 0 =>
+            {
+                *event = Event::Dropped {
+                    text: std::mem::take(source),
+                    why: DropReason::LaterCall,
+                };
+            }
+            Event::Finish { tool_calls, .. } => *tool_calls = (*tool_calls).min(1),
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_text_tokens_sum_the_reasoning_texts_alone() {
+        let events = vec![
+            Event::Content(Text::new("a", 3)),
+            Event::Reasoning(Text::new("b", 2)),
+            Event::Reasoning(Text::uncounted("c")),
+            Event::Reasoning(Text::new("d", 5)),
+        ];
+        assert_eq!(reasoning_text_tokens(&events), 7);
+        assert_eq!(reasoning_text_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn first_call_only_keeps_the_first_call_and_caps_the_finish() {
+        let call = |index: u32| {
+            [
+                Event::ToolCallStart {
+                    index,
+                    id: format!("call_{index}"),
+                    name: "f".to_string(),
+                    source: Text::uncounted("<"),
+                },
+                Event::ToolCallArguments {
+                    index,
+                    json: "{}".to_string(),
+                    source: Text::uncounted("{}"),
+                },
+                Event::ToolCallEnd {
+                    index,
+                    source: Text::uncounted(">"),
+                },
+            ]
+        };
+        let mut events = vec![Event::Content(Text::uncounted("x"))];
+        events.extend(call(0));
+        events.extend(call(1));
+        events.push(Event::Finish {
+            reason: FinishReason::ToolCalls,
+            tool_calls: 2,
+            reasoning_tokens: 0,
+        });
+
+        first_call_only(&mut events);
+
+        let indices: Vec<u32> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallStart { index, .. }
+                | Event::ToolCallArguments { index, .. }
+                | Event::ToolCallEnd { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(indices, [0, 0, 0]);
+        assert!(matches!(events.first(), Some(Event::Content(_))));
+        let dropped: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::LaterCall,
+                } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dropped,
+            ["<", "{}", ">"],
+            "the second call's bytes stay, in place"
+        );
+        assert_eq!(events.len(), 8);
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+    }
 
     #[test]
     fn adjacent_content_merges_and_counts_tokens() {
@@ -356,5 +611,63 @@ mod tests {
         let other = serde_json::to_string(&FinishReason::Other("content_filter".into()))
             .expect("serializes");
         assert_eq!(other, r#"{"other":"content_filter"}"#);
+        // A malformed region's reason is the variant's name on the wire, and a sentence in prose.
+        let malformed = serde_json::to_string(&Event::Malformed {
+            text: Text::uncounted("<parameter"),
+            why: MalformedReason::TextBetweenTags,
+        })
+        .expect("serializes");
+        assert_eq!(
+            malformed,
+            r#"{"kind":"malformed","text":{"text":"<parameter","tokens":null},"why":"text_between_tags"}"#
+        );
+        let back: Event = serde_json::from_str(&malformed).expect("deserializes");
+        assert!(matches!(
+            back,
+            Event::Malformed {
+                why: MalformedReason::TextBetweenTags,
+                ..
+            }
+        ));
+        assert_eq!(
+            MalformedReason::TextBetweenTags.to_string(),
+            "text between a call's tags"
+        );
+        assert_eq!(
+            MalformedReason::BlockWithoutACompleteCall.sentence(),
+            "a tool-call block that closed without a complete call"
+        );
+    }
+
+    #[test]
+    fn runs_alternate_whitespace_and_the_rest_on_character_boundaries_and_join_back() {
+        assert_eq!(runs("").count(), 0);
+        assert_eq!(runs(" \n\t").collect::<Vec<_>>(), vec![(" \n\t", true)]);
+        assert_eq!(runs("ab").collect::<Vec<_>>(), vec![("ab", false)]);
+        assert_eq!(
+            runs(" a  bc\n").collect::<Vec<_>>(),
+            vec![
+                (" ", true),
+                ("a", false),
+                ("  ", true),
+                ("bc", false),
+                ("\n", true)
+            ]
+        );
+        // A no-break space and an ideographic space are whitespace; the letters around them are
+        // two, three and four bytes long.
+        assert_eq!(
+            runs("\u{e9}\u{a0}\u{65e5}\u{672c}\u{3000}\u{1f327}").collect::<Vec<_>>(),
+            vec![
+                ("\u{e9}", false),
+                ("\u{a0}", true),
+                ("\u{65e5}\u{672c}", false),
+                ("\u{3000}", true),
+                ("\u{1f327}", false)
+            ]
+        );
+        for text in ["", " ", "a", " a b ", "\u{e9}\u{a0}\u{65e5} \u{1f327}"] {
+            assert_eq!(runs(text).map(|(run, _)| run).collect::<String>(), text);
+        }
     }
 }

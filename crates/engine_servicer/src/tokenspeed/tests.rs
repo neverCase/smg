@@ -24,6 +24,7 @@ use engine_zmq_client::{
     },
     EngineId,
 };
+use futures::StreamExt;
 use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
 use prost_types::value::Kind;
 use smg_grpc_client::{
@@ -36,7 +37,11 @@ use tonic_health::pb::{
 };
 
 use super::*;
-use crate::{kv_events, testing::Bounded, ServicerError};
+use crate::{
+    kv_events,
+    testing::{servicer_config, Bounded},
+    ServicerError,
+};
 
 fn model_info() -> TokenSpeedModelInfo {
     TokenSpeedModelInfo {
@@ -52,7 +57,7 @@ fn model_info() -> TokenSpeedModelInfo {
         bos_token_id: 1,
         default_sampling_params_json: "{\"temperature\":0.7}".to_string(),
         server_args_json:
-            r#"{"model":"org/model","max_num_seqs":64,"dp_size":2,"pairing_protocol":"p1","engine_reasoning_parser":"kimi_k25","structured_outputs_start":"first_token"}"#
+            r#"{"model":"org/model","max_num_seqs":64,"dp_size":2,"pairing_protocol":"p1","engine_reasoning_parser":"kimi_k25","constrained_decoding_start":"first_token"}"#
                 .to_string(),
         scheduler_info_json: r#"{"shm_namespace_id":"boot:1"}"#.to_string(),
         tokenspeed_version: "0.1.0.post20261003".to_string(),
@@ -68,14 +73,8 @@ fn config(
     model: TokenSpeedModelInfo,
 ) -> TokenSpeedServicerConfig {
     TokenSpeedServicerConfig {
-        bind_address: "127.0.0.1:0".to_string(),
-        ipc_base_url: format!("ipc://{}", dir.join("engine").display()),
-        handshake_address: handshake.to_string(),
-        engine_count: 1,
-        tokenizer_dir: None,
+        servicer: servicer_config(dir, handshake),
         model,
-        engine_startup_timeout: Duration::from_secs(10),
-        engine_startup_ceiling: None,
     }
 }
 
@@ -271,11 +270,9 @@ async fn a_slow_scheduler_stays_linked_while_the_launcher_reports_it_alive() {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let silence = Duration::from_millis(300);
-    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
-        engine_startup_timeout: silence,
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = silence;
+    let server = TokenSpeedServicerServer::start(config).unwrap();
     // The scheduler dials in at once, then "loads" for four silences.
     let loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
@@ -311,11 +308,9 @@ async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound()
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let silence = Duration::from_millis(300);
-    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
-        engine_startup_timeout: silence,
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = silence;
+    let server = TokenSpeedServicerServer::start(config).unwrap();
     let _loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
@@ -346,12 +341,10 @@ async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive()
     let handshake = handshake_address(dir.path());
     let silence = Duration::from_millis(300);
     let ceiling = Duration::from_millis(900);
-    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
-        engine_startup_timeout: silence,
-        engine_startup_ceiling: Some(ceiling),
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = silence;
+    config.servicer.engine_startup_ceiling = Some(ceiling);
+    let server = TokenSpeedServicerServer::start(config).unwrap();
     let started = Instant::now();
     let _loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
@@ -376,48 +369,34 @@ async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive()
 fn config_is_validated_before_binding() {
     let dir = tempfile::tempdir().unwrap();
     let good = config(dir.path(), "tcp://127.0.0.1:1", model_info());
+    let with = |edit: fn(&mut ServicerConfig)| {
+        let mut config = good.clone();
+        edit(&mut config.servicer);
+        config
+    };
     for (name, bad) in [
         (
             "bind",
-            TokenSpeedServicerConfig {
-                bind_address: "nope".into(),
-                ..good.clone()
-            },
+            with(|servicer| servicer.bind_address = "nope".into()),
         ),
         (
             "ipc",
-            TokenSpeedServicerConfig {
-                ipc_base_url: "tcp://x".into(),
-                ..good.clone()
-            },
+            with(|servicer| servicer.ipc_base_url = "tcp://x".into()),
         ),
         (
             "handshake",
-            TokenSpeedServicerConfig {
-                handshake_address: "udp://x".into(),
-                ..good.clone()
-            },
+            with(|servicer| servicer.handshake_address = "udp://x".into()),
         ),
-        (
-            "engines",
-            TokenSpeedServicerConfig {
-                engine_count: 0,
-                ..good.clone()
-            },
-        ),
+        ("engines", with(|servicer| servicer.engine_count = 0)),
         (
             "timeout",
-            TokenSpeedServicerConfig {
-                engine_startup_timeout: Duration::ZERO,
-                ..good.clone()
-            },
+            with(|servicer| servicer.engine_startup_timeout = Duration::ZERO),
         ),
         (
             "ceiling",
-            TokenSpeedServicerConfig {
-                engine_startup_ceiling: Some(Duration::ZERO),
-                ..good.clone()
-            },
+            with(|servicer| {
+                servicer.engine_startup_ceiling = Some(Duration::ZERO);
+            }),
         ),
         (
             "model",
@@ -428,10 +407,7 @@ fn config_is_validated_before_binding() {
         ),
         (
             "startup timeout",
-            TokenSpeedServicerConfig {
-                engine_startup_timeout: Duration::ZERO,
-                ..good.clone()
-            },
+            with(|servicer| servicer.engine_startup_timeout = Duration::ZERO),
         ),
     ] {
         assert!(
@@ -672,6 +648,10 @@ async fn string_stops_without_a_tokenizer_are_refused() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// `Abort` ends the stream with an `abort` Complete and reaches the
+/// scheduler. The caller's own abort stays a completion; only a shutdown
+/// under an open request is a status
+/// (`a_shutdown_ends_an_open_stream_with_unavailable_not_an_abort_completion`).
 #[tokio::test]
 async fn abort_rpc_cancels_an_in_flight_stream() {
     let mut h = harness(model_info(), None).await;
@@ -847,6 +827,29 @@ async fn requests_without_token_ids_are_refused() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The launcher's constrained-decoding policy (the engine's declaration that
+/// it takes a grammar on every turn) reaches `GetServerInfo` as a field of its
+/// own, for the Router's `constrained_decoding` label.
+#[tokio::test]
+async fn server_info_reports_the_engines_constrained_decoding_policy() {
+    let mut h = harness(
+        TokenSpeedModelInfo {
+            constrained_decoding: "always".to_string(),
+            ..model_info()
+        },
+        None,
+    )
+    .await;
+    let info = h
+        .client
+        .get_server_info(ts::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.constrained_decoding, "always");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// The info RPCs report the launcher's facts, with the handshake's capacity
 /// figures under `scheduler_info`, and the loads the scheduler piggybacks on
 /// its output (zero-filled per rank before any step).
@@ -874,6 +877,9 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
         .await
         .unwrap()
         .into_inner();
+    // A launcher that reports no constrained-decoding policy leaves the field
+    // at its default; the Router then sets no `constrained_decoding` label.
+    assert_eq!(info.constrained_decoding, "");
     let server_args = info.server_args.expect("server_args");
     assert_eq!(
         server_args.fields["dp_size"].kind,
@@ -891,7 +897,7 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
         Some(Kind::StringValue("kimi_k25".to_string()))
     );
     assert_eq!(
-        server_args.fields["structured_outputs_start"].kind,
+        server_args.fields["constrained_decoding_start"].kind,
         Some(Kind::StringValue("first_token".to_string()))
     );
     let scheduler_info = info.scheduler_info.expect("scheduler_info");
@@ -1223,11 +1229,9 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
 async fn a_scheduler_that_never_dials_in_fails_the_link_at_the_startup_bound() {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
-    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
-        engine_startup_timeout: Duration::from_millis(300),
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = Duration::from_millis(300);
+    let server = TokenSpeedServicerServer::start(config).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let error = loop {
         if let Some(error) = server.last_error().unwrap() {
@@ -1245,4 +1249,192 @@ async fn a_scheduler_that_never_dials_in_fails_the_link_at_the_startup_bound() {
 
     server.stop(Duration::from_secs(5)).unwrap();
     assert_handshake_released(&handshake).await;
+}
+
+/// A shutdown with a stream still open is the engine side going away under
+/// the request, not an abort the caller asked for: the stream ends with
+/// `UNAVAILABLE` (the status the Router counts and logs as the worker's
+/// failure), never with a `Complete` whose finish reason is `abort`.
+#[tokio::test]
+async fn a_shutdown_ends_an_open_stream_with_unavailable_not_an_abort_completion() {
+    let mut h = harness(model_info(), None).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r8", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r8", vec![10], 1, None, None)).await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![10]
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    let status = stream
+        .message()
+        .bounded()
+        .await
+        .expect_err("a shutdown ends the stream with a status, not a completion");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert!(
+        status.message().contains("shutting down"),
+        "{}",
+        status.message()
+    );
+    assert!(!h.server.running());
+}
+
+/// A request the engine finished on the tick before the shutdown keeps its
+/// completion: the finish tick's chunk went out and its `Complete` was
+/// parked for the next poll when `stop()` landed, so the stream ends with
+/// that `Complete` and no status (nothing was cut), never with `UNAVAILABLE`.
+#[tokio::test]
+async fn a_shutdown_keeps_the_completion_of_a_choice_the_engine_had_finished() {
+    let mut h = harness(model_info(), None).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r11", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r11", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![10]
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    let done = complete(
+        stream
+            .message()
+            .bounded()
+            .await
+            .expect("the completion the engine had already produced, not a status")
+            .expect("a completion, not the end of the stream"),
+    );
+    assert_eq!(done.finish_reason, "length");
+    assert_eq!(done.output_ids, vec![10]);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert!(!h.server.running());
+}
+
+/// The engine's own `Complete` went out and the shutdown lands before the
+/// poll that would have ended the stream (the gap h2 backpressure opens):
+/// the choice has ended and is not open, so the stream ends cleanly, never
+/// with `UNAVAILABLE` after a completion. Driven poll by poll with no
+/// transport in between, so nothing races; without the choice dropping its
+/// engine stream as the `Complete` goes out, this ends with a status.
+#[tokio::test]
+async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
+    let mut h = harness(model_info(), None).await;
+    let mut stream = generate::generate(&h.server.state, generate_request("r12", true, Vec::new()))
+        .await
+        .expect("generate");
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r12", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        chunk_tokens(stream.next().bounded().await.unwrap().unwrap()),
+        vec![10]
+    );
+    let done = complete(stream.next().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "length");
+    assert_eq!(done.output_ids, vec![10]);
+    // The shutdown lands between the completion and the poll that ends the
+    // stream: `cancel_all` is what `stop()` fires first.
+    h.server.state.registry.cancel_all().expect("cancel_all");
+    assert!(
+        stream.next().bounded().await.is_none(),
+        "a clean end after the completion, not a status"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A worker with two attention-DP ranks publishes on `port` and `port + 1`,
+/// each under its own sequence counter. The launcher's width
+/// (`data_parallel_size`) tells the relay how many publishers to follow: a
+/// gateway's stream carries both ranks' batches, each under its rank's own
+/// numbers and stamped with its socket's rank, which is what the gateway's
+/// per-rank admission cursors expect.
+#[tokio::test]
+async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
+    use zeromq::prelude::*;
+
+    use crate::{kv_events::golden, testing::consecutive_publishers};
+
+    let (base, mut publishers) = consecutive_publishers(2).await;
+    let mut model = model_info();
+    model.kv_events_endpoint = format!("tcp://*:{base}");
+    model.kv_events_topic = "kv".to_string();
+    model.data_parallel_size = 2;
+    let mut h = harness(model, None).await;
+    let relay = h
+        .server
+        .state
+        .kv_relay
+        .clone()
+        .expect("a relay for the publishers");
+    // Each SUB connect is asynchronous: publish sequence 0 on both ranks
+    // until the relay has taken both (repeats are duplicates).
+    let batch2 = golden::bytes(golden::BATCH2);
+    for _ in 0..250 {
+        for publisher in &mut publishers {
+            publisher
+                .send(golden::frame(b"kv", 0, &batch2))
+                .await
+                .expect("publish");
+        }
+        if relay.counts().relayed >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        relay.counts().relayed,
+        2,
+        "both ranks' sequence 0 reached the relay"
+    );
+
+    let mut stream = h
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
+        .await
+        .expect("subscribe")
+        .into_inner();
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("a batch in time")
+            .expect("stream open")
+            .expect("a batch");
+        seen.push((batch.dp_rank, batch.sequence_number));
+    }
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec![(Some(0), 0), (Some(1), 0)],
+        "each rank under its own sequence, stamped with its socket's rank"
+    );
+    // Each rank continues its own count.
+    publishers[1]
+        .send(golden::frame(b"kv", 1, &batch2))
+        .await
+        .expect("publish");
+    let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
+        .await
+        .expect("a batch in time")
+        .expect("stream open")
+        .expect("a batch");
+    assert_eq!((batch.dp_rank, batch.sequence_number), (Some(1), 1));
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
