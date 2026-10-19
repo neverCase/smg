@@ -3,7 +3,12 @@
 use std::fmt::Debug;
 
 use async_trait::async_trait;
-use axum::{body::Body, extract::Request, http::HeaderMap, response::Response};
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
