@@ -32,7 +32,7 @@ pub use messages_errors::{
     wants_messages_envelope,
 };
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
-pub(crate) use metrics::HttpRequestStartedAt;
+pub(crate) use metrics::{HttpRequestModel, HttpRequestStartedAt};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
 pub use remote_auth::{create_remote_auth_client, RemoteAuthClient};
 pub use storage_context::storage_context_middleware;

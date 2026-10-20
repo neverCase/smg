@@ -263,7 +263,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_http_responses_total",
-        "Total HTTP responses by path, status_code and error_code"
+        "Total HTTP responses by path, status_code, error_code and requested model_id (empty when unavailable)"
     );
     describe_gauge!(
         "smg_http_connections_active",
@@ -1323,15 +1323,22 @@ impl Metrics {
     }
 
     /// Record HTTP response.
-    pub fn record_http_response(path: &str, status_code: u16, error_code: &str) {
+    pub fn record_http_response(path: &str, status_code: u16, error_code: &str, model_id: &str) {
         let path_interned = intern_string(path);
         let status_str: Cow<'static, str> = status_code_to_cow(status_code);
         let error_interned = intern_string(error_code);
+        // Keep the missing-model label empty even after the model cap is reached.
+        let model = if model_id.is_empty() {
+            Arc::<str>::from("")
+        } else {
+            intern_model_label(model_id)
+        };
         counter!(
             "smg_http_responses_total",
             "path" => path_interned,
             "status_code" => status_str,
-            "error_code" => error_interned
+            "error_code" => error_interned,
+            "model_id" => model
         )
         .increment(1);
     }

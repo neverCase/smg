@@ -7,7 +7,7 @@
 
 use std::{
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
     time::Instant,
 };
@@ -35,6 +35,22 @@ pub(crate) struct HttpRequestStartedAt(Instant);
 impl HttpRequestStartedAt {
     pub(crate) fn instant(&self) -> Instant {
         self.0
+    }
+}
+
+/// The requested model, shared with handlers after they parse the body.
+/// Recording before authorization keeps early refusals attributed to the
+/// same model as successful responses, without buffering the body here.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HttpRequestModel(Arc<OnceLock<String>>);
+
+impl HttpRequestModel {
+    pub(crate) fn record(&self, model_id: &str) {
+        self.0.get_or_init(|| model_id.to_owned());
+    }
+
+    fn get(&self) -> &str {
+        self.0.get().map_or("", String::as_str)
     }
 }
 
@@ -104,6 +120,8 @@ where
         let start = Instant::now();
 
         req.extensions_mut().insert(HttpRequestStartedAt(start));
+        let model = HttpRequestModel::default();
+        req.extensions_mut().insert(model.clone());
 
         let mut inner = self.inner.clone();
         let in_flight_request_tracker = self.in_flight_request_tracker.clone();
@@ -127,6 +145,7 @@ where
                 &path,
                 response.status().as_u16(),
                 error_code_label(&response),
+                model.get(),
             );
             Metrics::record_http_duration(method, &path, duration);
 

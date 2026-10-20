@@ -254,9 +254,11 @@ async fn generate(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<GenerateRequest>,
 ) -> Response {
+    request_model.record(&body.model);
     let model = body.model.clone();
     cancel
         .guard(
@@ -271,10 +273,12 @@ async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     mut headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     request_started_at: Option<Extension<middleware::HttpRequestStartedAt>>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(mut body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
+    request_model.record(&body.model);
     let tenant_meta = match request_started_at {
         Some(Extension(started_at)) => {
             tenant_meta.with_extension(started_at)
@@ -366,9 +370,11 @@ async fn v1_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CompletionRequest>,
 ) -> Response {
+    request_model.record(&body.model);
     let model = body.model.clone();
     if let Err(resp) = check_remote_auth(&state, &headers, &model).await {
         return resp;
@@ -386,9 +392,11 @@ async fn rerank(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<RerankRequest>,
 ) -> Response {
+    request_model.record(&body.model);
     let model = body.model.clone();
     if let Err(resp) = check_remote_auth(&state, &headers, &model).await {
         return resp;
@@ -407,11 +415,13 @@ async fn v1_rerank(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<V1RerankReqInput>,
 ) -> Response {
     let rerank_body: RerankRequest = body.into();
     let model = rerank_body.model.clone();
+    request_model.record(&model);
 
     if let Err(resp) = check_remote_auth(&state, &headers, &model).await {
         return resp;
@@ -446,9 +456,11 @@ async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
+    request_model.record(&body.model);
     let model = body.model.clone();
     if let Err(resp) = check_remote_auth(&state, &headers, &model).await {
         return resp;
@@ -466,9 +478,11 @@ async fn v1_interactions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<InteractionsRequest>,
 ) -> Response {
+    request_model.record(body.model.as_deref().unwrap_or(""));
     let model_id = body.model.clone().or_else(|| body.agent.clone());
     cancel
         .guard(state.router.route_interactions(
@@ -484,9 +498,11 @@ async fn v1_decisions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<DecisionsRequest>,
 ) -> Response {
+    request_model.record(&body.model);
     let model = body.model.clone();
     cancel
         .guard(
@@ -501,9 +517,11 @@ async fn v1_systemone(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<SystemOneRequest>,
 ) -> Response {
+    request_model.record(&body.model);
     let model = body.model.clone();
     cancel
         .guard(
@@ -518,9 +536,11 @@ async fn v1_embeddings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<EmbeddingRequest>,
 ) -> Response {
+    request_model.record(&body.model);
     let model = body.model.clone();
     if let Err(resp) = check_remote_auth(&state, &headers, &model).await {
         return resp;
@@ -629,9 +649,11 @@ async fn v1_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CreateMessageRequest>,
 ) -> Response {
+    request_model.record(&body.model);
     if let Err(refused) = check_anthropic_version(&headers) {
         return refused;
     }
@@ -655,9 +677,11 @@ async fn v1_messages_count_tokens(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CountMessageTokensRequest>,
 ) -> Response {
+    request_model.record(&body.model);
     if let Err(refused) = check_anthropic_version(&headers) {
         return refused;
     }
@@ -675,9 +699,11 @@ async fn v1_classify(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<ClassifyRequest>,
 ) -> Response {
+    request_model.record(&body.model);
     let model = body.model.clone();
     cancel
         .guard(
@@ -692,9 +718,11 @@ async fn v1_image_generations(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<ImageGenerationRequest>,
 ) -> Response {
+    request_model.record(&body.model);
     if let Err(resp) = check_remote_auth(&state, &headers, &body.model).await {
         return resp;
     }
@@ -712,9 +740,11 @@ async fn v1_image_edits(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     ImageEditMultipart { request, images }: ImageEditMultipart,
 ) -> Response {
+    request_model.record(&request.model);
     if let Err(resp) = check_remote_auth(&state, &headers, &request.model).await {
         return resp;
     }
@@ -733,9 +763,11 @@ async fn v1_image_variations(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     ImageVariationMultipart { request, image }: ImageVariationMultipart,
 ) -> Response {
+    request_model.record(&request.model);
     if let Err(resp) = check_remote_auth(&state, &headers, &request.model).await {
         return resp;
     }
@@ -754,9 +786,11 @@ async fn v1_audio_transcriptions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     AudioTranscriptionMultipart { request, audio }: AudioTranscriptionMultipart,
 ) -> Response {
+    request_model.record(&request.model);
     if let Err(resp) = check_remote_auth(&state, &headers, &request.model).await {
         return resp;
     }
@@ -775,9 +809,11 @@ async fn v1_audio_speech(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
+    Extension(request_model): Extension<middleware::HttpRequestModel>,
     cancel: middleware::scheduler::PreemptionGuard,
     AudioSpeechMultipart { request, prompt_speech }: AudioSpeechMultipart,
 ) -> Response {
+    request_model.record(&request.model);
     if let Err(resp) = check_remote_auth(&state, &headers, &request.model).await {
         return resp;
     }
