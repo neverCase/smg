@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#070b12" />
+  <meta name="description" content="XHIVE-PRO inference network, visualized as a living 3D galaxy." />
+  <title>XHIVE-PRO · Orbital Console</title>
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div id="universe" aria-label="可旋转、缩放的三维模型星系"></div>
+  <div class="screen-grain" aria-hidden="true"></div>
+  <header class="topbar">
+    <a class="brand" href="./" aria-label="XHIVE-PRO Orbital Console 首页">
+      <svg class="brand-mark" viewBox="0 0 40 40" fill="none"><circle cx="20" cy="20" r="6" fill="currentColor"/><ellipse cx="20" cy="20" rx="18" ry="8" transform="rotate(-38 20 20)" stroke="currentColor" stroke-width="1.3"/><circle cx="32.6" cy="8.7" r="2.7" fill="currentColor"/></svg>
+      <span>XHIVE-PRO<span class="brand-divider">/</span><span class="brand-sub">ORBITAL</span></span>
+      <span class="edition">CONSOLE</span>
+    </a>
+    <nav class="top-nav" aria-label="视图"><span class="nav-active"><i></i>星系拓扑</span><button id="overview-button">集群概览 <span>↗</span></button></nav>
+    <div class="top-actions"><button id="immersive-toggle" class="immersive-button" aria-pressed="false" title="沉浸模式 · F">⛶ <span>沉浸模式</span></button><span id="connection-badge" class="connection-badge connecting"><i></i><span>连接中</span></span><button id="settings-button" class="icon-button" aria-label="连接设置" title="连接设置"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="16" cy="17" r="3"/></svg></button><span class="local-time" id="local-time"></span></div>
+  </header>
+
+  <main class="workspace">
+    <section class="page-heading"><div><div class="eyebrow"><span class="tiny-cross">✦</span> INFERENCE CONSTELLATION <span class="heading-rule"></span></div><h1>让算力，汇成星河<span>。</span></h1><p>每一个节点，都是智能宇宙中的一束光。</p></div><div class="view-label"><span class="coordinate">SYS / 001</span><span>实时推理网络</span><span class="view-line"></span></div></section>
+
+    <section class="summary" aria-label="集群统计">
+      <div class="summary-item"><span class="stat-label">模型星系 <small>GALAXIES</small></span><div><strong id="stat-models">—</strong><span class="stat-unit">个模型</span><span class="stat-symbol">◉</span></div></div>
+      <div class="summary-item"><span class="stat-label">在线节点 <small>WORKERS</small></span><div><strong id="stat-workers">—</strong><span class="stat-unit" id="stat-health">等待数据</span><span class="stat-symbol cyan">✧</span></div></div>
+      <div class="summary-item"><span class="stat-label">在途请求 <small>IN FLIGHT</small></span><div><strong id="stat-inflight">—</strong><span class="stat-unit">网关当前</span><span class="mini-bars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span></div></div>
+      <div class="summary-item"><span class="stat-label">引擎队列 <small>QUEUED</small></span><div><strong id="stat-queued">—</strong><span class="stat-unit" id="queue-description">等待快照</span><span class="stat-symbol amber">≋</span></div></div>
+    </section>
+
+    <section id="explorer-panel" class="galaxy-panel panel" aria-label="模型星系列表">
+      <div class="panel-top"><div><span class="section-kicker">EXPLORER</span><h2>模型星系 <span id="galaxy-count">00</span></h2></div><div class="panel-actions"><button id="show-all" class="text-button">全部 <span>↗</span></button><button id="collapse-left" class="panel-collapse" aria-label="收起模型列表" aria-controls="explorer-panel" title="收起模型列表">‹</button></div></div>
+      <label class="search"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 5 5"/></svg><input id="model-search" type="search" placeholder="搜索模型或 worker" autocomplete="off" aria-label="搜索模型或 worker"/><kbd>/</kbd></label>
+      <div id="galaxy-list" class="galaxy-list"><div class="empty-list">正在寻找星系…</div></div>
+      <div class="panel-foot"><span><i class="small-dot"></i>一个模型，一个星系</span><span id="visible-count">— NODES</span></div>
+    </section>
+
+    <section id="worker-panel" class="worker-panel panel" aria-label="Worker 详情">
+      <div class="panel-top"><div><span class="section-kicker">MISSION CONTROL</span><h2 id="detail-title">网关观测站</h2></div><div class="panel-actions"><span id="detail-icon" class="detail-icon">◎</span><button id="collapse-right" class="panel-collapse" aria-label="收起节点详情" aria-controls="worker-panel" title="收起节点详情">›</button></div></div>
+      <div id="worker-detail"></div>
+    </section>
+
+    <div class="scene-caption"><span class="scene-index">01 / ORBITAL VIEW</span><span id="scene-caption-text">探索你的推理宇宙</span></div>
+    <div id="scene-notice" class="scene-notice" role="status" hidden></div>
+    <div class="scene-controls" aria-label="场景控制">
+      <button id="reset-view" title="重置视角" aria-label="重置视角"><svg viewBox="0 0 24 24"><path d="M4 9V4h5M4 4l5 5M20 9V4h-5M20 4l-5 5M4 15v5h5M4 20l5-5M20 15v5h-5M20 20l-5-5"/></svg></button>
+      <span></span><button id="zoom-in" title="放大" aria-label="放大">+</button><button id="zoom-out" title="缩小" aria-label="缩小">−</button><span></span>
+      <button id="motion-toggle" title="暂停公转" aria-label="暂停公转" aria-pressed="false"><svg id="motion-icon" viewBox="0 0 24 24"><path d="M9 5v14M15 5v14"/></svg></button>
+      <button id="labels-toggle" title="切换节点标签" aria-label="切换节点标签" aria-pressed="true"><svg viewBox="0 0 24 24"><path d="M5 5h14v14H5zM8 9h8M8 13h5"/></svg></button>
+    </div>
+    <div class="interaction-hint"><span>拖拽旋转</span><i>·</i><span>滚轮缩放</span><i>·</i><span>点击节点探索</span></div>
+
+    <section id="telemetry-panel" class="telemetry panel" aria-label="负载趋势和图例">
+      <button id="collapse-bottom" class="panel-collapse telemetry-collapse" aria-label="收起负载趋势" aria-controls="telemetry-panel" title="收起负载趋势">⌄</button>
+      <div class="telemetry-heading"><span class="section-kicker">NETWORK PULSE</span><h2>星网脉搏 <span class="live-dot"></span></h2><span id="history-window">本页观测 · 等待数据</span></div>
+      <div class="chart-block"><div class="chart-heading"><span><i class="chart-key"></i>网关在途请求</span><span id="chart-current">—</span></div><svg id="load-chart" viewBox="0 0 560 58" preserveAspectRatio="none" role="img" aria-label="本页观测到的 网关在途请求趋势"><defs><linearGradient id="chart-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#67d9d0" stop-opacity=".24"/><stop offset="1" stop-color="#67d9d0" stop-opacity="0"/></linearGradient></defs><path class="chart-grid" d="M0 12H560M0 34H560M0 56H560"/><path id="chart-area" fill="url(#chart-fill)"/><path id="chart-line" fill="none" stroke="#71d9d0" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg></div>
+      <div class="legend"><div><i class="legend-dot cyan-dot"></i><span>相对低负载</span><i class="heat-gradient"></i><i class="legend-dot red-dot"></i><span>相对高负载</span></div><p>按同星系在途数着色 · 灰色表示不可用 / 未知</p><span>相对颜色不代表过载判定；光点为流量示意</span></div>
+    </section>
+    <button id="expand-left" class="panel-tab tab-left" aria-label="展开模型列表" aria-controls="explorer-panel" aria-expanded="false"><span>✦</span> 模型星系 <b>›</b></button>
+    <button id="expand-right" class="panel-tab tab-right" aria-label="展开节点详情" aria-controls="worker-panel" aria-expanded="false"><b>‹</b> 观测站 <span>◎</span></button>
+    <button id="expand-bottom" class="panel-tab tab-bottom" aria-label="展开负载趋势" aria-controls="telemetry-panel" aria-expanded="false"><span>≋</span> 星网脉搏 <b>⌃</b></button>
+  </main>
+
+  <footer class="statusbar"><div><span class="footer-mark">✦</span><span id="endpoint-label">10.8.0.27:31188</span><span class="status-divider">/</span><span id="source-label">LIVE SOURCE</span></div><div><span id="last-update">等待首次采集</span><span class="status-divider">·</span><button id="refresh-now">刷新 <span>↻</span></button><span id="poll-label">每 3 秒</span></div><span class="footer-version">XHIVE-PRO ORBITAL <span>v1.0</span></span></footer>
+
+  <dialog id="settings-dialog">
+    <form id="settings-form">
+      <div class="dialog-head"><div><span class="section-kicker">CONNECTION</span><h2>连接你的星网</h2></div><button type="button" id="close-settings" class="icon-button" aria-label="关闭设置">×</button></div>
+      <label class="field-label" for="endpoint-input">Workers 接口地址</label><input id="endpoint-input" class="form-input" type="url" required placeholder="http://host:port/workers"/>
+      <p class="field-help">浏览器直接访问接口，请确保接口允许当前页面跨域访问。</p>
+      <label class="field-label" for="interval-input">页面刷新间隔</label><select id="interval-input" class="form-input"><option value="2000">2 秒</option><option value="3000">3 秒</option><option value="5000">5 秒</option><option value="10000">10 秒</option></select>
+      <p class="field-help">页面刷新不会触发引擎即时采样；engine_load 是 ai-gateway 最近采集的快照。</p>
+      <div class="mode-choice"><label><input type="radio" name="mode" value="live" checked/><span><strong>实时星网</strong><small>连接 ai-gateway，显示真实 worker</small></span></label><label><input type="radio" name="mode" value="demo"/><span><strong>演示宇宙</strong><small>模拟多个模型与动态负载</small></span></label></div>
+      <p id="settings-error" class="form-error" hidden></p><button type="submit" class="primary-button">进入星网 <span>↗</span></button>
+    </form>
+  </dialog>
+  <div id="tooltip" class="tooltip" hidden></div>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

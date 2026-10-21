@@ -1,0 +1,12 @@
+{
+  "name": "xhive-pro-orbital-console",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server.mjs",
+    "start": "node server.mjs",
+    "test": "node --test --test-isolation=none tests/*.test.mjs"
+  },
+  "engines": { "node": ">=22" }
+}
