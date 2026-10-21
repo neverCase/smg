@@ -4,6 +4,10 @@
 
 ## 启动
 
+Windows 推荐直接双击 `start.cmd`，或在 PowerShell 中执行 `./start.cmd`。脚本会自动查找 Node.js；未单独安装时会尝试使用当前用户的 Codex 内置 Node.js，因此不要求普通终端已经配置好 `node` 的 PATH。保持启动窗口打开，按 `Ctrl+C` 停止服务。
+
+如果提示找不到 Node.js，请从 https://nodejs.org/ 安装 Node.js 22 或更新版本，然后重新打开终端。Codex 内置运行环境的路径可能随版本变化，独立部署时建议使用正式安装的 Node.js。
+
 在本目录执行（Node.js 22 或更新版本）：
 
 ```powershell
