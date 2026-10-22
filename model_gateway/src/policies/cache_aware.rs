@@ -155,7 +155,8 @@ pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     /// Expected-wait selector used after cache affinity has narrowed the
     /// candidate set. It owns backend snapshots and since-poll dispatch credit,
-    /// keeping selection and credit atomic under concurrent arrivals.
+    /// keeping selection and credit atomic under concurrent arrivals. Workers
+    /// share a fixed drain rate so batch occupancy cannot masquerade as capacity.
     load_scorer: LeastLoadPolicy,
     /// Selection policy run over the per-worker inputs gathered for each
     /// request (`cost` module); the default reproduces the affinity-group
@@ -446,7 +447,7 @@ impl CacheAwarePolicy {
 
         Self {
             config,
-            load_scorer: LeastLoadPolicy::new(),
+            load_scorer: LeastLoadPolicy::new().with_fixed_throughput(),
             selection,
             accounting,
             string_trees,
@@ -3797,6 +3798,74 @@ mod tests {
     }
 
     #[test]
+    fn http_misses_balance_despite_asymmetric_batch_throughput() {
+        // Same-capacity workers: a prior warm-up left some reporting two
+        // running requests while the others report idle. A low live rate used
+        // to send 117/128 misses to the idle worker at the default thresholds.
+        // A high batch rate must not confer extra capacity either.
+        for worker_count in [2, 4, 8, 16] {
+            for reporting_warmup in [1, worker_count - 1] {
+                for throughput in [210.0, 20_000.0] {
+                    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+                        cache_threshold: 0.3,
+                        balance_abs_threshold: 64,
+                        balance_rel_threshold: 1.5,
+                        eviction_interval_secs: 0,
+                        ..Default::default()
+                    });
+                    let urls: Vec<_> = (0..worker_count)
+                        .map(|i| format!("http://worker-{i}:8000"))
+                        .collect();
+                    let workers =
+                        make_workers(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+                    policy.init_workers(&workers);
+                    let loads = workers
+                        .iter()
+                        .enumerate()
+                        .map(|(i, worker)| {
+                            let mut load = expected_wait_load(0, 0.0, 0.0);
+                            if i < reporting_warmup {
+                                load.loads[0].num_running_reqs = 2;
+                                load.loads[0].gen_throughput = throughput;
+                            }
+                            (worker.url().to_string(), load)
+                        })
+                        .collect();
+                    policy.update_loads(&loads);
+                    let mut counts = vec![0usize; worker_count];
+                    for request in 0..128 {
+                        // Different first characters guarantee zero prefix
+                        // overlap; no cache-affinity gate can repair these misses.
+                        let text = format!(
+                            "{} random payload",
+                            char::from_u32(0x1000 + request).unwrap()
+                        );
+                        let idx = route_text(&policy, &workers, &text).unwrap();
+                        workers[idx].increment_load();
+                        counts[idx] += 1;
+                    }
+                    let accounted: Vec<_> = counts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &count)| count + if i < reporting_warmup { 2 } else { 0 })
+                        .collect();
+                    assert!(
+                        accounted.iter().max().unwrap() - accounted.iter().min().unwrap() <= 1,
+                        "workers={worker_count}, warm={reporting_warmup}, throughput={throughput}: {counts:?}"
+                    );
+                    for (worker, &count) in workers.iter().zip(&counts) {
+                        assert_eq!(
+                            policy.load_scorer.load_state_for_test(worker.url()),
+                            (true, count as u64 * 1024, count as u64),
+                            "only final dispatches should be credited"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cache_aware_load_update_resets_atomic_inflight_credit() {
         let policy = CacheAwarePolicy::with_config(test_config());
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
@@ -3804,8 +3873,8 @@ mod tests {
         // `w2` holds one request the router dispatched, and its report counts
         // it: one waiting request of 500 uncached tokens. Right after the
         // update `w2` is the busier worker by count (1 vs 0) and the more
-        // expensive by wait (5 s vs 0 s), so the first miss goes to `w1`;
-        // once that miss credits `w1` with 1,024 tokens (10.24 s), `w2` is
+        // expensive by work (500 tokens vs 0), so the first miss goes to `w1`;
+        // once that miss credits `w1` with 1,024 tokens, `w2` is
         // the busier by count but the cheaper by wait, which is the state the
         // second-miss assertion checks. The report hides nothing, so the
         // charge for requests a report does not show stays out of this test.
@@ -3858,7 +3927,7 @@ mod tests {
         // backlog that herded a fleet onto its emptiest-looking workers. `w1`
         // reports one queued request of 10 tokens. Read from the reports
         // alone, `w2` is the emptier worker and takes the miss; charged five
-        // mean prefills (51.2 s at 100 tokens/s) for the requests its report
+        // mean prefills (5,120 tokens) for the requests its report
         // hides, it loses every miss to `w1` until `w1`'s own credit has
         // grown to as much.
         let policy = CacheAwarePolicy::with_config(test_config());
@@ -3891,9 +3960,9 @@ mod tests {
     #[test]
     fn a_request_the_report_already_counts_is_not_priced_again() {
         // `w1` holds three requests and its report counts them as running:
-        // three mean prefills at 100 tokens/s = 30.72 s, nothing more. `w2`
-        // holds nothing and reports 3,100 queued tokens = 31 s. Charged a
-        // second time for the three, `w1` would read as 61.44 s and lose.
+        // three mean prefills = 3,072 tokens, nothing more. `w2` holds nothing
+        // and reports 3,100 queued tokens. Charged a second time for the three,
+        // `w1` would read as 6,144 tokens and lose.
         let policy = CacheAwarePolicy::with_config(test_config());
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         policy.init_workers(&workers);
@@ -3912,7 +3981,7 @@ mod tests {
         assert_eq!(route_text(&policy, &workers, "alpha"), Some(0));
 
         // The same three requests dispatched after `w1`'s report: the
-        // since-poll credit carries them (3 × 1024 tokens = 30.72 s), and
+        // since-poll credit carries them (3 × 1024 tokens), and
         // nothing is charged on top of the credit either.
         let policy = CacheAwarePolicy::with_config(test_config());
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
@@ -3964,8 +4033,8 @@ mod tests {
 
         // The next complete WorkerMonitor snapshot drops w1 after its load
         // fetch fails. Its old cached report says idle, but its five live
-        // requests make the documented missing-snapshot estimate (51.2s)
-        // worse than w2's reported 10s queue.
+        // requests add 5,120 tokens to its missing-snapshot baseline, making
+        // it more expensive than w2's reported 1,000-token queue.
         for _ in 0..5 {
             workers[0].increment_load();
         }

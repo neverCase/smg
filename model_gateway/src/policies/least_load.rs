@@ -99,6 +99,8 @@ impl SincePollDispatch {
 ///   like a dispatch whose size is unknown.
 /// - `/ throughput` — normalizes work to *time*, comparing heterogeneous
 ///   workers by drain time rather than raw token count.
+///   Cache-aware routing opts into a fixed rate for every worker: a live
+///   generation rate reflects batch occupancy, not replica capacity.
 /// - `k / (1 − k)` — the M/M/1 expected-occupancy barrier on KV utilization
 ///   `k`; convex and divergent at the KV cliff, so routing avoids the
 ///   preemption/recompute that begins as KV fills.
@@ -163,9 +165,13 @@ pub struct LeastLoadPolicy {
     /// Mean prefill length (tokens) for estimating in-flight token-work when a
     /// request's token count is unknown at routing time.
     mean_prefill_tokens: u32,
-    /// Fallback throughput (tokens/s) for the `/throughput` term when a backend
-    /// reports no live `gen_throughput`.
+    /// Fallback throughput (tokens/s), or the rate for every worker when
+    /// `fixed_throughput` is enabled.
     default_throughput: f64,
+    /// Price all workers at `default_throughput`, including missing reports.
+    /// Cache-aware routing uses this to avoid retaining a warm-up batch's
+    /// throughput bias through subsequent cache affinity.
+    fixed_throughput: bool,
     /// Per-worker waiting-queue cap; `0` disables the veto.
     max_waiting_requests: u32,
     /// Seeded source for the tie draw when set (tests reproduce a selection
@@ -225,9 +231,17 @@ impl LeastLoadPolicy {
             } else {
                 DEFAULT_THROUGHPUT
             },
+            fixed_throughput: false,
             max_waiting_requests,
             tie_rng: None,
         }
+    }
+
+    /// Use the configured default rate for every worker instead of its current
+    /// batch's generation throughput. Load and KV pressure still affect scores.
+    pub(super) fn with_fixed_throughput(mut self) -> Self {
+        self.fixed_throughput = true;
+        self
     }
 
     /// Draw ties from a seeded generator instead of the thread's.
@@ -283,8 +297,9 @@ impl LeastLoadPolicy {
     /// Expected-wait score for a worker (lower is better).
     ///
     /// `inflight` maps worker URL -> token-work dispatched since its last poll.
-    /// `nominal_throughput` (a peer-derived mean) estimates drain rate for a
-    /// worker missing a fresh snapshot; `fleet_has_loads` is false only when no
+    /// `nominal_throughput` (a peer-derived mean, or the fixed configured rate)
+    /// estimates drain rate for a worker missing a fresh snapshot;
+    /// `fleet_has_loads` is false only when no
     /// worker reports at all, in which case we fall back to join-shortest-queue
     /// on the live in-flight count (which, unlike the since-poll estimate,
     /// reflects completions and so suits backends that never report loads).
@@ -345,9 +360,13 @@ impl LeastLoadPolicy {
         loads.and_then(|map| map.get(url))
     }
 
-    /// The drain rate a reporting worker's wait is priced at: its live
-    /// generation rate, else the configured default.
+    /// The drain rate a reporting worker's wait is priced at. Fixed mode uses
+    /// the configured rate even when a small or large batch reports a different
+    /// generation rate; otherwise retain the live-rate/default behavior.
     fn drain_rate(&self, load: &WorkerLoadResponse) -> f64 {
+        if self.fixed_throughput {
+            return self.default_throughput;
+        }
         let live = load.total_gen_throughput();
         if live > 0.0 {
             live
@@ -357,7 +376,7 @@ impl LeastLoadPolicy {
     }
 
     /// The scoring inputs for one pass over `candidates`: the nominal drain
-    /// rate (mean of the positive reports) that stands in for a worker
+    /// rate (fixed, or the mean of positive reports) that stands in for a worker
     /// missing a fresh snapshot; whether anyone reports at all, which
     /// separates a partial gap (estimate the missing worker at the nominal
     /// rate) from a dark fleet (join-shortest-queue on live in-flight); and
@@ -373,16 +392,20 @@ impl LeastLoadPolicy {
         complete_snapshot: Option<&'a LoadSnapshot>,
         inflight: &'a HashMap<String, SincePollDispatch>,
     ) -> ScoreInputs<'a> {
-        let (tp_sum, tp_count) = candidates
-            .iter()
-            .filter_map(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()))
-            .map(|l| l.total_gen_throughput())
-            .filter(|t| *t > 0.0)
-            .fold((0.0, 0u32), |(s, n), t| (s + t, n + 1));
-        let nominal_throughput = if tp_count > 0 {
-            tp_sum / tp_count as f64
-        } else {
+        let nominal_throughput = if self.fixed_throughput {
             self.default_throughput
+        } else {
+            let (tp_sum, tp_count) = candidates
+                .iter()
+                .filter_map(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()))
+                .map(|l| l.total_gen_throughput())
+                .filter(|t| *t > 0.0)
+                .fold((0.0, 0u32), |(s, n), t| (s + t, n + 1));
+            if tp_count > 0 {
+                tp_sum / tp_count as f64
+            } else {
+                self.default_throughput
+            }
         };
         let reporting = candidates
             .iter()
@@ -1434,6 +1457,27 @@ mod tests {
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn fixed_throughput_prices_reported_and_missing_loads_consistently() {
+        // One peer reports 1,024 queued tokens; the other has no report and
+        // holds one request. Both must use the configured 4,096 tok/s rate,
+        // whatever batch throughput the reporting peer happens to expose.
+        for throughput in [0.0, 210.0, 20_000.0] {
+            let policy = LeastLoadPolicy::with_params(0.0, 1024, 4096.0, 0).with_fixed_throughput();
+            let workers = vec![mk("http://reported:8000"), mk("http://missing:8000")];
+            workers[1].increment_load();
+            let loads = HashMap::from([(
+                workers[0].url().to_string(),
+                make_load(1024, 0.0, throughput),
+            )]);
+            let inflight = HashMap::new();
+            let inputs = policy.score_inputs(&workers, &[0, 1], Some(&loads), None, &inflight);
+            assert_eq!(policy.score(&workers[0], &inputs), 0.25);
+            // Missing-report baseline (0.25 s) plus its own request (0.25 s).
+            assert_eq!(policy.score(&workers[1], &inputs), 0.5);
+        }
     }
 
     #[test]
