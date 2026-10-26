@@ -34,6 +34,7 @@ pub mod service;
     reason = "FIXME: worker.rs needs to be broken apart into focused modules"
 )]
 pub mod worker;
+pub mod workload_drain;
 
 // Re-export commonly used types for convenience
 pub use builder::BasicWorkerBuilder;

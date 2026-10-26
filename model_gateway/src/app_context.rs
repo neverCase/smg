@@ -98,6 +98,8 @@ pub struct AppContext {
     /// RL control plane state; `None` unless `router_config.rl.enabled`.
     pub rl: Option<Arc<smg_rl::RlState>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
+    pub kube_client: kube::Client,
+    pub kube_namespace: Option<String>,
     /// Optional remote-auth HTTP client. When set, every chat-completion-style
     /// handler verifies the caller's token + model_id against the remote
     /// service, and `/v1/models` returns only the allowed subset.
@@ -183,6 +185,7 @@ pub struct AppContextBuilder {
     mcp_format_registry: Option<FormatRegistry>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    kube_client: Option<kube::Client>,
     remote_auth_client: Option<Arc<RemoteAuthClient>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
@@ -272,6 +275,7 @@ impl AppContextBuilder {
             mcp_format_registry: None,
             wasm_manager: None,
             kv_event_monitor: None,
+            kube_client: None,
             remote_auth_client: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
@@ -422,6 +426,12 @@ impl AppContextBuilder {
         self
     }
 
+    pub async fn with_kube_client(mut self) -> Result<Self, kube::Error> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        self.kube_client = Some(kube::Client::try_default().await?);
+        Ok(self)
+    }
+
     pub fn build(self) -> Result<AppContext, AppContextBuildError> {
         let router_config = self
             .router_config
@@ -544,6 +554,8 @@ impl AppContextBuilder {
             kv_event_monitor: self.kv_event_monitor,
             rl,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
+            kube_client: self.kube_client.ok_or(AppContextBuildError::MissingField("kube_client"))?,
+            kube_namespace: None,
             remote_auth_client: self.remote_auth_client,
             audit_sink: AuditConfig::from_env().map(|cfg| Arc::new(AuditSink::spawn(cfg))),
             webrtc_bind_addr: self.webrtc_bind_addr,
@@ -569,6 +581,9 @@ impl AppContextBuilder {
         );
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
+            .with_kube_client()
+            .await
+            .map_err(|e| e.to_string())?
             .maybe_rate_limiter(&router_config)
             .maybe_rate_limit_manager(&router_config)?
             .with_tokenizer_registry()

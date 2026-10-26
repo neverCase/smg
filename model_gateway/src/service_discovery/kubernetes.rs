@@ -482,11 +482,7 @@ pub(super) async fn start_kubernetes_discovery(
     config: ServiceDiscoveryConfig,
     app_context: Arc<AppContext>,
 ) -> Result<task::JoinHandle<()>, kube::Error> {
-    let _ = ring::default_provider().install_default();
-
-    let client = Client::try_default().await?;
-
-    Ok(run_service_discovery(client, config, app_context))
+    Ok(run_service_discovery(app_context.kube_client.clone(), config, app_context))
 }
 
 /// Run discovery against an injected client. Compiled only for this crate's

@@ -74,6 +74,7 @@ use crate::{
     worker::{
         manager::{WorkerManager, WorkerManagerConfig},
         ConnectionMode,
+        workload_drain::run_workload_drain,
     },
     workflow::{
         job_queue::{JobQueue, JobQueueConfig},
@@ -1128,6 +1129,38 @@ async fn get_worker(
     }
 }
 
+async fn drain_worker(
+    State(state): State<Arc<AppState>>,
+    Path((kind, name)): Path<(String, String)>,
+) -> Response {
+    if !matches!(kind.as_str(), "deployment" | "statefulset") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Unsupported resource type".to_string(),
+        )
+            .into_response();
+    }
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Resource name cannot be empty".to_string(),
+        )
+            .into_response();
+    }
+
+    let context = Arc::clone(&state.context);
+    spawn(async move {
+        if let Err(err) = run_workload_drain(context, &kind, &name).await {
+            error!("failed to drain worker: {}", err);
+        }
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "status": "accepted" }))
+    )
+        .into_response()
+}
+
 async fn delete_worker(
     State(state): State<Arc<AppState>>,
     Path(worker_id_raw): Path<String>,
@@ -1523,6 +1556,10 @@ pub fn build_app(
                 .put(replace_worker)
                 .patch(update_worker)
                 .delete(delete_worker),
+        )
+        .route(
+            "/workers/drain/{kind}/{name}",
+            get(drain_worker),
         );
 
     // Fallback (no control-plane auth) normally uses `admin_auth_config`.
@@ -1775,15 +1812,23 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size / (1024 * 1024)
     );
 
-    let app_context = Arc::new(
-        AppContext::from_config(
-            config.router_config.clone(),
-            config.request_timeout_secs,
-            config.webrtc_bind_addr,
-            config.webrtc_stun_server.clone(),
-        )
-        .await?,
-    );
+    let mut app_context = AppContext::from_config(
+        config.router_config.clone(),
+        config.request_timeout_secs,
+        config.webrtc_bind_addr,
+        config.webrtc_stun_server.clone(),
+    )
+    .await?;
+
+    app_context.kube_namespace =
+        match config.service_discovery_config.as_ref() {
+            Some(RuntimeDiscoveryConfig::Kubernetes(discovery)) => {
+                discovery.namespace.clone()
+            }
+            _ => None,
+        };
+
+    let app_context = Arc::new(app_context);
 
     // Register the CRDT namespaces and start the inbound sync adapters, then
     // start gossip. Order matters: see the note at the mesh build above.
