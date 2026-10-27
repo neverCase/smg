@@ -817,6 +817,7 @@ def test_router_defaults_and_start(monkeypatch):
         prefill_max_inflight_requests_per_worker=7,
         prefill_queue_size=13,
         prefill_queue_timeout_secs=17,
+        drain_worker_timeout=900,
     )
 
     r = Router.from_args(args)
@@ -830,6 +831,7 @@ def test_router_defaults_and_start(monkeypatch):
     assert captured["prefill_max_inflight_requests_per_worker"] == 7
     assert captured["prefill_queue_size"] == 13
     assert captured["prefill_queue_timeout_secs"] == 17
+    assert captured["drain_worker_timeout"] == 900
     from smg.smg_rs import PolicyType
 
     assert captured["policy"] == PolicyType.RoundRobin

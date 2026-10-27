@@ -495,6 +495,14 @@ class TestRouterPositionalSignature:
         assert params[-1].kind is inspect.Parameter.KEYWORD_ONLY
         return [p.name for p in params if p.kind is not inspect.Parameter.KEYWORD_ONLY]
 
+    def test_drain_worker_timeout_is_keyword_only(self):
+        import inspect
+
+        param = inspect.signature(_Router).parameters["drain_worker_timeout"]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default == 600
+        _Router(worker_urls=[], drain_worker_timeout=900)
+
     def test_appended_parameters_follow_prefill_queue_timeout(self):
         names = self.positional_names()
         tail = names[names.index("prefill_queue_timeout_secs") :]

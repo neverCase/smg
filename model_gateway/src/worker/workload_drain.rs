@@ -163,8 +163,9 @@ pub(crate) async fn run_workload_drain(
             })?;
     }
 
-    // todo loop check worker loads
-    let drain_result = timeout(Duration::from_secs(600), async {
+    let drain_worker_timeout = app_context.router_config.drain_worker_timeout;
+    let drain_timeout = Duration::from_secs(drain_worker_timeout);
+    let drain_result = timeout(drain_timeout, async {
         let mut ticker = interval(Duration::from_secs(10));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -239,9 +240,7 @@ pub(crate) async fn run_workload_drain(
     if drain_result.is_err() {
         warn!(
             namespace,
-            kind,
-            name,
-            "Drain timed out after 600s; forcing replicas to zero"
+            kind, name, drain_worker_timeout, "Drain timed out; forcing replicas to zero"
         );
     }
 

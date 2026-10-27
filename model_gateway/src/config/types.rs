@@ -88,6 +88,10 @@ pub struct RouterConfig {
     #[serde(default = "default_upstream_pool_idle_timeout_secs")]
     pub upstream_pool_idle_timeout_secs: u64,
     pub worker_startup_timeout_secs: u64,
+    /// Maximum time in seconds to drain workload workers before forcing
+    /// replicas to zero. Must be > 0; defaults to 600 (10 minutes).
+    #[serde(default = "default_drain_worker_timeout")]
+    pub drain_worker_timeout: u64,
     /// Grace period before the first worker-startup check fires. The engine is
     /// left alone for this long, then polled every
     /// `worker_startup_check_interval_secs`.
@@ -482,6 +486,10 @@ pub struct TokenizerCacheConfig {
 
 fn default_load_monitor_interval_secs() -> u64 {
     10
+}
+
+fn default_drain_worker_timeout() -> u64 {
+    600
 }
 
 fn default_worker_overload_protection() -> bool {
@@ -1590,6 +1598,7 @@ impl Default for RouterConfig {
             request_timeout_secs: 1800, // 30 minutes
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
+            drain_worker_timeout: default_drain_worker_timeout(),
             worker_startup_delay_secs: 0,
             worker_startup_check_interval_secs: 30,
             job_queue_capacity: default_job_queue_capacity(),
@@ -1785,6 +1794,7 @@ mod tests {
         assert_eq!(config.request_timeout_secs, 1800);
         assert_eq!(config.upstream_pool_idle_timeout_secs, 3);
         assert_eq!(config.worker_startup_timeout_secs, 1800);
+        assert_eq!(config.drain_worker_timeout, 600);
         assert_eq!(config.worker_startup_check_interval_secs, 30);
         assert_eq!(config.load_monitor_interval_secs, 10);
         assert!(config.discovery.is_none());
@@ -1978,6 +1988,25 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.max_buffered_request_bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_drain_worker_timeout_serde_default_and_roundtrip() {
+        let mut json = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("drain_worker_timeout")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.drain_worker_timeout, 600);
+
+        let config = RouterConfig::builder()
+            .drain_worker_timeout(900)
+            .build()
+            .unwrap();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.drain_worker_timeout, 900);
     }
 
     #[test]

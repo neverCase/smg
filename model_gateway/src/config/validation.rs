@@ -942,6 +942,14 @@ impl ConfigValidator {
             });
         }
 
+        if config.drain_worker_timeout == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "drain_worker_timeout".to_string(),
+                value: config.drain_worker_timeout.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
         if config.worker_startup_check_interval_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "worker_startup_check_interval_secs".to_string(),
@@ -1717,6 +1725,18 @@ mod tests {
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn zero_drain_worker_timeout_is_rejected() {
+        let config = RouterConfig {
+            drain_worker_timeout: 0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "drain_worker_timeout"
+        ));
     }
 
     #[test]

@@ -594,6 +594,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
     worker_startup_timeout_secs: u64,
 
+    /// Maximum workload drain wait in seconds before forcing replicas to zero
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Worker Configuration")]
+    drain_worker_timeout: u64,
+
     /// Grace period in seconds before the first worker startup check
     #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
     worker_startup_delay: u64,
@@ -2213,6 +2217,7 @@ impl CliArgs {
             .request_timeout_secs(self.request_timeout_secs)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
+            .drain_worker_timeout(self.drain_worker_timeout)
             .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .job_queue_capacity(self.job_queue_capacity)
@@ -2828,6 +2833,22 @@ mod tests {
                 Cli::try_parse_from(argv).is_err(),
                 "{flag} {bad} should be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn drain_worker_timeout_flows_into_router_config() {
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.drain_worker_timeout, 600);
+
+        let cli = cli_args_from(&["--drain-worker-timeout", "900"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.drain_worker_timeout, 900);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.drain_worker_timeout, 900);
+
+        for value in ["0", "-1", "1.5"] {
+            assert!(Cli::try_parse_from(["smg", "--drain-worker-timeout", value]).is_err());
         }
     }
 

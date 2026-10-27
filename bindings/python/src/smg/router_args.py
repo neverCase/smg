@@ -42,6 +42,13 @@ def _non_negative_int(value: str) -> int:
     return number
 
 
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return number
+
+
 @dataclasses.dataclass
 class RouterArgs:
     # Worker configuration
@@ -348,6 +355,8 @@ class RouterArgs:
     # the foreground); appended last for the same reason
     max_background_responses: int = 1024
     power_of_two_load_metric: str = "expected_wait"
+    # Seconds to drain workload workers before forcing replicas to zero.
+    drain_worker_timeout: int = 600
 
     @staticmethod
     def add_cli_args(
@@ -1137,6 +1146,15 @@ class RouterArgs:
             type=int,
             default=RouterArgs.worker_startup_delay,
             help="Grace period in seconds before the first worker startup check (default: 0)",
+        )
+        worker_group.add_argument(
+            f"--{prefix}drain-worker-timeout",
+            type=_positive_int,
+            default=RouterArgs.drain_worker_timeout,
+            help=(
+                "Maximum workload drain wait in seconds before forcing replicas to zero"
+                " (must be > 0; default: 600)"
+            ),
         )
         pd_group.add_argument(
             f"--{prefix}worker-startup-check-interval",

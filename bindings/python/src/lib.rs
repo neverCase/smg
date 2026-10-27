@@ -403,6 +403,7 @@ struct Router {
     worker_urls: Vec<String>,
     policy: PolicyType,
     worker_startup_timeout_secs: u64,
+    drain_worker_timeout: u64,
     worker_startup_check_interval: u64,
     load_monitor_interval: u64,
     cache_threshold: f32,
@@ -996,6 +997,7 @@ impl Router {
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
+            .drain_worker_timeout(self.drain_worker_timeout)
             .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .job_queue_capacity(self.job_queue_capacity)
@@ -1346,6 +1348,7 @@ impl Router {
         mesh_tls_cert = None,
         mesh_tls_key = None,
         power_of_two_load_metric = String::from("expected_wait"),
+        drain_worker_timeout = 600,
         discovery = None,
     ))]
     #[expect(clippy::too_many_arguments)]
@@ -1538,6 +1541,7 @@ impl Router {
         mesh_tls_cert: Option<String>,
         mesh_tls_key: Option<String>,
         power_of_two_load_metric: String,
+        drain_worker_timeout: u64,
         discovery: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
@@ -1580,6 +1584,7 @@ impl Router {
             worker_urls,
             policy,
             worker_startup_timeout_secs,
+            drain_worker_timeout,
             worker_startup_check_interval,
             load_monitor_interval,
             cache_threshold,

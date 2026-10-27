@@ -28,6 +28,7 @@ class TestRouterArgs:
         assert args.pd_disaggregation is False
         assert args.prefill_urls == []
         assert args.decode_urls == []
+        assert args.drain_worker_timeout == 600
 
         # Test PD-specific defaults
         assert args.prefill_policy is None
@@ -545,6 +546,28 @@ class TestPolicyFromStr:
 
 class TestParseRouterArgs:
     """Test the parse_router_args function."""
+
+    def test_drain_worker_timeout(self):
+        assert parse_router_args([]).drain_worker_timeout == 600
+        assert parse_router_args(["--drain-worker-timeout", "900"]).drain_worker_timeout == 900
+
+    @pytest.mark.parametrize("use_router_prefix", [False, True])
+    def test_drain_worker_timeout_prefix(self, use_router_prefix):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=use_router_prefix)
+        prefix = "router-" if use_router_prefix else ""
+        defaults = RouterArgs.from_cli_args(
+            parser.parse_args([]), use_router_prefix=use_router_prefix
+        )
+        assert defaults.drain_worker_timeout == 600
+        args = RouterArgs.from_cli_args(
+            parser.parse_args([f"--{prefix}drain-worker-timeout", "900"]),
+            use_router_prefix=use_router_prefix,
+        )
+        assert args.drain_worker_timeout == 900
+        for value in ("0", "-1", "1.5"):
+            with pytest.raises(SystemExit):
+                parser.parse_args([f"--{prefix}drain-worker-timeout", value])
 
     def test_parse_basic_args(self):
         """Test parsing basic router arguments."""
@@ -1805,6 +1828,7 @@ class TestRouterArgsFieldOrder:
         "discovery_check_interval_secs",
         "max_background_responses",
         "power_of_two_load_metric",
+        "drain_worker_timeout",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1867,6 +1891,7 @@ class TestRouterArgsFieldOrder:
             "tokenizer_cache_l0_max_memory",
             "max_background_responses",
             "power_of_two_load_metric",
+            "drain_worker_timeout",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

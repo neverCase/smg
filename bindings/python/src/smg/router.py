@@ -157,6 +157,8 @@ class Router:
         worker_startup_timeout_secs: Timeout in seconds for worker startup and
             registration. Large models can take significant time to load into GPU
             memory. Default: 1800 (30 minutes)
+        drain_worker_timeout: Maximum time in seconds to drain workload workers
+            before forcing replicas to zero. Must be > 0. Default: 600 (10 minutes)
         worker_startup_delay: Grace period in seconds before the first worker
             startup check fires. Leaves the engine alone this long, then polls
             every worker_startup_check_interval. Default: 0

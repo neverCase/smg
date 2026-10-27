@@ -242,6 +242,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Maximum workload drain wait in seconds before forcing replicas to zero.
+    pub fn drain_worker_timeout(mut self, timeout: u64) -> Self {
+        self.config.drain_worker_timeout = timeout;
+        self
+    }
+
     pub fn worker_startup_delay_secs(mut self, delay: u64) -> Self {
         self.config.worker_startup_delay_secs = delay;
         self
