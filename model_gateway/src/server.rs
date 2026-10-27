@@ -1148,11 +1148,27 @@ async fn drain_worker(
             .into_response();
     }
 
+    let key = (kind.clone(), name.clone());
+
+    if !state.context.draining_workloads.insert(key.clone()) {
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status": "draining",
+                "message": "This workload is draining."
+            })),
+        )
+            .into_response();
+
+    }
+
     let context = Arc::clone(&state.context);
     spawn(async move {
-        if let Err(err) = run_workload_drain(context, &kind, &name).await {
+        if let Err(err) = run_workload_drain(Arc::clone(&context), &kind, &name).await {
             error!("failed to drain worker: {}", err);
         }
+
+        context.draining_workloads.remove(&key);
     });
     (
         StatusCode::ACCEPTED,

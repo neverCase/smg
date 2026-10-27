@@ -2,7 +2,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
-
+use dashmap::DashSet;
 use llm_tokenizer::registry::TokenizerRegistry;
 use openai_protocol::profile::ProviderProfile;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
@@ -100,6 +100,7 @@ pub struct AppContext {
     pub realtime_registry: Arc<RealtimeRegistry>,
     pub kube_client: kube::Client,
     pub kube_namespace: Option<String>,
+    pub draining_workloads: DashSet<(String, String)>,
     /// Optional remote-auth HTTP client. When set, every chat-completion-style
     /// handler verifies the caller's token + model_id against the remote
     /// service, and `/v1/models` returns only the allowed subset.
@@ -556,6 +557,7 @@ impl AppContextBuilder {
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             kube_client: self.kube_client.ok_or(AppContextBuildError::MissingField("kube_client"))?,
             kube_namespace: None,
+            draining_workloads: DashSet::new(),
             remote_auth_client: self.remote_auth_client,
             audit_sink: AuditConfig::from_env().map(|cfg| Arc::new(AuditSink::spawn(cfg))),
             webrtc_bind_addr: self.webrtc_bind_addr,
