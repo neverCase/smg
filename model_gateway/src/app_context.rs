@@ -1,5 +1,9 @@
 use std::{
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc,
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use dashmap::DashSet;
@@ -100,7 +104,9 @@ pub struct AppContext {
     pub realtime_registry: Arc<RealtimeRegistry>,
     pub kube_client: kube::Client,
     pub kube_namespace: Option<String>,
-    pub draining_workloads: DashSet<(String, String)>,
+    pub draining_workloads: DashSet<String>,
+    pub drain_counter: Arc<AtomicU64>,
+    pub workload_scale_lock: Arc<tokio::sync::Mutex<()>>,
     /// Optional remote-auth HTTP client. When set, every chat-completion-style
     /// handler verifies the caller's token + model_id against the remote
     /// service, and `/v1/models` returns only the allowed subset.
@@ -558,6 +564,8 @@ impl AppContextBuilder {
             kube_client: self.kube_client.ok_or(AppContextBuildError::MissingField("kube_client"))?,
             kube_namespace: None,
             draining_workloads: DashSet::new(),
+            drain_counter: Arc::new(AtomicU64::new(0)),
+            workload_scale_lock: Arc::new(tokio::sync::Mutex::new(())),
             remote_auth_client: self.remote_auth_client,
             audit_sink: AuditConfig::from_env().map(|cfg| Arc::new(AuditSink::spawn(cfg))),
             webrtc_bind_addr: self.webrtc_bind_addr,

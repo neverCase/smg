@@ -1131,15 +1131,8 @@ async fn get_worker(
 
 async fn drain_worker(
     State(state): State<Arc<AppState>>,
-    Path((kind, name)): Path<(String, String)>,
+    Path(name): Path<String>,
 ) -> Response {
-    if !matches!(kind.as_str(), "deployment" | "statefulset") {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Unsupported resource type".to_string(),
-        )
-            .into_response();
-    }
     if name.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -1147,9 +1140,7 @@ async fn drain_worker(
         )
             .into_response();
     }
-
-    let key = (kind.clone(), name.clone());
-
+    let key =  name.clone();
     if !state.context.draining_workloads.insert(key.clone()) {
         return (
             StatusCode::ACCEPTED,
@@ -1159,15 +1150,12 @@ async fn drain_worker(
             })),
         )
             .into_response();
-
     }
-
     let context = Arc::clone(&state.context);
     spawn(async move {
-        if let Err(err) = run_workload_drain(Arc::clone(&context), &kind, &name).await {
+        if let Err(err) = run_workload_drain(Arc::clone(&context), &name).await {
             error!("failed to drain worker: {}", err);
         }
-
         context.draining_workloads.remove(&key);
     });
     (
@@ -1574,8 +1562,8 @@ pub fn build_app(
                 .delete(delete_worker),
         )
         .route(
-            "/workers/drain/{kind}/{name}",
-            get(drain_worker),
+            "/workers/drain/{name}",
+            post(drain_worker),
         );
 
     // Fallback (no control-plane auth) normally uses `admin_auth_config`.
