@@ -686,6 +686,11 @@ pub struct WorkerSpec {
     /// Typically matches the backend engine's page size (e.g. 16 for one of the engines).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_block_size: Option<usize>,
+
+    // pod restart count
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_count: Option<i32>,
+
     /// Explicit PD pairing protocol. A prefill and a decode with this set
     /// pair only when the values are equal, and nothing derived about their
     /// transport, engine version or KV layout is compared. The same value
@@ -768,6 +773,7 @@ impl WorkerSpec {
             kv_role: None,
             kv_engine_id: None,
             kv_block_size: None,
+            restart_count: None,
             pairing_protocol: None,
             health: HealthCheckUpdate::default(),
             http_pool: HttpPoolConfig::default(),

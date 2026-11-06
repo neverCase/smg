@@ -553,6 +553,7 @@ impl PDRouter {
                     cache_namespace,
                     candidate_filter: None,
                     tried: &[],
+                    conductor_matches: None,
                 },
                 sticky_key,
             )
@@ -2634,6 +2635,7 @@ impl RouterTrait for PDRouter {
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
             cache_namespace: CacheNamespace::derive(&body.cache_partition()),
+            conductor_tokens: None,
         };
         let context = PDRequestContext {
             route: "/generate",
@@ -2675,6 +2677,7 @@ impl RouterTrait for PDRouter {
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
             cache_namespace: CacheNamespace::derive(&body.cache_partition()),
+            conductor_tokens: None,
         };
         let context = PDRequestContext {
             route: "/v1/chat/completions",
@@ -2715,6 +2718,7 @@ impl RouterTrait for PDRouter {
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
             cache_namespace: CacheNamespace::derive(&body.cache_partition()),
+            conductor_tokens: None,
         };
         let context = PDRequestContext {
             route: "/v1/messages",
@@ -2757,6 +2761,7 @@ impl RouterTrait for PDRouter {
                 cache_namespace: None,
                 candidate_filter: None,
                 tried: &[],
+                conductor_matches: None,
             },
         ) else {
             return error::service_unavailable(
@@ -2850,6 +2855,7 @@ impl RouterTrait for PDRouter {
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
             cache_namespace: CacheNamespace::derive(&body.cache_partition()),
+            conductor_tokens: None,
         };
         let context = PDRequestContext {
             route: "/v1/responses",
@@ -2894,6 +2900,7 @@ impl RouterTrait for PDRouter {
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
             cache_namespace: CacheNamespace::derive(&body.cache_partition()),
+            conductor_tokens: None,
         };
         let context = PDRequestContext {
             route: "/v1/completions",
@@ -2930,6 +2937,7 @@ impl RouterTrait for PDRouter {
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
             cache_namespace: CacheNamespace::derive(&body.cache_partition()),
+            conductor_tokens: None,
         };
         let context = PDRequestContext {
             route: "/v1/rerank",

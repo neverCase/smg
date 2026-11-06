@@ -71,6 +71,7 @@ pub(super) struct DiscoveredWorker {
     pub(super) kv_connector: Option<String>,
     pub(super) kv_role: Option<String>,
     pub(super) kv_engine_id: Option<String>,
+    pub(super) restart_count: Option<i32>,
     /// Labels a provider keeps writing for compatibility with what it wrote
     /// before discovery became provider-neutral — Kubernetes' Pod name and UID.
     /// The reconciler writes them verbatim and never interprets them. They are
@@ -106,6 +107,7 @@ impl DiscoveredWorker {
             kv_connector,
             kv_role,
             kv_engine_id,
+            restart_count,
         } = self;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"smg-discovered-worker-spec/v1");
@@ -119,6 +121,7 @@ impl DiscoveredWorker {
         hash_field(&mut hasher, kv_connector.as_deref());
         hash_field(&mut hasher, kv_role.as_deref());
         hash_field(&mut hasher, kv_engine_id.as_deref());
+        hash_field(&mut hasher, restart_count.map(|r| r.to_string()).as_deref());
         hasher.finalize().to_hex().to_string()
     }
 }
@@ -154,6 +157,7 @@ mod tests {
             kv_connector: None,
             kv_role: None,
             kv_engine_id: None,
+            restart_count: None,
             compat_labels: BTreeMap::new(),
         }
     }

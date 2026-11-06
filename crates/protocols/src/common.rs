@@ -148,6 +148,12 @@ pub trait GenerationRequest: Send + Sync {
     fn cache_partition(&self) -> CachePartition<'_> {
         CachePartition::default()
     }
+
+    fn as_chat_request(
+        &self,
+    ) -> Option<&crate::chat::ChatCompletionRequest> {
+        None
+    }
 }
 
 // ============================================================================

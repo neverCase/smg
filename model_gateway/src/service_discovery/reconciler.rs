@@ -271,6 +271,7 @@ fn build_worker_spec(
     spec.kv_connector.clone_from(&worker.kv_connector);
     spec.kv_role.clone_from(&worker.kv_role);
     spec.kv_engine_id.clone_from(&worker.kv_engine_id);
+    spec.restart_count.clone_from(&worker.restart_count);
     spec.api_key.clone_from(&app_context.router_config.api_key);
     spec.max_connection_attempts = app_context
         .router_config

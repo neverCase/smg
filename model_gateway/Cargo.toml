@@ -100,6 +100,7 @@ smg-rl.workspace = true
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
 engine-zmq-adapter.workspace = true
+rmp-serde.workspace = true
 
 # External dependencies (not in workspace)
 bincode = "1.3"
@@ -196,7 +197,6 @@ zip = "8.6"
 # The KV-index exactness tests and the decision bench run the mock engine's
 # streams through the relay's decoder and normalizer into the gateway's index.
 engine-servicer.workspace = true
-rmp-serde.workspace = true
 
 [[bench]]
 name = "wasm_middleware_latency"

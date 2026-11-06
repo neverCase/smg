@@ -36,6 +36,11 @@ use crate::{
 pub const POD_NAME_LABEL: &str = "smg.ai/pod-name";
 pub const POD_UID_LABEL: &str = "smg.ai/pod-uid";
 
+pub const MOONCAKE_URL_ANNOTATION: &str = "xhive.io/cache-pool";
+
+pub const MOONCAKE_CACHE_DOMAIN_ANNOTATION: &str = "xhive.io/cache-domain";
+
+
 /// Source for per-worker model_id override during Kubernetes service discovery.
 #[derive(Debug, Clone)]
 pub enum ModelIdSource {
@@ -219,6 +224,7 @@ pub struct PodInfo {
     pub kv_connector: Option<String>,
     pub kv_engine_ids: Vec<Option<String>>,
     pub model_id_override: Option<String>,
+    pub restart_count: Option<i32>,
 }
 
 impl PodInfo {
@@ -322,25 +328,45 @@ impl PodInfo {
         } else {
             vec![None; ports.len()]
         };
-        let kv_connector = config.and_then(|config| {
-            let connector = annotation_value(pod, &config.kv_connector_annotation)?;
-            if connector != MOONCAKE_CONNECTOR && connector != NIXL_CONNECTOR {
-                warn!(
-                    "Pod {}: {} annotation '{}' is not a connector with explicit PD handling; \
-                     using passthrough behavior",
-                    name, config.kv_connector_annotation, connector
-                );
-            }
-            Some(connector.to_string())
-        });
-        let kv_engine_ids = config
-            .map(|config| resolve_kv_engine_ids(&name, pod, config, ports.len()))
-            .unwrap_or_else(|| vec![None; ports.len()]);
+
+        let kv_connector = annotation_value(pod, MOONCAKE_URL_ANNOTATION)
+            .map(|s| s.to_string());
+
+        let mut kv_engine_ids: Vec<Option<String>> = Vec::new();
+        kv_engine_ids.push(
+            annotation_value(pod, MOONCAKE_CACHE_DOMAIN_ANNOTATION)
+                .map(|s| s.to_string())
+        );
+
+        // let kv_connector = config.and_then(|config| {
+        //     let connector = annotation_value(pod, &config.kv_connector_annotation)?;
+        //     if connector != MOONCAKE_CONNECTOR && connector != NIXL_CONNECTOR {
+        //         warn!(
+        //             "Pod {}: {} annotation '{}' is not a connector with explicit PD handling; \
+        //              using passthrough behavior",
+        //             name, config.kv_connector_annotation, connector
+        //         );
+        //     }
+        //     Some(connector.to_string())
+        // });
+        // let kv_engine_ids = config
+        //     .map(|config| resolve_kv_engine_ids(&name, pod, config, ports.len()))
+        //     .unwrap_or_else(|| vec![None; ports.len()]);
 
         // Extract model_id override from pod metadata if source is configured
         let model_id_override = config
             .and_then(|c| c.model_id_source.as_ref())
             .and_then(|source| source.extract(pod));
+
+        let restart_count: Option<i32> = pod
+            .status
+            .as_ref()
+            .and_then(|status| {
+                // todo 优先从常规容器状态中获取第一个容器的重启次数
+                status.container_statuses.as_ref()?.first().map(|cs| cs.restart_count)
+            });
+
+        // info!("Pod {} restart count: {:?}", name, restart_count);
 
         Some(PodInfo {
             name,
@@ -355,6 +381,7 @@ impl PodInfo {
             kv_connector,
             kv_engine_ids,
             model_id_override,
+            restart_count,
         })
     }
 
@@ -664,8 +691,14 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
                 );
                 continue;
             };
+            let restart_suffix = info
+                .restart_count
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+
             workers.push(DiscoveredWorker {
-                discovery_id: format!("{}:{port}", info.uid),
+                discovery_id: format!("{}:{port}:{restart_suffix}", info.uid),
                 endpoint,
                 worker_type: worker_type_for(info.pod_type.as_ref(), config.disaggregated_mode),
                 bootstrap_port: info.bootstrap_ports.get(index).copied().flatten(),
@@ -674,7 +707,8 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
                 // Kubernetes has no kv_role annotation; `None` keeps the
                 // registration workflow's existing label fallback.
                 kv_role: None,
-                kv_engine_id: info.kv_engine_ids.get(index).cloned().flatten(),
+                kv_engine_id: info.kv_engine_ids.get(0).cloned().flatten(),
+                restart_count: info.restart_count.clone(),
                 compat_labels: BTreeMap::from([
                     (POD_NAME_LABEL.to_string(), info.name.clone()),
                     (POD_UID_LABEL.to_string(), info.uid.clone()),

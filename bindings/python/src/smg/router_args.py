@@ -535,7 +535,7 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=COMMON_POLICY_CHOICES,
+            choices=[*COMMON_POLICY_CHOICES, "kvcache_conductor"],
             help=(
                 "Load balancing policy to use. In PD mode, this is used for both prefill and decode"
                 " unless overridden"

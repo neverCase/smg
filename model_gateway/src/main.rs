@@ -279,7 +279,7 @@ struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket", "kvcache_conductor"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Minimum matched-prefix share (0.0-1.0) before cache-aware routing
@@ -1822,6 +1822,9 @@ impl CliArgs {
                     self.assignment_mode.as_deref(),
                     ManualAssignmentMode::Random,
                 ),
+            },
+            "kvcache_conductor" => PolicyConfig::KvcacheConductor {
+                tenant_id: self.service_discovery_namespace.clone().unwrap_or_default(),
             },
             _ => PolicyConfig::RoundRobin,
         }

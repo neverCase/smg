@@ -878,6 +878,14 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().dp_size()
     }
 
+    fn restart_count(&self) -> Option<i32> {
+        self.metadata().spec.restart_count.clone()
+    }
+
+    fn kv_connector(&self) -> Option<String> {
+        self.metadata().spec.kv_connector.clone()
+    }
+    
     /// The KV transfer engine id the worker's engine currently reports: the
     /// spec's, unless a recovery re-read it (see
     /// [`Self::refresh_kv_engine_id`]). A PD handoff must be minted for the

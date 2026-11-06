@@ -35,9 +35,9 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
         }
 
         // HTTP mode has no gRPC fallback and doesn't consult the tokenizer registry.
-        if context.data.connection_mode == Some(ConnectionMode::Http) {
-            return Ok(StepResult::Skip);
-        }
+        // if context.data.connection_mode == Some(ConnectionMode::Http) {
+        //     return Ok(StepResult::Skip);
+        // }
 
         let labels = &context.data.final_labels;
         let app_context = context
@@ -67,13 +67,13 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
         };
 
         // Get chat_template: first model card in config > global router config
-        let chat_template = context
-            .data
-            .config
-            .models
-            .primary()
-            .and_then(|m| m.chat_template.clone())
-            .or_else(|| app_context.router_config.chat_template.clone());
+        // let chat_template = context
+        //     .data
+        //     .config
+        //     .models
+        //     .primary()
+        //     .and_then(|m| m.chat_template.clone())
+        //     .or_else(|| app_context.router_config.chat_template.clone());
 
         // Get cache config from router config
         let cache_config = app_context.router_config.tokenizer_cache.to_option();
@@ -91,17 +91,17 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
                 .or_else(|| labels.get("model_path"))
             {
                 path.clone()
-            } else if let Some(path) = app_context
-                .router_config
-                .tokenizer_path
-                .as_ref()
-                .or(app_context.router_config.model_path.as_ref())
-            {
-                debug!(
-                    "Using router config tokenizer path '{}' for model {}",
-                    path, model_id
-                );
-                path.clone()
+            // } else if let Some(path) = app_context
+            //     .router_config
+            //     .tokenizer_path
+            //     .as_ref()
+            //     .or(app_context.router_config.model_path.as_ref())
+            // {
+            //     debug!(
+            //         "Using router config tokenizer path '{}' for model {}",
+            //         path, model_id
+            //     );
+            //     path.clone()
             } else {
                 warn!(
                     "No tokenizer_path or model_path found for model {} (checked worker labels and router config)",
@@ -124,7 +124,7 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
                 id: TokenizerRegistry::generate_id(),
                 name: model_id.clone(),
                 source: tokenizer_path,
-                chat_template_path: chat_template.clone(),
+                chat_template_path: None,
                 cache_config: cache_config.clone(),
                 fail_on_duplicate: false,
             };

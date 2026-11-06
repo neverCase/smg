@@ -6,6 +6,7 @@ use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
     LeastLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy, PassthroughPolicy,
     PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    KvcacheConductorPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -115,6 +116,9 @@ impl PolicyFactory {
                 };
                 Arc::new(PrefixHashPolicy::new(config))
             }
+            PolicyConfig::KvcacheConductor {
+                tenant_id,
+            } => Arc::new(KvcacheConductorPolicy::new(tenant_id.to_string())),
         }
     }
 

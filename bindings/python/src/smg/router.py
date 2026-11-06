@@ -31,6 +31,7 @@ def policy_from_str(policy_str: str | None) -> PolicyType:
         "manual": PolicyType.Manual,
         "consistent_hashing": PolicyType.ConsistentHashing,
         "prefix_hash": PolicyType.PrefixHash,
+        "kvcache_conductor": PolicyType.KvcacheConductor,
     }
     return policy_map[policy_str]
 

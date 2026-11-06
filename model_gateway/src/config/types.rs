@@ -1126,6 +1126,12 @@ pub enum PolicyConfig {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cache_boundaries: Vec<usize>,
     },
+
+    #[serde(rename = "kvcache_conductor")]
+    KvcacheConductor {
+        tenant_id: String,
+    },
+
 }
 
 fn default_block_size() -> usize {
@@ -1209,6 +1215,7 @@ impl PolicyConfig {
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
+            PolicyConfig::KvcacheConductor { .. }=> "kvcache_conductor",
         }
     }
 }

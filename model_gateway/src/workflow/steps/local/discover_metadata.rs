@@ -3,6 +3,7 @@
 use std::{collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
+use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -53,6 +54,7 @@ pub struct ServerInfo {
     /// see the same label regardless of transport.
     pub max_running_requests: Option<usize>,
     pub weight_version: Option<String>,
+    pub page_size: Option<usize>,
 }
 
 /// SGLang `/model_info` response.
@@ -259,7 +261,68 @@ async fn fetch_vllm_http_metadata(
         }
     }
 
+    // /metrics
+    match fetch_vllm_block_size(client, &base, api_key).await {
+        Ok(Some(block_size)) => {
+            labels.insert("page_size".to_string(), block_size.to_string());
+        }
+        Ok(None) => {
+            warn!("No page_size(block_size) reported by vLLM worker {}", url);
+        }
+        Err(e) => {
+            warn!("Failed to fetch vLLM block size: {}", e);
+        }
+    }
+
     labels
+}
+
+
+async fn fetch_vllm_block_size(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<Option<usize>, String> {
+
+    let base = http_base_url(url);
+    let metrics_url = if base.ends_with("/metrics") {
+        base
+    } else {
+        format!("{}/metrics", base.trim_end_matches('/'))
+    };
+
+    let mut req = client.get(&metrics_url).timeout(METADATA_TIMEOUT);
+
+    if let Some(key) = api_key {
+        req = req.header("Authorization", format!("Bearer {}", key));
+    }
+
+    let resp = req.send().await
+        .map_err(|e| format!("Failed to connect to {url}: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!(
+            "status {} from {}",
+            resp.status(),
+            metrics_url
+        ));
+    }
+
+    let body = resp.text().await
+        .map_err(|e| format!("Failed to read response body: {e}"))?;
+
+    let re = Regex::new(r#"vllm:cache_config_info\{[^}]*\bblock_size="([^"]+)"[^}]*}"#)
+        .map_err(|e| format!("regex match failed: {}", e))?;
+
+    if let Some(caps) = re.captures(&body) {
+        if let Some(matched) = caps.get(1) {
+            let block_size = matched.as_str().parse::<usize>()
+                .map_err(|e| format!("failed to parse block size: {}", e))?;
+            return Ok(Some(block_size));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Re-read the KV transfer engine id a gRPC engine reports, for a PD worker

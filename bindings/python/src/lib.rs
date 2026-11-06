@@ -44,6 +44,7 @@ pub enum PolicyType {
     Manual,
     ConsistentHashing,
     PrefixHash,
+    KvcacheConductor,
 }
 
 #[pyclass(eq, from_py_object)]
@@ -818,6 +819,9 @@ impl Router {
                     load_factor: self.prefix_hash_load_factor,
                     balance_abs_threshold: self.prefix_hash_balance_abs_threshold,
                     cache_boundaries: self.cache_boundaries.clone(),
+                },
+                PolicyType::KvcacheConductor => ConfigPolicyConfig::KvcacheConductor {
+                    tenant_id: self.service_discovery_namespace.clone().unwrap_or_default(),
                 },
             })
         };

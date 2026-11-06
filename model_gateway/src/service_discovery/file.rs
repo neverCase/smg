@@ -155,6 +155,7 @@ struct ManifestWorker {
     kv_connector: Option<String>,
     kv_role: Option<String>,
     kv_engine_id: Option<String>,
+    restart_count: Option<i32>,
 }
 
 impl ManifestWorker {
@@ -201,6 +202,7 @@ impl ManifestWorker {
             kv_connector: self.kv_connector,
             kv_role: self.kv_role,
             kv_engine_id: self.kv_engine_id,
+            restart_count: self.restart_count,
             compat_labels: BTreeMap::new(),
         })
     }

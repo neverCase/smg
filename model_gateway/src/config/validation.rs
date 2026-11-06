@@ -774,6 +774,7 @@ impl ConfigValidator {
 
                 Self::validate_cache_boundaries(cache_boundaries)?;
             }
+            PolicyConfig::KvcacheConductor { .. } => {}
         }
         Ok(())
     }

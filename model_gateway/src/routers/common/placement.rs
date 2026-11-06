@@ -37,6 +37,7 @@ use crate::{
         PrefillSelectionContext, RoutingPool, RuntimeType, Worker, WorkerRegistry,
     },
 };
+use crate::policies::ConductorQueryResponse;
 
 /// The wire a retained plan was built for. Retry re-selection filters
 /// candidates to this (runtime, transport): the plan's proto flavor and its
@@ -92,6 +93,8 @@ pub(crate) struct PlacementInputs<'a> {
     /// nothing else left is used whole, so a single worker is retried as
     /// before.
     pub tried: &'a [String],
+
+    pub conductor_matches: Option<&'a ConductorQueryResponse>,
 }
 
 /// The pool a placement draws from, before the availability filter.
@@ -298,6 +301,7 @@ pub(crate) fn select_from(
             cache_namespace: inputs.cache_namespace,
             hash_ring,
             leg: WorkerLeg::Single,
+            conductor_matches: inputs.conductor_matches,
         },
     ) else {
         // A policy that filters availability itself misses on an
@@ -694,6 +698,7 @@ pub(crate) fn select_pair(
         cache_namespace: inputs.cache_namespace,
         hash_ring,
         leg: WorkerLeg::Prefill,
+        conductor_matches: inputs.conductor_matches,
     };
     // Both legs were filtered for availability above, so a miss here is the
     // policy's own decision, never an overloaded pool.

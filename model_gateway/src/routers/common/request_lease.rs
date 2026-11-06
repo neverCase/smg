@@ -1,6 +1,6 @@
 //! Dispatch-phase ownership of request memory, shared by every router.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
 
@@ -36,6 +36,7 @@ pub(crate) struct RoutingDerivatives {
     pub text: Option<String>,
     pub rid_key: Option<String>,
     pub cache_namespace: Option<CacheNamespace>,
+    pub conductor_tokens: Option<Arc<[u32]>>,
 }
 
 /// Borrowed view of the leased request and its routing derivatives.
@@ -46,6 +47,7 @@ pub(crate) struct LeaseView<'a, T> {
     pub text: Option<&'a str>,
     pub rid_key: Option<&'a str>,
     pub cache_namespace: Option<CacheNamespace>,
+    pub conductor_tokens: Option<&'a Arc<[u32]>>,
 }
 
 /// Single owner of a request's dispatch-phase memory: the parsed request,
@@ -193,6 +195,7 @@ impl<T> RequestLease<T> {
             text: held.routing.text.as_deref(),
             rid_key: held.routing.rid_key.as_deref(),
             cache_namespace: held.routing.cache_namespace,
+            conductor_tokens: held.routing.conductor_tokens.as_ref(),
         }
     }
 }

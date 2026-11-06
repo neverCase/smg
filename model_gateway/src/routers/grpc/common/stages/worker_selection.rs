@@ -342,6 +342,7 @@ impl WorkerSelectionStage {
             cache_namespace,
             candidate_filter: media_refs.then_some(ACCEPTS_MEDIA_REFS),
             tried: &[],
+            conductor_matches: None,
         };
         let sticky_key = ctx.state.sticky_key.as_deref();
 
@@ -564,6 +565,7 @@ impl WorkerSelectionStage {
                     cache_namespace,
                     candidate_filter: Some(&pinned),
                     tried: &[],
+                    conductor_matches: None,
                 };
                 let (pair, guard) = self
                     .admit_pd_pair(
@@ -1188,6 +1190,7 @@ impl WorkerSelectionStage {
                 cache_namespace,
                 candidate_filter,
                 tried,
+                conductor_matches: None,
             },
         )
     }
@@ -1412,6 +1415,7 @@ impl WorkerSelectionStage {
             cache_namespace,
             hash_ring: hash_ring.clone(),
             leg: WorkerLeg::Prefill,
+            conductor_matches: None,
         };
         let prefill_idx = self
             .policy_registry
@@ -1502,6 +1506,7 @@ fn assign_encode_workers(
                 cache_namespace: None,
                 hash_ring: hash_ring.clone(),
                 leg: WorkerLeg::Single,
+                conductor_matches: None,
             };
             let worker_idx = policy.select_worker(encode_workers, &info)?;
             let worker = encode_workers[worker_idx].clone();

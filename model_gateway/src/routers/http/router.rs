@@ -44,6 +44,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, warn, Instrument};
 
+use llm_tokenizer::registry::TokenizerRegistry;
+use llm_multimodal::MediaPartOrder;
+
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
@@ -57,7 +60,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{CacheNamespace, PolicyRegistry},
+    policies::{CacheNamespace, PolicyRegistry, KvcacheConductorPolicy, ConductorQueryResponse},
     routers::{
         common::{
             attach_sized_body,
@@ -83,7 +86,10 @@ use crate::{
         error::{self, extract_error_code_from_response},
         external::GatewayWorker,
         gateway::Gateway,
-        grpc::utils::{error_type_from_status, route_to_endpoint},
+        grpc::{
+            utils::{error_type_from_status, route_to_endpoint},
+            multimodal, utils,
+        },
         http::{
             request_body::{
                 serialize_request_body, serialize_request_body_preserving_fields, RequestBodyError,
@@ -131,6 +137,7 @@ struct StreamRelayMode {
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
+    tokenizer_registry: Arc<TokenizerRegistry>,
     retry_config: RetryConfig,
     /// Cap on buffered worker response bodies, mirroring the ingress limit.
     max_payload_size: usize,
@@ -201,6 +208,7 @@ impl Router {
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
+            tokenizer_registry: ctx.tokenizer_registry.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             max_payload_size: ctx.router_config.max_payload_size,
             stream_stall_timeout: match ctx.router_config.stream_body_stall_timeout_secs {
@@ -212,6 +220,46 @@ impl Router {
             webrtc_bind_addr: ctx.webrtc_bind_addr,
             webrtc_stun_server: ctx.webrtc_stun_server.clone(),
         })
+    }
+
+    async fn tokenizer_conductor_chat(
+        &self,
+        model_id: &str,
+        request: &ChatCompletionRequest,
+    ) -> Result<Vec<u32>, String> {
+
+        if !multimodal::media_plan_chat(&request.messages).is_empty() {
+            return Err(
+                "Conductor tokenization currently supports text-only chat"
+                    .to_string(),
+            );
+        }
+
+        let tokenizer = self.tokenizer_registry.get(model_id).ok_or_else(|| {
+            format!("Tokenizer not found for model: {model_id}")
+        })?;
+
+        utils::validate_chat_content_parts(&request.messages)?;
+
+        let render_request = utils::request_as_rendered(request);
+
+        let (processed, prompt_encoding) =
+            utils::process_chat_messages_with_placeholders(
+                &render_request.as_ref(),
+                tokenizer.as_ref(),
+                None,
+                MediaPartOrder::MediaFirst
+            )?;
+
+        let encoding = utils::encode_prompt_blocking(
+            tokenizer,
+            &processed.text,
+            prompt_encoding,
+        )
+        .await
+        .map_err(|e| format!("Tokenizer encoding failed: {e}"))?;
+
+        Ok(encoding.token_ids().to_vec())
     }
 
     fn select_first_worker(&self) -> Result<Arc<dyn Worker>, String> {
@@ -288,6 +336,7 @@ impl Router {
         cache_namespace: Option<CacheNamespace>,
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
+        conductor_matches: Option<&ConductorQueryResponse>,
     ) -> Option<Arc<dyn Worker>> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
@@ -305,6 +354,7 @@ impl Router {
                 cache_namespace,
                 candidate_filter,
                 tried,
+                conductor_matches
             },
         )
     }
@@ -443,6 +493,35 @@ impl Router {
         // and an alias would silently fall back to router defaults.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let model_id = canonical_model.as_deref().unwrap_or(model_id);
+
+        // todo conductor
+        let policy = self.policy_registry.get_policy_or_default(model_id);
+        let use_conductor = policy.as_any().is::<KvcacheConductorPolicy>();
+        let conductor_tokens: Option<Arc<[u32]>> = if use_conductor {
+            match typed_req.as_chat_request() {
+                Some(chat_req) => {
+                    match self
+                        .tokenizer_conductor_chat(model_id, chat_req)
+                        .await
+                    {
+                        Ok(tokens) => Some(tokens.into()),
+                        Err(error) => {
+                            warn!(
+                                model = model_id,
+                                %error,
+                                "Conductor tokenization unavailable"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
+
         let model = model_id;
         let endpoint = route_to_endpoint(route);
 
@@ -481,6 +560,7 @@ impl Router {
                 text,
                 rid_key,
                 cache_namespace,
+                conductor_tokens,
             },
             ReleasePoint::from_retry_config(retry_config),
         );
@@ -627,8 +707,60 @@ impl Router {
         ledger: &AttemptLedger,
         tried: &parking_lot::Mutex<Vec<String>>,
     ) -> Response {
+        let conductor_tokens: Option<Arc<[u32]>> =
+            lease.with_view(|view| view.conductor_tokens.cloned());
+
+        let policy = self
+            .policy_registry
+            .get_policy_or_default(model_id);
+
         // A retry never goes back to a worker whose answer was definitive.
         let admits = |worker: &dyn Worker| ledger.admits(worker);
+
+        let conductor_workers: Option<Vec<Arc<dyn Worker>>> =
+            if conductor_tokens.is_some() && policy.as_any().is::<KvcacheConductorPolicy>()
+            {
+                let pool = placement::candidates(
+                    &self.worker_registry,
+                    model_id,
+                    RoutingPool::HttpRegular,
+                    None,
+                );
+
+                let workers = pool
+                    .as_slice()
+                    .iter()
+                    .filter(|worker| admits(worker.as_ref()))
+                    .cloned()
+                    .collect::<Vec<Arc<dyn Worker>>>();
+
+                Some(workers)
+            } else {
+                None
+            };
+
+        // todo prepare_chat
+        let conductor_matches: Option<ConductorQueryResponse> =
+            if let (Some(tokens), Some(workers), Some(conductor)) = (
+                conductor_tokens.as_deref(),
+                conductor_workers.as_deref(),
+                policy.as_any().downcast_ref::<KvcacheConductorPolicy>(),
+            ) {
+                match conductor
+                    .prepare_request(workers, tokens)
+                    .await
+                {
+                    Ok(response) => Some(response),
+                    Err(error) => {
+                        warn!(%error, "Conductor query failed");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+
         let worker = match lease.with_view(|view| {
             // A retry re-selects away from the engines this request already
             // tried, while another available worker is left to take it.
@@ -642,6 +774,7 @@ impl Router {
                 view.cache_namespace,
                 Some(&admits),
                 &tried,
+                conductor_matches.as_ref(),
             )
         }) {
             Some(w) => w,
@@ -1075,6 +1208,7 @@ impl Router {
                 cache_namespace: None,
                 candidate_filter: None,
                 tried: &[],
+                conductor_matches: None,
             },
         ) else {
             // Judged from the same candidates whether the pre-filter emptied
@@ -1481,6 +1615,7 @@ impl Router {
                 cache_namespace: None,
                 candidate_filter: None,
                 tried: &[],
+                conductor_matches: None,
             },
         ) else {
             // Judged from the same candidates whether the pre-filter emptied
@@ -2870,6 +3005,7 @@ impl Router {
             None,
             None,
             &[],
+            None,
         ) else {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
             return Err(req);
@@ -3569,6 +3705,7 @@ mod tests {
         Router {
             worker_registry,
             policy_registry,
+            tokenizer_registry: Arc::new(TokenizerRegistry::new()),
             retry_config: RetryConfig::default(),
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
@@ -3662,6 +3799,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             )
             .unwrap();
         assert!(selected.is_available());
@@ -3679,6 +3817,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None
             )
             .is_none());
     }
@@ -3780,6 +3919,7 @@ mod tests {
         Router {
             worker_registry,
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            tokenizer_registry: Arc::new(TokenizerRegistry::new()),
             retry_config: retry,
             max_payload_size: 536_870_912,
             stream_stall_timeout: Some(Duration::from_secs(60)),
@@ -4140,6 +4280,7 @@ mod tests {
         Router {
             worker_registry,
             policy_registry,
+            tokenizer_registry: Arc::new(TokenizerRegistry::new()),
             retry_config: RetryConfig::default(),
             max_payload_size,
             stream_stall_timeout: Some(Duration::from_secs(60)),

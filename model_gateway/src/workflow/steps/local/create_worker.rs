@@ -242,6 +242,13 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         spec.kv_connector = None;
         spec.kv_role = None;
         spec.kv_engine_id = None;
+        spec.restart_count = config.restart_count;
+
+        if spec.kv_block_size.is_none() {
+            spec.kv_block_size = labels.get("page_size")
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n > 0);
+        }
 
         let workers: Vec<Arc<dyn Worker>> = dp_ranks
             .into_iter()

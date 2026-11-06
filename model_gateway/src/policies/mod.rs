@@ -27,7 +27,9 @@ mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
+mod kvcache_conductor;
 pub(crate) mod utils;
+
 
 pub use bucket::BucketPolicy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
@@ -45,7 +47,12 @@ pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
-
+pub use kvcache_conductor::{
+    ConductorInstanceMatch,
+    ConductorQueryResponse,
+    ConductorRankMatch,
+    KvcacheConductorPolicy,
+};
 /// Core trait for load balancing policies
 ///
 /// This trait provides a unified interface for implementing routing algorithms
@@ -337,6 +344,8 @@ pub struct SelectWorkerInfo<'a> {
     /// Which PD leg this selection is for (default `Single`); namespaces
     /// header-based sticky routing so prefill and decode stick independently.
     pub leg: WorkerLeg,
+
+    pub conductor_matches: Option<&'a ConductorQueryResponse>,
 }
 
 #[cfg(test)]

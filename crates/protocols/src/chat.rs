@@ -851,6 +851,10 @@ impl GenerationRequest for ChatCompletionRequest {
         self.stream
     }
 
+    fn as_chat_request(&self) -> Option<&ChatCompletionRequest> {
+        Some(self)
+    }
+
     fn cache_partition(&self) -> CachePartition<'_> {
         CachePartition {
             // Engine extensions carried in the passthrough map, not typed
