@@ -134,7 +134,7 @@ pub fn create_worker_registration_workflow(
                 },
             })
             .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::ContinueNextStep)
+            .with_failure_action(FailureAction::FailWorkflow)
             .depends_on(&["detect_connection_mode"]),
         )
         // Step 2a: Discover metadata

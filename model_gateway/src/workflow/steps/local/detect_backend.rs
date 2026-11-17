@@ -212,6 +212,7 @@ async fn detect_http_backend(
                 "Could not detect backend via /v1/models, trying fallback: {}",
                 e
             );
+            return Err(format!("Could not detect HTTP backend for {url}: {e}"));
         }
     }
 
