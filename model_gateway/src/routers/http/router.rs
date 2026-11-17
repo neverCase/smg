@@ -768,7 +768,7 @@ impl Router {
             self.select_worker_for_model(
                 model_id,
                 view.text,
-                view.tokens,
+                conductor_tokens.as_deref().or(view.tokens),
                 headers,
                 view.rid_key,
                 view.cache_namespace,

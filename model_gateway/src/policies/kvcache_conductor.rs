@@ -10,9 +10,9 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use rand::seq::IteratorRandom;
-
+use openai_protocol::worker::WorkerLoadResponse;
 use crate::service_discovery::{POD_NAME_LABEL, POD_UID_LABEL};
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{get_healthy_worker_indices, LeastLoadPolicy, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::worker::Worker;
 
 /// POST /query 请求体。
@@ -51,6 +51,11 @@ pub(crate) struct ConductorQueryRequest {
 pub struct ConductorQueryResponse {
     /// 注册时的 instance_id -> 实例缓存命中信息。
     pub instances: HashMap<String, ConductorInstanceMatch>,
+
+    /// The length of the full token_ids that were only used in the selection policy.
+    /// It wasn't included inside the response during ConductorQueryRequest.
+    /// It would only be patched manually.
+    pub token_ids_length: Option<usize>,
 }
 
 /// 单个实例的缓存命中信息。
@@ -92,6 +97,23 @@ pub struct ConductorRankMatch {
 
 #[derive(Debug, Default)]
 pub struct KvcacheConductorPolicy {
+    pub cache_threshold: f32,
+    /// Absolute load margin for the per-request candidate gate: the selected
+    /// worker spills to least-loaded when its load exceeds the healthy-fleet
+    /// mean by this many requests AND by `balance_rel_threshold`. Requiring
+    /// both keeps the gate quiet on steady-state variance at low means
+    /// (absolute) without going blind to a deep queue at high means
+    /// (relative).
+    pub balance_abs_threshold: usize,
+    /// Relative load margin (multiple of the healthy-fleet mean) for the
+    /// per-request candidate gate; fires only together with
+    /// `balance_abs_threshold`.
+    pub balance_rel_threshold: f32,
+    /// Expected-wait selector used after cache affinity has narrowed the
+    /// candidate set. It owns backend snapshots and since-poll dispatch credit,
+    /// keeping selection and credit atomic under concurrent arrivals. Workers
+    /// share a fixed drain rate so batch occupancy cannot masquerade as capacity.
+    load_scorer: LeastLoadPolicy,
     tenant_id: String,
     client: reqwest::Client,
     next_start: AtomicUsize,
@@ -107,6 +129,10 @@ impl KvcacheConductorPolicy {
             .expect("Failed to build client");
 
         Self {
+            cache_threshold: 0.4,
+            balance_abs_threshold: 10,
+            balance_rel_threshold: 1.1,
+            load_scorer: LeastLoadPolicy::new().with_fixed_throughput(),
             tenant_id,
             client,
             next_start: AtomicUsize::new(0),
@@ -180,6 +206,7 @@ impl KvcacheConductorPolicy {
         // scan blocks map
         let mut merged_instances = ConductorQueryResponse {
             instances: HashMap::new(),
+            token_ids_length: Some(tokens_i32.len())
         };
 
         let mut instance_with_block_size: HashMap<String, i32> = HashMap::new();
@@ -200,7 +227,7 @@ impl KvcacheConductorPolicy {
                 .map(String::as_str)
                 .unwrap_or("");
 
-            let model_id = match worker.kv_engine_id() {
+            let cache_domain = match worker.kv_engine_id() {
                 Some(m) => m,
                 None => {
                     warn!("Worker - pod name: {} uid: {} has no kv_engine_id", pod_name, pod_uid);
@@ -214,7 +241,7 @@ impl KvcacheConductorPolicy {
                     continue;
                 }
             };
-            let key = format!("model_id-{}-block_size-{}", model_id, block_size);
+            let key = format!("cache_domain-{}-block_size-{}", cache_domain, block_size);
             if instance_with_block_size.contains_key(&key) {
                 warn!("Worker - pod name: {} uid: {} has duplicate kv_block_size", pod_name, pod_uid);
                 continue;
@@ -238,7 +265,7 @@ impl KvcacheConductorPolicy {
             let url = format!("http://mooncake-conductor.{}.svc.cluster.local:13333/query", namespace);
 
             let request = ConductorQueryRequest {
-                model: model_id,
+                model: cache_domain,
                 block_size: block_size as i64,
                 token_ids: tokens_i32.clone(),
                 tenant_id: Some(self.tenant_id.clone()),
@@ -282,6 +309,83 @@ impl KvcacheConductorPolicy {
 
         Ok(merged_instances)
     }
+
+    pub fn least_load_with_no_kvcache_candidates(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        select_worker_info: &SelectWorkerInfo
+    ) -> Option<usize> {
+        let candidate: Vec<usize> = workers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, worker)| {
+                if !worker.is_available() {
+                    return None;
+                }
+                Some(index)
+            })
+            .collect::<Vec<_>>();
+        self.load_scorer.select_min_expected_wait(
+            workers,
+            &candidate,
+            select_worker_info,
+            self.name()
+        )
+    }
+
+    pub fn least_load_with_filter_spill_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        select_worker_info: &SelectWorkerInfo,
+        spill_candidates: &[usize],
+    ) -> Option<usize> {
+        let candidate: Vec<usize> = workers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, worker)| {
+                if !worker.is_available() {
+                    return None;
+                }
+                if spill_candidates.contains(&index) {
+                    return None;
+                }
+                Some(index)
+            })
+            .collect::<Vec<_>>();
+        self.load_scorer.select_min_expected_wait(
+            workers,
+            &candidate,
+            select_worker_info,
+            self.name()
+        )
+    }
+
+    pub fn scan_worker_avg_load(&self, workers: &[Arc<dyn Worker>],) -> f64 {
+        let mut total_loads: usize = 0;
+        for worker in workers {
+            total_loads += worker.load();
+        }
+        total_loads as f64 / workers.len() as f64
+    }
+
+    pub fn check_cache_hit(
+        &self,
+        conductor_instance_match: &ConductorInstanceMatch,
+        token_ids_length: usize,
+    ) -> f64 {
+        // todo use GPU_local
+        conductor_instance_match.longest_matched as f64 / token_ids_length as f64
+    }
+
+    pub fn candidate_requires_spill(
+        &self,
+        load: usize,
+        avg_load: f64,
+    ) -> bool {
+        load as f64 > avg_load * f64::from(self.balance_rel_threshold) &&
+            load as f64 > avg_load + self.balance_abs_threshold as f64
+    }
+
 }
 
 impl LoadBalancingPolicy for KvcacheConductorPolicy {
@@ -303,15 +407,15 @@ impl LoadBalancingPolicy for KvcacheConductorPolicy {
             }
         }
 
-        let mut rng = rand::rng();
-
         let Some(matches) = select_worker_info.conductor_matches else {
-            return get_healthy_worker_indices(workers)
-                .into_iter()
-                .choose(&mut rng);
+            return self.least_load_with_no_kvcache_candidates(workers, select_worker_info);
         };
 
-        let mut candidates: Vec<(usize, i64)> = workers
+        let Some(token_ids_length) = matches.token_ids_length else {
+            return self.least_load_with_no_kvcache_candidates(workers, select_worker_info);
+        };
+
+        let mut candidates: Vec<usize> = workers
             .iter()
             .enumerate()
             .filter_map(|(index, worker)| {
@@ -323,33 +427,76 @@ impl LoadBalancingPolicy for KvcacheConductorPolicy {
                 let restart_count = worker.restart_count()?;
                 let instance_id = format!("xhive-{}-{}", pod_uid, restart_count);
                 let hit = matches.instances.get(&instance_id)?;
-
-                Some((index, hit.longest_matched))
+                let hit_percent = self.check_cache_hit(hit, token_ids_length);
+                info!("Instance {} hit percent {} cache threshold {}",
+                        instance_id,
+                        hit_percent,
+                        self.cache_threshold);
+                if hit_percent <= self.cache_threshold as f64 {
+                    return None;
+                }
+                Some(index)
             })
             .collect();
 
-        // longest_matched 从大到小排序。
-        candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        let avg_load = self.scan_worker_avg_load(workers);
 
-        if let Some((_, best_matched)) = candidates.first().copied() {
-            return candidates
-                .into_iter()
-                .take_while(|(_, matched)| *matched == best_matched)
-                .map(|(index, _)| index)
-                .choose(&mut rng);
+        let safe_affinity: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                let load = workers[idx].load();
+                if self.candidate_requires_spill(load, avg_load) {
+                    let pod_uid = workers[idx]
+                        .metadata()
+                        .spec
+                        .labels
+                        .get(POD_UID_LABEL)
+                        .map(String::as_str)
+                        .unwrap_or("unknown-pod-uid");
+                    warn!("Worker pod_uid {}  load {} is above average load rel{} * avg{} and abs{} + avg{}",
+                        pod_uid,
+                        load,
+                        self.balance_rel_threshold,
+                        avg_load,
+                        self.balance_abs_threshold,
+                        avg_load);
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        if safe_affinity.is_empty() {
+            warn!("No available safe_affinity worker matches Conductor instances, just return least load");
+            return self.least_load_with_filter_spill_worker(workers, select_worker_info, &candidates);
         }
 
-        // 没有匹配到可用 worker，随机回退。
-        warn!("No available worker matches Conductor instances");
-        get_healthy_worker_indices(workers)
-            .into_iter()
-            .choose(&mut rng)
+        self.load_scorer.select_min_expected_wait(
+            workers,
+            &safe_affinity,
+            select_worker_info,
+            self.name()
+        )
     }
+
     fn name(&self) -> &'static str {
         "kvcache_conductor"
     }
 
+    fn update_loads(&self, loads: &HashMap<String, WorkerLoadResponse>) {
+        self.load_scorer.update_loads(loads);
+    }
+
+    fn needs_backend_loads(&self) -> bool {
+        true
+    }
+    fn remove_worker(&self, url: &str) {
+        self.load_scorer.remove_worker(url);
+    }
+
     fn reset(&self) {
+        self.load_scorer.reset();
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
