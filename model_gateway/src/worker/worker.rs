@@ -885,6 +885,10 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     fn kv_connector(&self) -> Option<String> {
         self.metadata().spec.kv_connector.clone()
     }
+
+    fn kv_role(&self) -> Option<String> {
+        self.metadata().spec.kv_role.clone()
+    }
     
     /// The KV transfer engine id the worker's engine currently reports: the
     /// spec's, unless a recovery re-read it (see

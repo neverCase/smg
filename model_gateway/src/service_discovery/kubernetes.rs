@@ -37,9 +37,7 @@ pub const POD_NAME_LABEL: &str = "smg.ai/pod-name";
 pub const POD_UID_LABEL: &str = "smg.ai/pod-uid";
 
 pub const MOONCAKE_URL_ANNOTATION: &str = "xhive.io/cache-pool";
-
 pub const MOONCAKE_CACHE_DOMAIN_ANNOTATION: &str = "xhive.io/cache-domain";
-
 
 /// Source for per-worker model_id override during Kubernetes service discovery.
 #[derive(Debug, Clone)]
@@ -125,29 +123,21 @@ impl ServiceDiscoveryConfig {
     /// list call covers all selected pod types. If there are no common
     /// labels, returns an empty string (no server-side filtering).
     fn list_label_selector(&self) -> String {
-        if self.disaggregated_mode {
-            let selectors = self.disaggregated_selectors();
-            let Some(first) = selectors.first() else {
-                return String::new();
-            };
-            first
-                .iter()
-                .filter(|(k, v)| {
-                    selectors
-                        .iter()
-                        .skip(1)
-                        .all(|selector| selector.get(*k) == Some(*v))
-                })
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        } else {
-            self.selector
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        }
+        let selectors = self.all_selectors();
+        let Some(first) = selectors.first() else {
+            return String::new();
+        };
+        first
+            .iter()
+            .filter(|(k, v)| {
+                selectors
+                    .iter()
+                    .skip(1)
+                    .all(|selector| selector.get(*k) == Some(*v))
+            })
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     fn disaggregated_selectors(&self) -> Vec<&HashMap<String, String>> {
@@ -159,6 +149,18 @@ impl ServiceDiscoveryConfig {
         .into_iter()
         .filter(|selector| !selector.is_empty())
         .collect()
+    }
+
+    fn all_selectors(&self) -> Vec<&HashMap<String, String>> {
+        [
+            &self.encode_selector,
+            &self.prefill_selector,
+            &self.decode_selector,
+            &self.selector
+        ]
+            .into_iter()
+            .filter(|selector| !selector.is_empty())
+            .collect()
     }
 }
 
@@ -183,9 +185,9 @@ impl Default for ServiceDiscoveryConfig {
         ServiceDiscoveryConfig {
             selector: HashMap::new(),
             check_interval: Duration::from_secs(60),
-            port: 8000,
+            port: 9000,
             namespace: None,
-            disaggregated_mode: false,
+            disaggregated_mode: true,
             encode_selector: HashMap::new(),
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
@@ -214,8 +216,6 @@ pub struct PodInfo {
     pub status: String,
     pub is_ready: bool,
     pub pod_type: Option<PodType>,
-    // TODO
-    pub tcp_port: Option<u16>,
     /// Worker data ports: the worker-ports annotation when present, else the
     /// single configured discovery port.
     pub ports: Vec<u16>,
@@ -240,22 +240,14 @@ impl PodInfo {
     }
 
     pub fn should_include(pod: &Pod, config: &ServiceDiscoveryConfig) -> bool {
-        if config.disaggregated_mode {
-            let selectors = config.disaggregated_selectors();
-            if selectors.is_empty() {
-                warn!("Disaggregated mode enabled but all role selectors are empty");
-                return false;
-            }
-            selectors
-                .iter()
-                .any(|selector| Self::matches_selector(pod, selector))
-        } else {
-            if config.selector.is_empty() {
-                warn!("Regular mode enabled but selector is empty");
-                return false;
-            }
-            Self::matches_selector(pod, &config.selector)
+        let selectors = config.all_selectors();
+        if selectors.is_empty() {
+            warn!("Both disaggregated mode's and regular mode's role selectors are empty");
+            return false;
         }
+        selectors
+            .iter()
+            .any(|selector| Self::matches_selector(pod, selector))
     }
 
     pub fn from_pod(pod: &Pod, config: Option<&ServiceDiscoveryConfig>) -> Option<Self> {
@@ -272,6 +264,7 @@ impl PodInfo {
         };
         let status = pod.status.clone()?;
         let raw_ip = status.pod_ip?;
+        // todo
         // Parsed rather than kept as a string so the worker URL renders an
         // IPv6 address in bracketed form; `format!("{ip}:{port}")` would
         // produce the unusable `fd00::1:8080`.
@@ -294,28 +287,18 @@ impl PodInfo {
         let pod_status = status.phase.unwrap_or_else(|| "Unknown".to_string());
 
         let pod_type = if let Some(config) = config {
-            if config.disaggregated_mode {
-                if Self::matches_selector(pod, &config.encode_selector) {
-                    Some(PodType::Encode)
-                } else if Self::matches_selector(pod, &config.prefill_selector) {
-                    Some(PodType::Prefill)
-                } else if Self::matches_selector(pod, &config.decode_selector) {
-                    Some(PodType::Decode)
-                } else {
-                    Some(PodType::Regular)
-                }
+            if Self::matches_selector(pod, &config.encode_selector) {
+                Some(PodType::Encode)
+            } else if Self::matches_selector(pod, &config.prefill_selector) {
+                Some(PodType::Prefill)
+            } else if Self::matches_selector(pod, &config.decode_selector) {
+                Some(PodType::Decode)
             } else {
                 Some(PodType::Regular)
             }
         } else {
             None
         };
-
-        let tcp_port = pod.spec.as_ref()
-            .and_then(|spec| spec.containers.first())
-            .and_then(|container| container.ports.as_ref())
-            .and_then(|ports| ports.iter().find(|p| p.protocol.as_deref() == Some("TCP")))
-            .map(|p| p.container_port as u16); // 转换
 
         let ports = config
             .map(|config| resolve_worker_ports(&name, pod, config))
@@ -365,7 +348,6 @@ impl PodInfo {
                 // todo 优先从常规容器状态中获取第一个容器的重启次数
                 status.container_statuses.as_ref()?.first().map(|cs| cs.restart_count)
             });
-
         // info!("Pod {} restart count: {:?}", name, restart_count);
 
         Some(PodInfo {
@@ -375,7 +357,6 @@ impl PodInfo {
             status: pod_status,
             is_ready,
             pod_type,
-            tcp_port,
             ports,
             bootstrap_ports,
             kv_connector,
@@ -388,16 +369,6 @@ impl PodInfo {
     pub fn is_healthy(&self) -> bool {
         self.is_ready && self.status == "Running"
     }
-
-    pub fn worker_url(&self, port: u16) -> String {
-        // Bare host:port lets DetectConnectionModeStep dual-probe HTTP and gRPC.
-        if self.tcp_port.is_some() {
-            format!("{}:{}", self.ip, self.tcp_port.unwrap())
-        } else {
-            format!("{}:{}", self.ip, port)
-        }
-    }
-
 }
 
 /// Parse a comma-separated port list. Preserves order, rejects 0 and junk.
@@ -416,25 +387,54 @@ fn parse_port_list(raw: &str) -> Option<Vec<u16>> {
 /// Data ports for the pod's workers: the worker-ports annotation when present
 /// (deduped, order-preserving), else the single configured discovery port.
 fn resolve_worker_ports(pod_name: &str, pod: &Pod, config: &ServiceDiscoveryConfig) -> Vec<u16> {
-    let Some(raw) = pod
+    let raw= pod
         .metadata
         .annotations
         .as_ref()
-        .and_then(|annotations| annotations.get(&config.worker_ports_annotation))
-    else {
-        return vec![config.port];
-    };
-    match parse_port_list(raw) {
-        Some(mut ports) => {
-            let mut seen = HashSet::new();
-            ports.retain(|port| seen.insert(*port));
-            ports
-        }
-        None => {
-            warn!(
-                "Pod {}: invalid {} annotation '{}', falling back to port {}",
-                pod_name, config.worker_ports_annotation, raw, config.port
+        .and_then(|annotations| annotations.get(&config.worker_ports_annotation));
+
+    if let Some(raw) = raw {
+        match parse_port_list(raw) {
+            Some(mut ports) => {
+                let mut seen = HashSet::new();
+                ports.retain(|port| seen.insert(*port));
+                return ports;
+            }
+            None => {
+                warn!(
+                "Pod {}: invalid {} annotation '{}', falling back to container ports or default",
+                pod_name, config.worker_ports_annotation, raw
             );
+            }
+        }
+    }
+
+    let container_ports: Vec<u16> = pod
+        .spec
+        .as_ref()
+        .map(|spec|{
+              spec.containers
+                  .iter()
+                  .filter_map(|container| container.ports.as_ref())
+                  .flatten()
+                  .filter(|port| {
+                      matches!(port.name.as_deref(), Some("http" | "http-0"))
+                        && matches!(port.protocol.as_deref(), None | Some("TCP"))
+                  })
+                  .filter_map(|port| u16::try_from(port.container_port).ok())
+                  .filter(|&port| port != 0)
+                  .collect()
+        })
+        .unwrap_or_default();
+
+    match container_ports.as_slice() {
+        [port] => vec![*port],
+        [] => vec![config.port],
+        _ => {
+            warn!(
+            "Pod {}: multiple HTTP ports {:?}, configure worker-ports explicitly",
+            pod_name, container_ports
+        );
             vec![config.port]
         }
     }
@@ -484,22 +484,55 @@ fn resolve_bootstrap_ports(
     config: &ServiceDiscoveryConfig,
     num_ports: usize,
 ) -> Vec<Option<u16>> {
-    let Some(raw) = pod
+    let raw= pod
         .metadata
         .annotations
         .as_ref()
-        .and_then(|annotations| annotations.get(&config.bootstrap_port_annotation))
-    else {
-        return vec![None; num_ports];
-    };
-    match parse_port_list(raw) {
-        Some(ports) if ports.len() == 1 => vec![Some(ports[0]); num_ports],
-        Some(ports) if ports.len() == num_ports => ports.into_iter().map(Some).collect(),
+        .and_then(|annotations| annotations.get(&config.bootstrap_port_annotation));
+
+    if let Some(raw) = raw {
+        match parse_port_list(raw) {
+            Some(ports) if ports.len() == 1 => {
+                return vec![Some(ports[0]); num_ports];
+            },
+            Some(ports) if ports.len() == num_ports => {
+                return ports.into_iter().map(Some).collect();
+            },
+            _ => {
+                warn!(
+                    "Pod {}: {} annotation '{}' does not align with {} worker port(s), ignoring",
+                    pod_name, config.bootstrap_port_annotation, raw, num_ports
+                );
+            }
+        }
+    }
+
+    let container_ports: Vec<u16> = pod
+        .spec
+        .as_ref()
+        .map(|spec| {
+            spec.containers
+                .iter()
+                .filter_map(|container| container.ports.as_ref())
+                .flatten()
+                .filter(|port| {
+                    matches!(port.name.as_deref(), Some("bootstrap"))
+                        && matches!(port.protocol.as_deref(), None | Some("TCP"))
+                })
+                .filter_map(|port| u16::try_from(port.container_port).ok())
+                .filter(|&port| port != 0)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    match container_ports.as_slice() {
+        [port] => vec![Some(*port); num_ports],
+        [] => vec![None; num_ports],
         _ => {
             warn!(
-                "Pod {}: {} annotation '{}' does not align with {} worker port(s), ignoring",
-                pod_name, config.bootstrap_port_annotation, raw, num_ports
-            );
+            "Pod {}: multiple bootstrap ports {:?}, configure bootstrap-ports explicitly",
+            pod_name, container_ports
+        );
             vec![None; num_ports]
         }
     }
@@ -530,45 +563,45 @@ fn run_service_discovery(
     app_context: Arc<AppContext>,
 ) -> task::JoinHandle<()> {
     // Log the appropriate selectors based on mode
-    if config.disaggregated_mode {
-        let encode_selector = config
-            .encode_selector
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(",");
 
-        let prefill_selector = config
-            .prefill_selector
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(",");
+    let encode_selector = config
+        .encode_selector
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",");
 
-        let decode_selector = config
-            .decode_selector
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(",");
+    let prefill_selector = config
+        .prefill_selector
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",");
 
-        info!(
-            "Starting K8s service discovery | disaggregated mode | encode: '{}' | prefill: '{}' | decode: '{}'",
-            encode_selector, prefill_selector, decode_selector
-        );
-    } else {
-        let label_selector = config
-            .selector
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(",");
+    let decode_selector = config
+        .decode_selector
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",");
 
-        info!(
-            "Starting K8s service discovery | selector: '{}'",
-            label_selector
-        );
-    }
+    info!(
+        "Starting K8s service discovery | disaggregated mode | encode: '{}' | prefill: '{}' | decode: '{}'",
+        encode_selector, prefill_selector, decode_selector
+    );
+
+    let label_selector = config
+        .selector
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    info!(
+        "Starting K8s service discovery | selector: '{}'",
+        label_selector
+    );
+
 
     #[expect(
         clippy::disallowed_methods,
@@ -646,15 +679,11 @@ fn run_service_discovery(
 }
 
 fn worker_type_for(pod_type: Option<&PodType>, disaggregated_mode: bool) -> WorkerType {
-    if disaggregated_mode {
-        match pod_type {
-            Some(PodType::Encode) => WorkerType::Encode,
-            Some(PodType::Prefill) => WorkerType::Prefill,
-            Some(PodType::Decode) => WorkerType::Decode,
-            _ => WorkerType::Regular,
-        }
-    } else {
-        WorkerType::Regular
+    match pod_type {
+        Some(PodType::Encode) => WorkerType::Encode,
+        Some(PodType::Prefill) => WorkerType::Prefill,
+        Some(PodType::Decode) => WorkerType::Decode,
+        _ => WorkerType::Regular,
     }
 }
 
@@ -1093,12 +1122,12 @@ mod tests {
             status: "Running".into(),
             is_ready: true,
             pod_type: None,
-            tcp_port: None,
             ports: vec![],
             bootstrap_ports: vec![],
             kv_connector: None,
             kv_engine_ids: vec![],
             model_id_override: None,
+            restart_count: Some(0),
         };
         assert!(healthy_pod.is_healthy());
 
@@ -1109,12 +1138,12 @@ mod tests {
             status: "Running".into(),
             is_ready: false,
             pod_type: None,
-            tcp_port: None,
             ports: vec![],
             bootstrap_ports: vec![],
             kv_connector: None,
             kv_engine_ids: vec![],
             model_id_override: None,
+            restart_count: Some(0),
         };
         assert!(!not_ready_pod.is_healthy());
 
@@ -1125,12 +1154,12 @@ mod tests {
             status: "Pending".into(),
             is_ready: true,
             pod_type: None,
-            tcp_port: None,
             ports: vec![],
             bootstrap_ports: vec![],
             kv_connector: None,
             kv_engine_ids: vec![],
             model_id_override: None,
+            restart_count: Some(0),
         };
         assert!(!not_running_pod.is_healthy());
     }
