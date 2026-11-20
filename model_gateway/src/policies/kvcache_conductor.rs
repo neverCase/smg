@@ -227,10 +227,10 @@ impl KvcacheConductorPolicy {
                 .map(String::as_str)
                 .unwrap_or("");
 
-            let cache_domain = match worker.kv_engine_id() {
+            let cache_domain = match worker.mooncake_cache_domain() {
                 Some(m) => m,
                 None => {
-                    warn!("Worker - pod name: {} uid: {} has no kv_engine_id", pod_name, pod_uid);
+                    warn!("Worker - pod name: {} uid: {} has no mooncake_cache_domain", pod_name, pod_uid);
                     continue;
                 }
             };
@@ -248,17 +248,17 @@ impl KvcacheConductorPolicy {
             }
 
             // replace url
-            let connector_str = match worker.kv_connector() {
+            let connector_str = match worker.mooncake_dns_address() {
                 Some(m) => m,
                 None => {
-                    warn!("Worker - pod name: {} uid: {} has no mooncake_url", pod_name, pod_uid);
+                    warn!("Worker - pod name: {} uid: {} has no mooncake_dns_address", pod_name, pod_uid);
                     continue;
                 }
             };
             let (namespace, _) = match connector_str.split_once('/') {
                 Some((s, ns)) => (s.to_string(), ns.to_string()),
                 None => {
-                    warn!("Worker - pod name: {} uid: {} has invalid mooncake_url format (missing '/')", pod_name, pod_uid);
+                    warn!("Worker - pod name: {} uid: {} has invalid mooncake_dns_address format (missing '/')", pod_name, pod_uid);
                     continue;
                 }
             };
@@ -370,11 +370,21 @@ impl KvcacheConductorPolicy {
 
     pub fn check_cache_hit(
         &self,
-        conductor_instance_match: &ConductorInstanceMatch,
+        conductor_rank_match: &ConductorRankMatch,
         token_ids_length: usize,
     ) -> f64 {
         // todo use GPU_local
-        conductor_instance_match.longest_matched as f64 / token_ids_length as f64
+        let max_match = [
+            conductor_rank_match.device,
+            conductor_rank_match.cpu_local,
+            conductor_rank_match.cpu_share,
+            conductor_rank_match.disk
+        ]
+            .into_iter()
+            .max()
+            .unwrap();
+        
+        max_match as f64 / token_ids_length as f64
     }
 
     pub fn candidate_requires_spill(
@@ -402,6 +412,7 @@ impl LoadBalancingPolicy for KvcacheConductorPolicy {
                     cpu_local = hit.cpu_local,
                     cpu_share = hit.cpu_share,
                     disk = hit.disk,
+                    rank_matches = ?hit.rank_matches,
                     "Conductor result reached worker selection"
                 );
             }
@@ -425,9 +436,18 @@ impl LoadBalancingPolicy for KvcacheConductorPolicy {
 
                 let pod_uid = worker.metadata().spec.labels.get(POD_UID_LABEL)?;
                 let restart_count = worker.restart_count()?;
+
                 let instance_id = format!("xhive-{}-{}", pod_uid, restart_count);
                 let hit = matches.instances.get(&instance_id)?;
-                let hit_percent = self.check_cache_hit(hit, token_ids_length);
+
+                let rank = match worker.dp_rank() {
+                    Some(rank) => rank,
+                    None if worker.dp_size() == Some(1) => 0,
+                    None => return None,
+                };
+                let rank_match = hit.rank_matches.get(&rank.to_string())?;
+
+                let hit_percent = self.check_cache_hit(rank_match, token_ids_length);
                 info!("Instance {} hit percent {} cache threshold {}",
                         instance_id,
                         hit_percent,

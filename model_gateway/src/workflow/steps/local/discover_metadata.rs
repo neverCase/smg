@@ -69,6 +69,16 @@ pub struct ModelInfo {
     pub architectures: Option<Vec<String>>,
 }
 
+// {"0":{"engine_id":"9cb7c5a5-c12a-4cc0-b2ef-135795179ec4_dp0","worker_addr":{"0":{"0":"tcp://10.244.0.179:43645"}}},
+// "1":{"engine_id":"9cb7c5a5-c12a-4cc0-b2ef-135795179ec4_dp1","worker_addr":{"0":{"0":"tcp://10.244.0.179:35019"}}}}
+pub type VllmMooncakeQueryResponse = HashMap<usize, VllmMooncakeEngineEntry>;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VllmMooncakeEngineEntry {
+    pub engine_id: String,
+    pub worker_addr: HashMap<usize, HashMap<usize, String>>,
+}
+
 /// Single entry from `/v1/models` (shared by sglang and vllm).
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct ModelsResponseEntry {
@@ -325,6 +335,34 @@ async fn fetch_vllm_block_size(
     Ok(None)
 }
 
+pub async fn fetch_vllm_mooncake_query(
+    client: &Client,
+    url: &str,
+    bootstrap_port: Option<u16>,
+    api_key: Option<&str>,
+) -> Result<VllmMooncakeQueryResponse, String> {
+    let port = bootstrap_port
+        .ok_or_else(|| format!("Missing Mooncake bootstrap port for {url}"))?;
+
+    let mut query_url =
+        reqwest::Url::parse(&http_base_url(url))
+            .map_err(|e| format!("Invalid worker URL {url}: {e}"))?;
+    
+    query_url
+        .set_port(Some(port))
+        .map_err(|_| format!("Cannot set bootstrap port on {url}"))?;
+
+    query_url.set_path("/query");
+    query_url.set_query(None);
+    query_url.set_fragment(None);
+
+    http_get_json::<VllmMooncakeQueryResponse>(
+        client,
+        query_url.as_str(),
+        api_key,
+    )
+    .await
+}
 /// Re-read the KV transfer engine id a gRPC engine reports, for a PD worker
 /// that came back on the same address (#2491): a restarted engine process
 /// carries a new id, and a handoff minted for the old one strands the decode.

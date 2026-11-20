@@ -20,6 +20,7 @@ COMMON_POLICY_CHOICES = [
     "manual",
     "consistent_hashing",
     "prefix_hash",
+    "kvcache_conductor"
 ]
 
 PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
@@ -535,7 +536,7 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=[*COMMON_POLICY_CHOICES, "kvcache_conductor"],
+            choices=[*COMMON_POLICY_CHOICES],
             help=(
                 "Load balancing policy to use. In PD mode, this is used for both prefill and decode"
                 " unless overridden"

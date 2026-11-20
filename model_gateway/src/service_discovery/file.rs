@@ -156,6 +156,8 @@ struct ManifestWorker {
     kv_role: Option<String>,
     kv_engine_id: Option<String>,
     restart_count: Option<i32>,
+    mooncake_cache_domain: Option<String>,
+    mooncake_dns_address: Option<String>,
 }
 
 impl ManifestWorker {
@@ -204,6 +206,8 @@ impl ManifestWorker {
             kv_engine_id: self.kv_engine_id,
             restart_count: self.restart_count,
             compat_labels: BTreeMap::new(),
+            mooncake_cache_domain: self.mooncake_cache_domain,
+            mooncake_dns_address: self.mooncake_dns_address
         })
     }
 }

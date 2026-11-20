@@ -566,7 +566,7 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket", "kvcache_conductor"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode

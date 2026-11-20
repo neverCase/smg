@@ -56,6 +56,7 @@ pub(crate) use smg_external_router::sglang_fields;
 pub use smg_external_router::{retry, sse};
 pub(crate) mod sse_rechunk;
 pub mod worker_selection;
+pub mod conductor;
 
 /// Threshold above which upstream request bodies are sent as one-shot
 /// streams. A streamed body's `try_clone()` is `None` in every layer that

@@ -882,6 +882,14 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().spec.restart_count.clone()
     }
 
+    fn mooncake_cache_domain(&self) -> Option<String> {
+        self.metadata().spec.mooncake_cache_domain.clone()
+    }
+
+    fn mooncake_dns_address(&self) -> Option<String> {
+        self.metadata().spec.mooncake_dns_address.clone()
+    }
+
     fn kv_connector(&self) -> Option<String> {
         self.metadata().spec.kv_connector.clone()
     }

@@ -18,6 +18,7 @@ use kube::{
 };
 use openai_protocol::worker::WorkerType;
 use rustls::crypto::ring;
+use serde::{Deserialize, Serialize};
 use tokio::{sync::Notify, task, time};
 use tracing::{debug, error, info, warn};
 
@@ -225,6 +226,8 @@ pub struct PodInfo {
     pub kv_engine_ids: Vec<Option<String>>,
     pub model_id_override: Option<String>,
     pub restart_count: Option<i32>,
+    pub mooncake_cache_domain: Option<String>,
+    pub mooncake_dns_address: Option<String>,
 }
 
 impl PodInfo {
@@ -312,15 +315,6 @@ impl PodInfo {
             vec![None; ports.len()]
         };
 
-        let kv_connector = annotation_value(pod, MOONCAKE_URL_ANNOTATION)
-            .map(|s| s.to_string());
-
-        let mut kv_engine_ids: Vec<Option<String>> = Vec::new();
-        kv_engine_ids.push(
-            annotation_value(pod, MOONCAKE_CACHE_DOMAIN_ANNOTATION)
-                .map(|s| s.to_string())
-        );
-
         // let kv_connector = config.and_then(|config| {
         //     let connector = annotation_value(pod, &config.kv_connector_annotation)?;
         //     if connector != MOONCAKE_CONNECTOR && connector != NIXL_CONNECTOR {
@@ -332,9 +326,17 @@ impl PodInfo {
         //     }
         //     Some(connector.to_string())
         // });
-        // let kv_engine_ids = config
-        //     .map(|config| resolve_kv_engine_ids(&name, pod, config, ports.len()))
-        //     .unwrap_or_else(|| vec![None; ports.len()]);
+        // todo temporarily
+        let kv_connector = Some(MOONCAKE_CONNECTOR.to_string());
+        let kv_engine_ids = config
+            .map(|config| resolve_kv_engine_ids(&name, pod, config, ports.len()))
+            .unwrap_or_else(|| vec![None; ports.len()]);
+
+        let mooncake_cache_domain = annotation_value(pod, MOONCAKE_CACHE_DOMAIN_ANNOTATION)
+            .map(|s| s.to_string());
+
+        let mooncake_dns_address = annotation_value(pod, MOONCAKE_URL_ANNOTATION)
+            .map(|s| s.to_string());
 
         // Extract model_id override from pod metadata if source is configured
         let model_id_override = config
@@ -363,6 +365,8 @@ impl PodInfo {
             kv_engine_ids,
             model_id_override,
             restart_count,
+            mooncake_cache_domain,
+            mooncake_dns_address,
         })
     }
 
@@ -742,6 +746,8 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
                     (POD_NAME_LABEL.to_string(), info.name.clone()),
                     (POD_UID_LABEL.to_string(), info.uid.clone()),
                 ]),
+                mooncake_cache_domain: info.mooncake_cache_domain.clone(),
+                mooncake_dns_address: info.mooncake_dns_address.clone(),
             });
         }
     }

@@ -64,7 +64,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             labels.insert(key.clone(), value.clone());
         }
 
-        let (kv_connector, kv_role, kv_engine_id) = take_kv_transfer_metadata(config, &mut labels);
+        let (kv_connector, kv_role, fallback_engine_id) = take_kv_transfer_metadata(config, &mut labels);
 
         let model_id = resolve_model_id(config, &labels);
         // ZMQ EngineCore does not report a served model name over the wire, so a
@@ -220,6 +220,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             resolve_zmq_health_config(config.health.apply_to(&health_base), *connection_mode, &url);
         let health_endpoint = &app_context.router_config.health_check.endpoint;
 
+        let dp_info = context.data.dp_info.as_ref();
+        let engine_ids = dp_info.and_then(|info| info.engine_ids.as_ref());
+
         let dp_ranks: Vec<Option<(usize, usize)>> = if app_context.router_config.dp_aware {
             dp_rank_expansion(context.data.dp_info.as_ref(), *connection_mode, &config.url)?
         } else {
@@ -238,11 +241,13 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         spec.url.clone_from(&url);
         spec.dp_base_url = None;
         spec.dp_rank = None;
-        spec.dp_size = None;
+        // spec.dp_size = None;
+        spec.dp_size = dp_info
+            .filter(|info| info.dp_size == 1)
+            .map(|_| 1);
         spec.kv_connector = None;
         spec.kv_role = None;
         spec.kv_engine_id = None;
-        spec.restart_count = config.restart_count;
 
         if spec.kv_block_size.is_none() {
             spec.kv_block_size = labels.get("page_size")
@@ -275,7 +280,38 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 if let Some(ref r) = kv_role {
                     builder = builder.kv_role(r);
                 }
-                if let Some(ref e) = kv_engine_id {
+                let worker_engine_id =  match engine_ids {
+                    Some(ids) => {
+                        let rank = match dp {
+                            Some((rank, _)) => rank,
+                            None if dp_info.is_some_and(|info| info.dp_size == 1) => 0,
+                            None => {
+                                return Err(WorkflowError::StepFailed {
+                                    step_id: StepId::new("create_worker"),
+                                    message: format!(
+                                        "Cannot select a DP engine without a rank for {}",
+                                        config.url
+                                    ),
+                                });
+                            }
+                        };
+
+                        let id = ids
+                            .get(&rank)
+                            .filter(|id| !id.is_empty())
+                            .ok_or_else(|| WorkflowError::StepFailed {
+                                step_id: StepId::new("create_worker"),
+                                message: format!(
+                                    "Missing engine_id for DP rank {rank} of {}",
+                                    config.url
+                                ),
+                            })?;
+
+                        Some(id.as_str())
+                    }
+                    None => fallback_engine_id.as_deref(),
+                };
+                if let Some(e) = worker_engine_id {
                     builder = builder.kv_engine_id(e);
                 }
                 if let Some(ref address) = config.zmq_handshake_address {
@@ -293,9 +329,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     builder.connect_signal_tx(app_context.worker_registry.connect_signal_sender());
 
                 // Builder sets initial status: Pending if health-checked, Ready if not.
-                Arc::new(builder.build()) as Arc<dyn Worker>
+                Ok(Arc::new(builder.build()) as Arc<dyn Worker>)
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         debug!(
             "Created {} worker(s) for {} ({:?}, {} labels)",
@@ -1092,6 +1128,7 @@ mod tests {
         let multi = DpInfo {
             dp_size: 3,
             model_id: "m".to_string(),
+            engine_ids: None,
         };
         assert_eq!(
             dp_rank_expansion(Some(&multi), ConnectionMode::Grpc, "grpc://w:1").unwrap(),
@@ -1103,6 +1140,7 @@ mod tests {
         let single = DpInfo {
             dp_size: 1,
             model_id: "m".to_string(),
+            engine_ids: None,
         };
         assert_eq!(
             dp_rank_expansion(Some(&single), ConnectionMode::Grpc, "grpc://w:1").unwrap(),

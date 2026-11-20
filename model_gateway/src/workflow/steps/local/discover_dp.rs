@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use openai_protocol::worker::WorkerSpec;
+use openai_protocol::worker::{WorkerSpec, WorkerType};
 use reqwest::Client;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::discover_metadata::get_server_info;
+use super::discover_metadata::{fetch_vllm_mooncake_query, get_server_info};
 use crate::{
     worker::{ConnectionMode, UNKNOWN_MODEL_ID},
     workflow::data::{WorkerKind, WorkerWorkflowData},
@@ -18,11 +18,45 @@ use crate::{
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DpInfo {
     pub dp_size: usize,
+    /// only used in sglang d/p
     pub model_id: String,
+    /// only exist in vllm engine
+    pub engine_ids: Option<HashMap<usize, String>>,
+}
+
+pub async fn get_vllm_dp_info(
+    client: &Client,
+    url: &str,
+    bootstrap_port: Option<u16>,
+    api_key: Option<&str>,
+) -> Result<DpInfo, String> {
+    let info = fetch_vllm_mooncake_query(
+        client,
+        url,
+        bootstrap_port,
+        api_key
+    )
+    .await?;
+
+    let dp_size = info.len();
+    if dp_size == 0 {
+        return Err(format!("No DP engines registered for {url}"));
+    }
+
+    let engine_ids = info
+        .into_iter()
+        .map(|(dp_rank, entry)| (dp_rank, entry.engine_id))
+        .collect::<HashMap<usize, String>>();
+
+    Ok(DpInfo {
+        dp_size,
+        model_id: UNKNOWN_MODEL_ID.to_string(),
+        engine_ids: Some(engine_ids),
+    })
 }
 
 /// Get DP info for a worker URL.
-pub async fn get_dp_info(
+pub async fn get_sglang_dp_info(
     client: &Client,
     url: &str,
     api_key: Option<&str>,
@@ -43,7 +77,7 @@ pub async fn get_dp_info(
         })
         .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
 
-    Ok(DpInfo { dp_size, model_id })
+    Ok(DpInfo { dp_size, model_id, engine_ids: None })
 }
 
 /// Build DP info from gRPC-discovered metadata labels (`dp_size` is reported
@@ -58,6 +92,7 @@ pub fn dp_info_from_labels(labels: &HashMap<String, String>) -> Result<DpInfo, S
     Ok(DpInfo {
         dp_size,
         model_id: model_id_from_labels(labels),
+        engine_ids: None,
     })
 }
 
@@ -86,6 +121,7 @@ fn zmq_dp_info(config: &WorkerSpec, labels: &HashMap<String, String>) -> DpInfo 
     DpInfo {
         dp_size: config.dp_size.unwrap_or(1).max(1),
         model_id: model_id_from_labels(labels),
+        engine_ids: None,
     }
 }
 
@@ -146,21 +182,44 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
                 // HTTP DP discovery uses SGLang's /server_info which exposes
                 // dp_size — other runtimes don't expose DP info this way
                 let runtime = context.data.detected_runtime_type.as_deref();
-                if runtime != Some("sglang") {
-                    warn!(
-                        "DP discovery is not supported for {} HTTP workers ({}), skipping",
-                        runtime.unwrap_or("unknown"),
-                        config.url
-                    );
-                    return Ok(StepResult::Success);
-                }
                 let client = context.data.http_client("discover_dp_info")?;
-                get_dp_info(&client, &config.url, config.api_key.as_deref())
-                    .await
-                    .map_err(|e| WorkflowError::StepFailed {
-                        step_id: StepId::new("discover_dp_info"),
-                        message: format!("Failed to get DP info: {e}"),
-                    })?
+                match runtime {
+                    Some("sglang" | "vllm") if config.worker_type == WorkerType::Decode =>
+                        {
+                            context.data.dp_info = None;
+                            return Ok(StepResult::Success);
+                        }
+
+                    Some("sglang") => {
+                        get_sglang_dp_info(&client, &config.url, config.api_key.as_deref())
+                            .await
+                            .map_err(|e| WorkflowError::StepFailed {
+                                step_id: StepId::new("discover_dp_info"),
+                                message: format!("Failed to get DP info: {e}"),
+                            })?
+                    }
+                    Some("vllm") => {
+                        get_vllm_dp_info(
+                            &client,
+                            &config.url,
+                            config.bootstrap_port,
+                            config.api_key.as_deref()
+                        )
+                        .await
+                        .map_err(|e| WorkflowError::StepFailed {
+                            step_id: StepId::new("discover_dp_info"),
+                            message: format!("Failed to get DP info: {e}"),
+                        })?
+                    }
+                    _ => {
+                        warn!(
+                            "DP discovery is not supported for {} HTTP workers ({}), skipping",
+                            runtime.unwrap_or("unknown"),
+                            config.url
+                        );
+                        return Ok(StepResult::Success);
+                    }
+                }
             }
         };
 

@@ -45,7 +45,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, warn, Instrument};
 
 use llm_tokenizer::registry::TokenizerRegistry;
-use llm_multimodal::MediaPartOrder;
 
 use crate::{
     app_context::AppContext,
@@ -88,7 +87,6 @@ use crate::{
         gateway::Gateway,
         grpc::{
             utils::{error_type_from_status, route_to_endpoint},
-            multimodal, utils,
         },
         http::{
             request_body::{
@@ -220,46 +218,6 @@ impl Router {
             webrtc_bind_addr: ctx.webrtc_bind_addr,
             webrtc_stun_server: ctx.webrtc_stun_server.clone(),
         })
-    }
-
-    async fn tokenizer_conductor_chat(
-        &self,
-        model_id: &str,
-        request: &ChatCompletionRequest,
-    ) -> Result<Vec<u32>, String> {
-
-        if !multimodal::media_plan_chat(&request.messages).is_empty() {
-            return Err(
-                "Conductor tokenization currently supports text-only chat"
-                    .to_string(),
-            );
-        }
-
-        let tokenizer = self.tokenizer_registry.get(model_id).ok_or_else(|| {
-            format!("Tokenizer not found for model: {model_id}")
-        })?;
-
-        utils::validate_chat_content_parts(&request.messages)?;
-
-        let render_request = utils::request_as_rendered(request);
-
-        let (processed, prompt_encoding) =
-            utils::process_chat_messages_with_placeholders(
-                &render_request.as_ref(),
-                tokenizer.as_ref(),
-                None,
-                MediaPartOrder::MediaFirst
-            )?;
-
-        let encoding = utils::encode_prompt_blocking(
-            tokenizer,
-            &processed.text,
-            prompt_encoding,
-        )
-        .await
-        .map_err(|e| format!("Tokenizer encoding failed: {e}"))?;
-
-        Ok(encoding.token_ids().to_vec())
     }
 
     fn select_first_worker(&self) -> Result<Arc<dyn Worker>, String> {
@@ -495,32 +453,13 @@ impl Router {
         let model_id = canonical_model.as_deref().unwrap_or(model_id);
 
         // todo conductor
-        let policy = self.policy_registry.get_policy_or_default(model_id);
-        let use_conductor = policy.as_any().is::<KvcacheConductorPolicy>();
-        let conductor_tokens: Option<Arc<[u32]>> = if use_conductor {
-            match typed_req.as_chat_request() {
-                Some(chat_req) => {
-                    match self
-                        .tokenizer_conductor_chat(model_id, chat_req)
-                        .await
-                    {
-                        Ok(tokens) => Some(tokens.into()),
-                        Err(error) => {
-                            warn!(
-                                model = model_id,
-                                %error,
-                                "Conductor tokenization unavailable"
-                            );
-                            None
-                        }
-                    }
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-
+        let conductor_tokens: Option<Arc<[u32]>> = conductor::prepare_conductor_tokens(
+            self.policy_registry.get_policy_or_default(model_id).as_ref(),
+            &self.tokenizer_registry,
+            model_id,
+            typed_req.as_chat_request()
+        )
+        .await;
 
         let model = model_id;
         let endpoint = route_to_endpoint(route);
@@ -2934,6 +2873,7 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
 }
 
 use async_trait::async_trait;
+use crate::routers::common::conductor;
 
 impl Router {
     /// Gather this router's per-request state for the shared decision matrix

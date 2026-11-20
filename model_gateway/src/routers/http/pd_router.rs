@@ -34,7 +34,7 @@ use serde_json::{
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, warn, Instrument};
-
+use llm_tokenizer::TokenizerRegistry;
 use super::{
     request_body::RawBody,
     stream_failure::{note_sent, on_frame_boundary, RelaySource, UpstreamCut},
@@ -79,6 +79,8 @@ use crate::{
         RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
 };
+use crate::policies::{ConductorQueryResponse, KvcacheConductorPolicy};
+use crate::routers::common::conductor;
 
 /// Why PD pair selection produced nothing.
 ///
@@ -125,10 +127,10 @@ impl From<PrefillAcquireError<Box<PairFailure>>> for PdSelectionFailure {
     }
 }
 
-#[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
+    pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     prefill_admission: Option<Arc<PrefillAdmission>>,
@@ -161,6 +163,18 @@ struct BootstrapFields {
     host: Box<RawValue>,
     port: Box<RawValue>,
     room: Box<RawValue>,
+}
+
+impl std::fmt::Debug for PDRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PDRouter")
+            .field("worker_registry", &self.worker_registry)
+            .field("policy_registry", &self.policy_registry)
+            .field("retry_config", &self.retry_config)
+            .field("prefill_admission", &self.prefill_admission)
+            .field("moriio_dp_turn", &self.moriio_dp_turn)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PDRouter {
@@ -268,6 +282,7 @@ impl PDRouter {
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
+            tokenizer_registry: Arc::clone(&ctx.tokenizer_registry),
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             prefill_admission: ctx.prefill_admission.clone(),
@@ -533,27 +548,64 @@ impl PDRouter {
     ) -> Response {
         // Admission may queue the request, so the selection inputs are copied
         // out of the lease's synchronous view first.
-        let (text, tokens, rid_key, cache_namespace) = lease.with_view(|view| {
+        let (
+            text,
+            tokens,
+            rid_key,
+            cache_namespace,
+            conductor_tokens
+        ) = lease.with_view(|view| {
             (
                 view.text.map(str::to_string),
                 view.tokens.map(Vec::from),
                 view.rid_key.map(str::to_string),
                 view.cache_namespace,
+                view.conductor_tokens.cloned()
             )
         });
+
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+
+        let conductor_matches: Option<ConductorQueryResponse> =
+            if let (Some(tokens), Some(conductor_policy)) = (
+                conductor_tokens.as_deref(),
+                prefill_policy.as_any().downcast_ref::<KvcacheConductorPolicy>(),
+        ) {
+                let pool = placement::candidates(
+                    &self.worker_registry,
+                    context.model_id,
+                    RoutingPool::HttpPrefill,
+                    None,
+                );
+
+                match conductor_policy.prepare_request(pool.as_slice(), tokens).await {
+                    Ok(response) => Some(response),
+                    Err(error) => {
+                        warn!(
+                            model = context.model_id,
+                            %error,
+                            "Conductor query failed"
+                        );
+                        None
+                    }
+                }
+        } else {
+            None
+        };
+
         let sticky_key = self.policy_registry.sticky_key(headers, rid_key.as_deref());
         let selected = self
             .select_pd_pair_with_admission(
                 context.model_id,
                 PlacementInputs {
                     text: text.as_deref(),
-                    tokens: tokens.as_deref(),
+                    tokens: conductor_tokens.as_deref().or(tokens.as_deref()),
                     headers: context.headers.as_ref(),
                     rid_key: rid_key.as_deref(),
                     cache_namespace,
                     candidate_filter: None,
                     tried: &[],
-                    conductor_matches: None,
+                    conductor_matches: conductor_matches.as_ref(),
                 },
                 sticky_key,
             )
@@ -794,15 +846,13 @@ impl PDRouter {
                     }
                     (None, None) => 1, // Use at least 1 to avoid no-op
                 };
-                let policy_prefill_rank =
-                    dp_rank_policy.select_dp_rank(prefill.as_ref(), estimated_cost);
-                let policy_decode_rank =
-                    dp_rank_policy.select_dp_rank(decode.as_ref(), estimated_cost);
-                if let Some(rank) = policy_prefill_rank {
-                    prefill_rank = Some(rank);
+                if prefill_rank.is_none() {
+                    prefill_rank =
+                        dp_rank_policy.select_dp_rank(prefill.as_ref(), estimated_cost);
                 }
-                if let Some(rank) = policy_decode_rank {
-                    decode_rank = Some(rank);
+                if decode_rank.is_none() {
+                    decode_rank =
+                        dp_rank_policy.select_dp_rank(decode.as_ref(), estimated_cost);
                 }
             }
 
@@ -1366,6 +1416,12 @@ impl PDRouter {
         guards: PdLoadGuards,
     ) -> Response {
         let (prefill_body, decode_body) = leg_bodies;
+        let (prefill_dp_rank, decode_dp_rank) = match &mode {
+            KvConnectorMode::Mooncake { .. } => {
+                (prefill.dp_rank(), decode.dp_rank())
+            }
+            _ => (dp_rank, dp_rank),
+        };
         let PdLoadGuards {
             prefill: prefill_guard,
             decode: decode_guard,
@@ -1402,7 +1458,7 @@ impl PDRouter {
                     headers,
                     false,
                 ),
-                dp_rank,
+                prefill_dp_rank,
             );
             let prefill_response = match send_with_stale_conn_retry(prefill_request).await {
                 Ok(response) => response,
@@ -1548,7 +1604,7 @@ impl PDRouter {
                 headers,
                 false,
             ),
-            dp_rank,
+            decode_dp_rank,
         );
         let decode_response = match send_with_stale_conn_retry(decode_request).await {
             Ok(response) => response,
@@ -2666,6 +2722,17 @@ impl RouterTrait for PDRouter {
             None
         };
 
+        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
+        let model_id = canonical_model.as_deref().unwrap_or(model_id);
+
+        let conductor_tokens = conductor::prepare_conductor_tokens(
+            self.policy_registry.get_prefill_policy().as_ref(),
+            &self.tokenizer_registry,
+            model_id,
+            Some(&body),
+        )
+        .await;
+
         // Calculate batch size
         let batch_size = Self::get_chat_batch_size(&body);
 
@@ -2677,7 +2744,7 @@ impl RouterTrait for PDRouter {
                 .derive_rid_key(body.rid())
                 .map(str::to_string),
             cache_namespace: CacheNamespace::derive(&body.cache_partition()),
-            conductor_tokens: None,
+            conductor_tokens,
         };
         let context = PDRequestContext {
             route: "/v1/chat/completions",
@@ -2977,10 +3044,11 @@ mod tests {
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
         PDRouter {
             worker_registry,
             policy_registry,
+            tokenizer_registry,
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             prefill_admission: None,

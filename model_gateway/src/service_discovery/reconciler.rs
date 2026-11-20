@@ -272,6 +272,8 @@ fn build_worker_spec(
     spec.kv_role.clone_from(&worker.kv_role);
     spec.kv_engine_id.clone_from(&worker.kv_engine_id);
     spec.restart_count.clone_from(&worker.restart_count);
+    spec.mooncake_cache_domain.clone_from(&worker.mooncake_cache_domain);
+    spec.mooncake_dns_address.clone_from(&worker.mooncake_dns_address);
     spec.api_key.clone_from(&app_context.router_config.api_key);
     spec.max_connection_attempts = app_context
         .router_config

@@ -145,6 +145,53 @@ impl PromScrape {
     fn has(&self, name: &str) -> bool {
         self.samples.get(name).is_some_and(|v| !v.is_empty())
     }
+
+    fn parse_for_rank(
+        text: &str,
+        rank_label: &str,
+        rank_usize: usize,
+    ) -> Self {
+        static LABEL_RE: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| {
+                regex::Regex::new(
+                    r#"([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)""#,
+                )
+                    .expect("valid label regex")
+            });
+
+        let rank_value = rank_usize.to_string();
+
+        let filtered = text
+            .lines()
+            .filter(|line| {
+                let line = line.trim();
+
+                if line.is_empty() || line.starts_with('#') {
+                    return false;
+                }
+
+                let Some(open) = line.find('{') else {
+                    return false;
+                };
+                let Some(close) = line.rfind('}') else {
+                    return false;
+                };
+                if close <= open {
+                    return false;
+                }
+
+                let labels = &line[open + 1..close];
+
+                LABEL_RE.captures_iter(labels).any(|capture| {
+                    &capture[1] == rank_label
+                        && &capture[2] == rank_value.as_str()
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Self::parse(&filtered)
+    }
 }
 
 /// DP rank load cache used by load-aware routing policies.
@@ -247,7 +294,7 @@ impl NativeLoadsPath {
 
     /// Where to probe this route on `worker`.
     fn probe_url(self, worker: &Arc<dyn Worker>) -> String {
-        let base = worker.url();
+        let base = worker.base_url();
         match self {
             // Sections beyond `core` degrade gracefully: an engine that does
             // not report them omits the fields, which deserialize to `None`.
@@ -1004,9 +1051,36 @@ impl WorkerMonitor {
         }
 
         match resp.json::<WorkerLoadResponse>().await {
-            Ok(response) if !response.loads.is_empty() => NativeLoads::Available(response),
-            // Our schema, no ranks reported yet — keep probing.
-            Ok(_) => NativeLoads::Inconclusive,
+            Ok(mut response) => {
+                if response.loads.is_empty() {
+                    return NativeLoads::Inconclusive;
+                }
+
+                if let Some(dp_rank) = worker.dp_rank() {
+                    if !response.ranks_are_dp_ranks() {
+                        return NativeLoads::Inconclusive;
+                    }
+
+                    let Ok(dp_rank) = i32::try_from(dp_rank) else {
+                        return NativeLoads::Inconclusive;
+                    };
+
+                    response.loads.retain(|load| {
+                        load.dp_rank == dp_rank
+                    });
+
+                    if response.loads.len() != 1 {
+                        return NativeLoads::Inconclusive;
+                    }
+
+                    response.dp_rank_count = 1;
+                    response.aggregate = None;
+                }
+
+                NativeLoads::Available(response)
+            }
+            // // Our schema, no ranks reported yet — keep probing.
+            // Ok(_) => NativeLoads::Inconclusive,
             // A 200 that is not a load response means something else is
             // mounted here; that is as definitive as a 404.
             Err(_) => NativeLoads::Absent,
@@ -1018,9 +1092,18 @@ impl WorkerMonitor {
     /// exposed as `vllm:gpu_cache_usage_perc` in vLLM v0 and renamed to
     /// `vllm:kv_cache_usage_perc` in vLLM v1, so accept either.
     async fn fetch_http_load_vllm(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
-        let url = format!("{}/metrics", worker.url());
+        let url = worker.endpoint_url("/metrics");
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
-        let m = PromScrape::parse(&body);
+        let dp_rank = worker.dp_rank();
+
+        let m = match dp_rank {
+            Some(rank) => PromScrape::parse_for_rank(
+                &body,
+                "engine",
+                rank,
+            ),
+            None => PromScrape::parse(&body),
+        };
 
         // Require the KV-usage gauge: it is the signal load-aware routing acts
         // on, and without it `token_usage` would default to `0.0` and make a
@@ -1029,7 +1112,17 @@ impl WorkerMonitor {
             .into_iter()
             .find(|name| m.has(name))?;
 
+        if !m.has("vllm:num_requests_running")
+            || !m.has("vllm:num_requests_waiting")
+        {
+            return None;
+        }
+
+        let snapshot_rank =
+            i32::try_from(dp_rank.unwrap_or(0)).ok()?;
+
         Some(Self::single_rank(SchedulerLoadSnapshot {
+            dp_rank: snapshot_rank,
             num_running_reqs: m.sum("vllm:num_requests_running") as i32,
             num_waiting_reqs: m.sum("vllm:num_requests_waiting") as i32,
             token_usage: m.mean(kv_usage),
@@ -1044,18 +1137,34 @@ impl WorkerMonitor {
     /// the `sglang:` metric prefix through v0.5.3 and switched to `sglang_`
     /// in v0.5.4+, so detect whichever is present and use it throughout.
     async fn fetch_http_load_sglang(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
-        let url = format!("{}/metrics", worker.url());
+        let url = worker.endpoint_url("/metrics");
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
-        let m = PromScrape::parse(&body);
+        let dp_rank = worker.dp_rank();
 
-        // Require the KV-usage gauge — the load signal routing acts on.
-        // Without it `token_usage` would default to 0.0 and hide real KV
-        // pressure, so report unavailable instead. Pick the prefix off it.
+        let m = match dp_rank {
+            Some(rank) => PromScrape::parse_for_rank(
+                &body,
+                "dp_rank",
+                rank,
+            ),
+            None => PromScrape::parse(&body),
+        };
+
         let prefix = ["sglang:", "sglang_"]
             .into_iter()
             .find(|p| m.has(&format!("{p}token_usage")))?;
 
+        let running = format!("{prefix}num_running_reqs");
+        let waiting = format!("{prefix}num_queue_reqs");
+
+        if !m.has(&running) || !m.has(&waiting) {
+            return None;
+        }
+
+        let snapshot_rank = i32::try_from(dp_rank.unwrap_or(0)).ok()?;
+
         Some(Self::single_rank(SchedulerLoadSnapshot {
+            dp_rank: snapshot_rank,
             num_running_reqs: m.sum(&format!("{prefix}num_running_reqs")) as i32,
             num_waiting_reqs: m.sum(&format!("{prefix}num_queue_reqs")) as i32,
             token_usage: m.mean(&format!("{prefix}token_usage")),

@@ -735,6 +735,7 @@ pub(crate) fn select_pair(
         return Err(fail(WorkerLeg::Decode, PlacementFailure::Unavailable));
     }
     info.leg = WorkerLeg::Decode;
+    info.conductor_matches = None;
     let Some(decode_idx) =
         policies.select_worker_for_model(&decode_policy, model_id, &decode, &info)
     else {

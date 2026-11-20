@@ -691,6 +691,12 @@ pub struct WorkerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_count: Option<i32>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mooncake_cache_domain: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mooncake_dns_address: Option<String>,
+
     /// Explicit PD pairing protocol. A prefill and a decode with this set
     /// pair only when the values are equal, and nothing derived about their
     /// transport, engine version or KV layout is compared. The same value
@@ -774,6 +780,8 @@ impl WorkerSpec {
             kv_engine_id: None,
             kv_block_size: None,
             restart_count: None,
+            mooncake_cache_domain: None,
+            mooncake_dns_address: None,
             pairing_protocol: None,
             health: HealthCheckUpdate::default(),
             http_pool: HttpPoolConfig::default(),

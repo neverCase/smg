@@ -503,16 +503,17 @@ pub(crate) fn moriio_side_channel_error(
 /// suffix the configured id as `{base}_dp{rank}`, so minting needs a pinned
 /// rank; unpinned DP>1 yields None (no mint — decode recomputes locally).
 pub(crate) fn effective_kv_engine_id(
-    base: Option<&str>,
+    engine_id: Option<&str>,
     dp_size: Option<usize>,
     dp_rank: Option<usize>,
 ) -> Option<String> {
-    let base = base.filter(|s| !s.is_empty())?;
-    if dp_size.unwrap_or(1) > 1 {
-        dp_rank.map(|rank| format!("{base}_dp{rank}"))
-    } else {
-        Some(base.to_string())
+    let engine_id = engine_id.filter(|s| !s.is_empty())?;
+
+    if dp_size.unwrap_or(1) > 1 && dp_rank.is_none() {
+        return None;
     }
+
+    Some(engine_id.to_string())
 }
 
 /// The connector mode for a PD pair, read off the prefill worker's metadata.
