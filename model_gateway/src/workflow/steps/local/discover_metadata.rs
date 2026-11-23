@@ -41,6 +41,7 @@ pub struct ServerInfo {
     pub served_model_name: Option<String>,
     pub tp_size: Option<usize>,
     pub dp_size: Option<usize>,
+    pub attn_dp_size: Option<usize>,
     pub pp_size: Option<usize>,
     pub load_balance_method: Option<String>,
     pub disaggregation_mode: Option<String>,
@@ -347,7 +348,7 @@ pub async fn fetch_vllm_mooncake_query(
     let mut query_url =
         reqwest::Url::parse(&http_base_url(url))
             .map_err(|e| format!("Invalid worker URL {url}: {e}"))?;
-    
+
     query_url
         .set_port(Some(port))
         .map_err(|_| format!("Cannot set bootstrap port on {url}"))?;

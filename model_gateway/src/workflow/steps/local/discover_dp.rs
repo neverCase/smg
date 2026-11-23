@@ -63,9 +63,15 @@ pub async fn get_sglang_dp_info(
 ) -> Result<DpInfo, String> {
     let info = get_server_info(client, url, api_key).await?;
 
-    let dp_size = info
+    let replica_dp  = info
         .dp_size
         .ok_or_else(|| format!("No dp_size in response from {url}"))?;
+    let attn_dp = info.attn_dp_size.unwrap_or(1);
+
+    let dp_size = replica_dp
+        .checked_mul(attn_dp)
+        .filter(|&n| n > 0)
+        .ok_or_else(|| format!("Invalid DP sizes from {url}"))?;
 
     let model_id = info
         .model_id
