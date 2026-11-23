@@ -118,7 +118,15 @@ impl PolicyFactory {
             }
             PolicyConfig::KvcacheConductor {
                 tenant_id,
-            } => Arc::new(KvcacheConductorPolicy::new(tenant_id.to_string())),
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+            } => Arc::new(KvcacheConductorPolicy::new(
+                tenant_id.clone(),
+                *cache_threshold,
+                *balance_abs_threshold,
+                *balance_rel_threshold,
+            )),
         }
     }
 

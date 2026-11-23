@@ -1134,6 +1134,8 @@ mod tests {
             kv_engine_ids: vec![],
             model_id_override: None,
             restart_count: Some(0),
+            mooncake_cache_domain: None,
+            mooncake_dns_address: None,
         };
         assert!(healthy_pod.is_healthy());
 
@@ -1150,6 +1152,8 @@ mod tests {
             kv_engine_ids: vec![],
             model_id_override: None,
             restart_count: Some(0),
+            mooncake_cache_domain: None,
+            mooncake_dns_address: None,
         };
         assert!(!not_ready_pod.is_healthy());
 
@@ -1166,6 +1170,8 @@ mod tests {
             kv_engine_ids: vec![],
             model_id_override: None,
             restart_count: Some(0),
+            mooncake_cache_domain: None,
+            mooncake_dns_address: None,
         };
         assert!(!not_running_pod.is_healthy());
     }

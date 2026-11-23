@@ -578,7 +578,7 @@ class RouterArgs:
             type=float,
             default=RouterArgs.cache_threshold,
             help=(
-                "Minimum matched-prefix share (0.0-1.0) before cache-aware routing"
+                "Minimum matched-prefix share (0.0-1.0) before cache_aware or kvcache_conductor"
                 " pins a request to a worker already holding that prefix"
             ),
         )
@@ -653,8 +653,9 @@ class RouterArgs:
             type=int,
             default=RouterArgs.balance_abs_threshold,
             help=(
-                "Spill gate, absolute part. Balancing is triggered if"
-                " `(max_load - min_load) > abs_threshold` and the relative threshold is also met."
+                "Spill gate, absolute part for cache_aware / kvcache_conductor:"
+                " the selected worker's load must exceed the healthy-fleet mean by this many"
+                " requests AND the relative threshold. Bucket compares max_load to min_load."
             ),
         )
         routing_group.add_argument(
@@ -663,8 +664,9 @@ class RouterArgs:
             type=float,
             default=RouterArgs.balance_rel_threshold,
             help=(
-                "Spill gate, relative part. Balancing is triggered if"
-                " `max_load > min_load * rel_threshold` and the absolute threshold is also met."
+                "Spill gate, relative part for cache_aware / kvcache_conductor:"
+                " the selected worker's load must exceed the healthy-fleet mean times this"
+                " factor AND the absolute threshold. Bucket compares max_load to min_load."
             ),
         )
         routing_group.add_argument(

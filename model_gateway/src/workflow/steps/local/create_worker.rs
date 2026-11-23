@@ -873,6 +873,10 @@ mod tests {
             kv_event_monitor: None,
             rl: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
+            kube_client: Arc::new(kube::Client::try_default().unwrap()),
+            kube_namespace: None,
+            draining_workloads: Arc::new(std::sync::Mutex::new(HashSet::new())),
+
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         })

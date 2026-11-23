@@ -1130,8 +1130,30 @@ pub enum PolicyConfig {
     #[serde(rename = "kvcache_conductor")]
     KvcacheConductor {
         tenant_id: String,
+        /// Minimum cache-hit share, using the same parameter as cache_aware.
+        #[serde(default = "default_cache_threshold", alias = "cache_match_threshold")]
+        cache_threshold: f32,
+        /// Absolute load margin above the healthy-fleet mean; both spill
+        /// thresholds must be exceeded before selecting the least-loaded worker.
+        #[serde(default = "default_balance_abs_threshold", alias = "spill_abs_threshold")]
+        balance_abs_threshold: usize,
+        /// Relative load margin (multiple of the healthy-fleet mean).
+        #[serde(default = "default_balance_rel_threshold", alias = "spill_rel_threshold")]
+        balance_rel_threshold: f32,
     },
 
+}
+
+fn default_cache_threshold() -> f32 {
+    0.3
+}
+
+fn default_balance_abs_threshold() -> usize {
+    64
+}
+
+fn default_balance_rel_threshold() -> f32 {
+    1.5
 }
 
 fn default_block_size() -> usize {

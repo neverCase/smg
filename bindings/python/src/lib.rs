@@ -822,6 +822,9 @@ impl Router {
                 },
                 PolicyType::KvcacheConductor => ConfigPolicyConfig::KvcacheConductor {
                     tenant_id: self.service_discovery_namespace.clone().unwrap_or_default(),
+                    cache_threshold: self.cache_threshold,
+                    balance_abs_threshold: self.balance_abs_threshold,
+                    balance_rel_threshold: self.balance_rel_threshold,
                 },
             })
         };

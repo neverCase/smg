@@ -282,7 +282,7 @@ struct CliArgs {
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket", "kvcache_conductor"], help_heading = "Routing Policy")]
     policy: String,
 
-    /// Minimum matched-prefix share (0.0-1.0) before cache-aware routing
+    /// Minimum matched-prefix share (0.0-1.0) before cache_aware or kvcache_conductor
     /// pins a request to a worker already holding that prefix; below it the
     /// request is load-balanced instead
     #[arg(
@@ -295,7 +295,7 @@ struct CliArgs {
 
     /// Spill gate, absolute part: a matched worker is skipped for the
     /// least-loaded one when its load exceeds the healthy-fleet mean by this
-    /// many requests AND by --balance-rel-threshold
+    /// many requests AND by --balance-rel-threshold (cache_aware / kvcache_conductor)
     #[arg(
         long,
         visible_alias = "spill-abs-threshold",
@@ -305,7 +305,7 @@ struct CliArgs {
     balance_abs_threshold: usize,
 
     /// Spill gate, relative part (multiple of the healthy-fleet mean); fires
-    /// only together with --balance-abs-threshold
+    /// only together with --balance-abs-threshold (cache_aware / kvcache_conductor)
     #[arg(
         long,
         visible_alias = "spill-rel-threshold",
@@ -1825,6 +1825,9 @@ impl CliArgs {
             },
             "kvcache_conductor" => PolicyConfig::KvcacheConductor {
                 tenant_id: self.service_discovery_namespace.clone().unwrap_or_default(),
+                cache_threshold: self.cache_threshold,
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
             },
             _ => PolicyConfig::RoundRobin,
         }

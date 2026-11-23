@@ -6,6 +6,7 @@ use std::{
     },
     collections::HashMap
 };
+use std::time::Instant;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -121,7 +122,12 @@ pub struct KvcacheConductorPolicy {
 }
 
 impl KvcacheConductorPolicy {
-    pub fn new(tenant_id: String) -> Self {
+    pub fn new(
+        tenant_id: String,
+        cache_threshold: f32,
+        balance_abs_threshold: usize,
+        balance_rel_threshold: f32,
+    ) -> Self {
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
@@ -129,9 +135,9 @@ impl KvcacheConductorPolicy {
             .expect("Failed to build client");
 
         Self {
-            cache_threshold: 0.4,
-            balance_abs_threshold: 10,
-            balance_rel_threshold: 1.1,
+            cache_threshold,
+            balance_abs_threshold,
+            balance_rel_threshold,
             load_scorer: LeastLoadPolicy::new().with_fixed_throughput(),
             tenant_id,
             client,
@@ -211,6 +217,7 @@ impl KvcacheConductorPolicy {
 
         let mut instance_with_block_size: HashMap<String, i32> = HashMap::new();
 
+        // todo sync query
         for (_, worker) in workers.iter().enumerate() {
             let pod_name = worker
                 .metadata()
@@ -241,12 +248,6 @@ impl KvcacheConductorPolicy {
                     continue;
                 }
             };
-            let key = format!("cache_domain-{}-block_size-{}", cache_domain, block_size);
-            if instance_with_block_size.contains_key(&key) {
-                warn!("Worker - pod name: {} uid: {} has duplicate kv_block_size", pod_name, pod_uid);
-                continue;
-            }
-
             // replace url
             let connector_str = match worker.mooncake_dns_address() {
                 Some(m) => m,
@@ -264,6 +265,11 @@ impl KvcacheConductorPolicy {
             };
             let url = format!("http://mooncake-conductor.{}.svc.cluster.local:13333/query", namespace);
 
+            let key = format!("connector_str-{}-cache_domain-{}-block_size-{}", connector_str, cache_domain, block_size);
+            if instance_with_block_size.contains_key(&key) {
+                warn!("Worker - pod name: {} uid: {} has duplicate kv_block_size", pod_name, pod_uid);
+                continue;
+            }
             let request = ConductorQueryRequest {
                 model: cache_domain,
                 block_size: block_size as i64,
@@ -273,7 +279,7 @@ impl KvcacheConductorPolicy {
                 cache_salt: None,
                 instance_id: None,
             };
-
+            let start = Instant::now();
             let response = match self.query_conductor(&url, &request).await {
                 Ok(response) => response,
                 Err(error) => {
@@ -289,9 +295,10 @@ impl KvcacheConductorPolicy {
             };
 
             info!(
-                "Conductor query response: instance_count={}, instance_ids={:?}",
+                "Conductor query response: instance_count={}, instance_ids={:?}, elapsed_ms={}",
                 response.instances.len(),
-                response.instances.keys().collect::<Vec<_>>()
+                response.instances.keys().collect::<Vec<_>>(),
+                start.elapsed().as_millis()
             );
 
             for (instance_id, hit) in response.instances {
@@ -383,7 +390,7 @@ impl KvcacheConductorPolicy {
             .into_iter()
             .max()
             .unwrap();
-        
+
         max_match as f64 / token_ids_length as f64
     }
 

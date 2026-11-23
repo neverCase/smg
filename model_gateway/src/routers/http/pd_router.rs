@@ -859,6 +859,8 @@ impl PDRouter {
             if let Some(p_rank) = prefill_rank {
                 Self::inject_dp_rank(&mut prefill_body, p_rank, "routed_dp_rank")
                     .map_err(serialization_error)?;
+                Self::inject_dp_rank(&mut prefill_body, p_rank, "disagg_prefill_dp_rank")
+                    .map_err(serialization_error)?;
                 Self::inject_dp_rank(&mut decode_body, p_rank, "disagg_prefill_dp_rank")
                     .map_err(serialization_error)?;
             }

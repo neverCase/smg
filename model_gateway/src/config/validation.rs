@@ -774,7 +774,27 @@ impl ConfigValidator {
 
                 Self::validate_cache_boundaries(cache_boundaries)?;
             }
-            PolicyConfig::KvcacheConductor { .. } => {}
+            PolicyConfig::KvcacheConductor {
+                cache_threshold,
+                balance_rel_threshold,
+                ..
+            } => {
+                if !(0.0..=1.0).contains(cache_threshold) {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cache_threshold".to_string(),
+                        value: cache_threshold.to_string(),
+                        reason: "Must be between 0.0 and 1.0".to_string(),
+                    });
+                }
+
+                if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "balance_rel_threshold".to_string(),
+                        value: balance_rel_threshold.to_string(),
+                        reason: "Must be finite and >= 1.0".to_string(),
+                    });
+                }
+            }
         }
         Ok(())
     }

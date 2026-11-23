@@ -164,6 +164,8 @@ mod tests {
             kv_role: None,
             kv_engine_id: None,
             restart_count: None,
+            mooncake_cache_domain: None,
+            mooncake_dns_address: None,
             compat_labels: BTreeMap::new(),
         }
     }
