@@ -195,7 +195,11 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
                             context.data.dp_info = None;
                             return Ok(StepResult::Success);
                         }
-
+                    Some("vllm") if config.worker_type == WorkerType::Regular =>
+                        {
+                            context.data.dp_info = None;
+                            return Ok(StepResult::Success);
+                        }
                     Some("sglang") => {
                         get_sglang_dp_info(&client, &config.url, config.api_key.as_deref())
                             .await
