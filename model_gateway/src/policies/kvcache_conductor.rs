@@ -175,7 +175,7 @@ impl KvcacheConductorPolicy {
                 info!("Conductor query response: status={}, body={}", status, body);
             }
             Err(error) => {
-                info!(
+                warn!(
                     "Conductor response decode failed: status={}, error={}, raw={:?}",
                     status, error, bytes
                 );

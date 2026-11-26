@@ -1,5 +1,6 @@
 use std::sync::Arc;
-use tracing::warn;
+use std::time::Instant;
+use tracing::{info, warn};
 use llm_multimodal::MediaPartOrder;
 use llm_tokenizer::TokenizerRegistry;
 use openai_protocol::chat::ChatCompletionRequest;
@@ -36,6 +37,7 @@ pub(crate) async fn tokenizer_conductor_chat(
     model_id: &str,
     request: &ChatCompletionRequest,
 ) -> Result<Vec<u32>, String> {
+    let start = Instant::now();
 
     if !multimodal::media_plan_chat(&request.messages).is_empty() {
         return Err(
@@ -65,8 +67,15 @@ pub(crate) async fn tokenizer_conductor_chat(
         &processed.text,
         prompt_encoding,
     )
-        .await
-        .map_err(|e| format!("Tokenizer encoding failed: {e}"))?;
+    .await
+    .map_err(|e| format!("Tokenizer encoding failed: {e}"))?;
+    
+    info!(
+        "Conductor tokenization: model_id={}, processed_text_len={}, elapsed_ms={}",
+        model_id,
+        processed.text.len(),
+        start.elapsed().as_millis()
+    );
 
     Ok(encoding.token_ids().to_vec())
 }
