@@ -16,7 +16,10 @@ use kube::{
     },
     Client,
 };
-use openai_protocol::worker::WorkerType;
+use openai_protocol::{
+    prefill::{PrefillDeviceSpec, PrefillHardwareSpec},
+    worker::WorkerType,
+};
 use rustls::crypto::ring;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Notify, task, time};
@@ -39,6 +42,7 @@ pub const POD_UID_LABEL: &str = "smg.ai/pod-uid";
 
 pub const MOONCAKE_URL_ANNOTATION: &str = "xhive.io/cache-pool";
 pub const MOONCAKE_CACHE_DOMAIN_ANNOTATION: &str = "xhive.io/cache-domain";
+pub const RESOURCE_SPEC_ANNOTATION: &str = "xhive.io/resource-spec";
 
 /// Source for per-worker model_id override during Kubernetes service discovery.
 #[derive(Debug, Clone)]
@@ -228,6 +232,8 @@ pub struct PodInfo {
     pub restart_count: Option<i32>,
     pub mooncake_cache_domain: Option<String>,
     pub mooncake_dns_address: Option<String>,
+    /// GPU allocation declared by this pod's resource-spec annotation.
+    pub hardware: Option<PrefillHardwareSpec>,
 }
 
 impl PodInfo {
@@ -367,6 +373,7 @@ impl PodInfo {
             restart_count,
             mooncake_cache_domain,
             mooncake_dns_address,
+            hardware: hardware_from_pod(pod),
         })
     }
 
@@ -451,6 +458,53 @@ fn annotation_value<'a>(pod: &'a Pod, key: &str) -> Option<&'a str> {
         .get(key)
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
+}
+
+/// Resource specs describe identical allocations per GPU. Their MB values use
+/// binary units, matching the platform's CPU-memory allocations (320 GiB = 327680 MB).
+fn hardware_from_pod(pod: &Pod) -> Option<PrefillHardwareSpec> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ResourceSpec {
+        gpu_count: u16,
+        gpu_model: Option<String>,
+        #[serde(rename = "gpuMemoryMB")]
+        gpu_memory_mb: Option<u64>,
+        gpu_cores: Option<u32>,
+    }
+
+    let raw = annotation_value(pod, RESOURCE_SPEC_ANNOTATION)?;
+    let resource: ResourceSpec = match serde_json::from_str(raw) {
+        Ok(resource) => resource,
+        Err(error) => {
+            warn!(pod = ?pod.metadata.name, %error, "Ignoring invalid GPU resource-spec annotation");
+            return None;
+        }
+    };
+    if resource.gpu_count == 0 {
+        return None;
+    }
+    let memory_bytes = match resource.gpu_memory_mb {
+        Some(mb) => match mb.checked_mul(1024 * 1024) {
+            Some(bytes) => Some(bytes),
+            None => {
+                warn!(pod = ?pod.metadata.name, "Ignoring overflowing GPU memory in resource-spec annotation");
+                None
+            }
+        },
+        None => None,
+    };
+    let device = PrefillDeviceSpec {
+        gpu_model: resource.gpu_model.filter(|model| !model.trim().is_empty()),
+        gpu_cores: resource.gpu_cores,
+        memory_bytes,
+        // The annotation does not identify devices or distributed ranks.
+        node: pod.spec.as_ref().and_then(|spec| spec.node_name.clone()),
+        ..Default::default()
+    };
+    Some(PrefillHardwareSpec {
+        devices: vec![device; usize::from(resource.gpu_count)],
+    })
 }
 
 /// Resolve one unique KV engine ID per worker port; unlike bootstrap ports,
@@ -748,6 +802,7 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
                 ]),
                 mooncake_cache_domain: info.mooncake_cache_domain.clone(),
                 mooncake_dns_address: info.mooncake_dns_address.clone(),
+                hardware: info.hardware.clone(),
             });
         }
     }
@@ -1136,6 +1191,7 @@ mod tests {
             restart_count: Some(0),
             mooncake_cache_domain: None,
             mooncake_dns_address: None,
+            hardware: None,
         };
         assert!(healthy_pod.is_healthy());
 
@@ -1154,6 +1210,7 @@ mod tests {
             restart_count: Some(0),
             mooncake_cache_domain: None,
             mooncake_dns_address: None,
+            hardware: None,
         };
         assert!(!not_ready_pod.is_healthy());
 
@@ -1172,6 +1229,7 @@ mod tests {
             restart_count: Some(0),
             mooncake_cache_domain: None,
             mooncake_dns_address: None,
+            hardware: None,
         };
         assert!(!not_running_pod.is_healthy());
     }
@@ -1200,6 +1258,71 @@ mod tests {
                 .collect(),
         );
         pod
+    }
+
+    #[test]
+    fn pod_info_carries_resource_spec_hardware_into_discovery() {
+        let config = make_regular_config();
+        let mut pod = pod_with_annotations(
+            "h20",
+            &[(
+                RESOURCE_SPEC_ANNOTATION,
+                r#"{"gpuModel":"NVIDIA-NVIDIA-H20","gpuCount":2,"gpuMemoryMB":97871,"gpuCores":100,"specName":"c32m320s1g2"}"#,
+            )],
+        );
+        pod.spec.as_mut().unwrap().node_name = Some("node-h20".to_owned());
+        let info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+        let hardware = info.hardware.as_ref().unwrap();
+        assert_eq!(hardware.devices.len(), 2);
+        for device in &hardware.devices {
+            assert_eq!(device.gpu_model.as_deref(), Some("NVIDIA-NVIDIA-H20"));
+            assert_eq!(device.memory_bytes, Some(102_625_181_696));
+            assert_eq!(device.gpu_cores, Some(100));
+            assert_eq!(device.node.as_deref(), Some("node-h20"));
+            assert!(device.uuid.is_none());
+            assert!(device.rank.is_none());
+        }
+        let desired = compute_desired_state(&[Arc::new(pod)], &config);
+        assert_eq!(desired.workers.len(), 1);
+        assert_eq!(
+            desired.workers.values().next().unwrap().hardware,
+            info.hardware
+        );
+    }
+
+    #[test]
+    fn unavailable_resource_spec_does_not_prevent_pod_discovery() {
+        let config = make_regular_config();
+        for raw in [
+            "",
+            "not-json",
+            "{}",
+            r#"{"gpuCount":0}"#,
+            r#"{"gpuCount":-1}"#,
+        ] {
+            let pod = pod_with_annotations("w", &[(RESOURCE_SPEC_ANNOTATION, raw)]);
+            let info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
+            assert!(info.hardware.is_none(), "{raw}");
+        }
+        let pod = pod_with_annotations("w", &[]);
+        assert!(PodInfo::from_pod(&pod, Some(&config))
+            .unwrap()
+            .hardware
+            .is_none());
+    }
+
+    #[test]
+    fn overflowing_gpu_memory_does_not_wrap_or_discard_other_hardware() {
+        let pod = pod_with_annotations(
+            "w",
+            &[(
+                RESOURCE_SPEC_ANNOTATION,
+                r#"{"gpuCount":1,"gpuMemoryMB":18446744073709551615,"gpuCores":50}"#,
+            )],
+        );
+        let hardware = PodInfo::from_pod(&pod, None).unwrap().hardware.unwrap();
+        assert_eq!(hardware.devices[0].memory_bytes, None);
+        assert_eq!(hardware.devices[0].gpu_cores, Some(50));
     }
 
     #[test]

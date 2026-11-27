@@ -184,7 +184,7 @@ pub struct PrefillExpertParallelSpec {
 }
 
 /// Devices assigned to this worker, not devices on the gateway host.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct PrefillHardwareSpec {
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -193,10 +193,12 @@ pub struct PrefillHardwareSpec {
 
 /// Stable device identity and placement; memory sizes are always bytes.
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct PrefillDeviceSpec {
     pub gpu_model: Option<String>,
+    /// Allocated GPU compute percentage (100 means a whole GPU), not CUDA core count.
+    pub gpu_cores: Option<u32>,
     /// GPU or MIG-device UUID, as appropriate for this allocation.
     pub uuid: Option<String>,
     pub memory_bytes: Option<u64>,
@@ -389,7 +391,7 @@ mod tests {
                 "chunked_prefill_size": 4096, "max_running_requests": 128
             },
             "hardware": {"devices": [{
-                "gpu_model": "test-gpu", "uuid": "GPU-example", "memory_bytes": 80000000000_u64,
+                "gpu_model": "test-gpu", "gpu_cores": 100, "uuid": "GPU-example", "memory_bytes": 80000000000_u64,
                 "rank": 0, "node": "node-1", "interconnect": "NVLink"
             }]},
             "predictor": {

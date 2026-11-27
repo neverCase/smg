@@ -240,6 +240,9 @@ fn build_worker_spec(
     let mut spec = WorkerSpec::new(worker.endpoint.render());
     spec.worker_type = worker.worker_type;
     spec.bootstrap_port = worker.bootstrap_port;
+    if let Some(hardware) = &worker.hardware {
+        spec.prefill.get_or_insert_with(Default::default).hardware = Some(hardware.clone());
+    }
     // A provider's compatibility labels go in first and verbatim, so the
     // provenance written after them always wins. Nothing under the reserved
     // prefix is taken from a provider: ownership comes from this module alone.
@@ -434,9 +437,10 @@ mod tests {
             kv_connector: None,
             kv_role: None,
             kv_engine_id: None,
-            restart_count: 0,
+            restart_count: None,
             mooncake_cache_domain: None,
             mooncake_dns_address: None,
+            hardware: None,
             compat_labels: BTreeMap::new(),
         }
     }
@@ -710,6 +714,17 @@ mod tests {
             kv_connector: Some("MooncakeConnector".to_string()),
             kv_role: Some("kv_producer".to_string()),
             kv_engine_id: Some("engine-1".to_string()),
+            hardware: Some(openai_protocol::prefill::PrefillHardwareSpec {
+                devices: vec![
+                    openai_protocol::prefill::PrefillDeviceSpec {
+                        gpu_model: Some("NVIDIA-NVIDIA-H20".to_owned()),
+                        gpu_cores: Some(100),
+                        memory_bytes: Some(102_625_181_696),
+                        ..Default::default()
+                    };
+                    2
+                ],
+            }),
             ..published("10.0.0.1:8081", "uid-1:8081")
         };
         let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &app_context);
@@ -720,6 +735,7 @@ mod tests {
         assert_eq!(spec.kv_connector.as_deref(), Some("MooncakeConnector"));
         assert_eq!(spec.kv_role.as_deref(), Some("kv_producer"));
         assert_eq!(spec.kv_engine_id.as_deref(), Some("engine-1"));
+        assert_eq!(spec.prefill.as_ref().unwrap().hardware, worker.hardware);
         assert_eq!(
             spec.labels.get("served_model_name").map(String::as_str),
             Some("llama")

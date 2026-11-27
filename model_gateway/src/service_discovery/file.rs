@@ -207,7 +207,8 @@ impl ManifestWorker {
             restart_count: self.restart_count,
             compat_labels: BTreeMap::new(),
             mooncake_cache_domain: self.mooncake_cache_domain,
-            mooncake_dns_address: self.mooncake_dns_address
+            mooncake_dns_address: self.mooncake_dns_address,
+            hardware: None,
         })
     }
 }

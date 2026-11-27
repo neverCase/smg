@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use openai_protocol::worker::WorkerType;
+use openai_protocol::{prefill::PrefillHardwareSpec, worker::WorkerType};
 
 use crate::{observability::metrics::metrics_labels, worker::endpoint::Endpoint};
 
@@ -74,6 +74,7 @@ pub(super) struct DiscoveredWorker {
     pub(super) restart_count: Option<i32>,
     pub(super) mooncake_cache_domain: Option<String>,
     pub(super) mooncake_dns_address: Option<String>,
+    pub(super) hardware: Option<PrefillHardwareSpec>,
     /// Labels a provider keeps writing for compatibility with what it wrote
     /// before discovery became provider-neutral — Kubernetes' Pod name and UID.
     /// The reconciler writes them verbatim and never interprets them. They are
@@ -112,6 +113,7 @@ impl DiscoveredWorker {
             restart_count,
             mooncake_cache_domain,
             mooncake_dns_address,
+            hardware,
         } = self;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"smg-discovered-worker-spec/v1");
@@ -128,6 +130,12 @@ impl DiscoveredWorker {
         hash_field(&mut hasher, restart_count.map(|r| r.to_string()).as_deref());
         hash_field(&mut hasher, mooncake_cache_domain.as_deref());
         hash_field(&mut hasher, mooncake_dns_address.as_deref());
+        // Serialized field order is stable, and every hardware field participates.
+        if let Some(hardware) = hardware {
+            let hardware = serde_json::to_string(hardware)
+                .expect("hardware consists only of serializable GPU fields");
+            hash_field(&mut hasher, Some(&hardware));
+        }
         hasher.finalize().to_hex().to_string()
     }
 }
@@ -166,6 +174,7 @@ mod tests {
             restart_count: None,
             mooncake_cache_domain: None,
             mooncake_dns_address: None,
+            hardware: None,
             compat_labels: BTreeMap::new(),
         }
     }
@@ -213,6 +222,12 @@ mod tests {
             },
             DiscoveredWorker {
                 kv_engine_id: Some("e".to_string()),
+                ..base.clone()
+            },
+            DiscoveredWorker {
+                hardware: Some(PrefillHardwareSpec {
+                    devices: vec![Default::default(); 2],
+                }),
                 ..base.clone()
             },
         ];
