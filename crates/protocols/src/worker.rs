@@ -18,6 +18,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;
 
 use super::model_card::ModelCard;
+pub use super::prefill::WorkerPrefillSpec;
 
 // ── Default value constants ──────────────────────────────────────────
 
@@ -636,6 +637,10 @@ pub struct WorkerSpec {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
 
+    /// Optional model, deployment and calibration metadata for prefill prediction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill: Option<WorkerPrefillSpec>,
+
     /// Worker priority (higher = preferred).
     #[serde(default = "default_priority")]
     pub priority: u32,
@@ -767,6 +772,7 @@ impl WorkerSpec {
             runtime_type: RuntimeType::default(),
             provider: None,
             labels: HashMap::new(),
+            prefill: None,
             priority: DEFAULT_WORKER_PRIORITY,
             cost: DEFAULT_WORKER_COST,
             api_key: None,

@@ -8,7 +8,7 @@ use openai_protocol::{
     model_type::ModelType,
     worker::{HealthCheckConfig, WorkerSpec, WorkerType},
 };
-use tracing::{debug, warn};
+use tracing::{debug, warn, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::discover_dp::DpInfo;
@@ -238,6 +238,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         // the merged labels with the KV transfer keys taken out, the KV
         // transfer fields as resolved, and the DP placement per rank.
         let mut spec = config.clone();
+        fill_worker_prefill(&mut spec, model_id, &labels).await;
+        info!("Creating worker with spec.prefill: {:?}", spec.prefill);
+
         spec.url.clone_from(&url);
         spec.dp_base_url = None;
         spec.dp_rank = None;
@@ -248,12 +251,6 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         spec.kv_connector = None;
         spec.kv_role = None;
         spec.kv_engine_id = None;
-
-        if spec.kv_block_size.is_none() {
-            spec.kv_block_size = labels.get("page_size")
-                .and_then(|s| s.parse::<usize>().ok())
-                .filter(|&n| n > 0);
-        }
 
         let workers: Vec<Arc<dyn Worker>> = dp_ranks
             .into_iter()
@@ -348,6 +345,233 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         false
+    }
+}
+
+async fn fill_worker_prefill(
+    spec: &mut WorkerSpec,
+    model_id: &str,
+    labels: &HashMap<String, String>,
+) {
+    use openai_protocol::prefill::{
+        PrefillFieldMetadata, PrefillFieldStatus,
+    };
+
+    use super::discover_metadata::{
+        load_checkpoint_precision, precision_string,
+    };
+
+    // read label: support string, number, boolean.
+    fn read<T: std::str::FromStr>(
+        labels: &HashMap<String, String>,
+        keys: &[&str],
+    ) -> Option<T> {
+        keys.iter().find_map(|key| {
+            let value = labels.get(*key)?.trim();
+
+            if value.is_empty() {
+                return None;
+            }
+
+            value.parse().ok()
+        })
+    }
+
+    // Existing explicit configuration takes precedence.
+    fn fill<T>(target: &mut Option<T>, value: Option<T>) {
+        if target.is_none() {
+            *target = value;
+        }
+    }
+
+    // 1. Locate the model directory or Hub repository.
+    let model_source = spec
+        .prefill
+        .as_ref()
+        .and_then(|p| p.models.get(model_id))
+        .and_then(|m| m.artifact.as_ref())
+        .and_then(|a| a.local_path.as_deref().or(a.repo_id.as_deref()))
+        .or_else(|| labels.get("model_path").map(String::as_str))
+        .unwrap_or(model_id)
+        .to_owned();
+
+    // 2. Read file-declared precision and quantization configurations.
+    let checkpoint = match load_checkpoint_precision(&model_source).await {
+        Ok(value) => Some(value),
+        Err(e) => {
+            debug!("Cannot read checkpoint precision for {model_source}: {e}");
+            None
+        }
+    };
+
+    // 3. Extract engine-reported precision and quantization methods.
+    let model_dtype = ["prefill_model_dtype", "model_dtype", "dtype"]
+        .into_iter()
+        .find_map(|key| {
+            precision_string(labels.get(key).map(String::as_str))
+        });
+
+    let quantization_method = ["quantization", "prefill_quantization"]
+        .into_iter()
+        .find_map(|key| {
+            precision_string(labels.get(key).map(String::as_str))
+        });
+
+    let quantization_disabled = labels
+        .get("quantization_status")
+        .is_some_and(|status| status == "disabled");
+
+    // KV block size uses the WorkerSpec existing field.
+    fill(
+        &mut spec.kv_block_size,
+        read::<usize>(labels, &["page_size", "block_size"])
+            .filter(|&size| size > 0),
+    );
+
+    let prefill = spec.prefill.get_or_insert_with(Default::default);
+
+    // field_metadata 的路径遵循 JSON Pointer 转义规则。
+    // The field_metadata path follows JSON Pointer escaping rules.
+    let escaped_id = model_id.replace('~', "~0").replace('/', "~1");
+    let dtype_path = format!("/models/{escaped_id}/execution/model_dtype");
+    let quantization_path =
+        format!("/models/{escaped_id}/execution/quantization_method");
+
+    let dtype_status_exists = prefill.field_metadata.contains_key(&dtype_path);
+    let quantization_status_exists =
+        prefill.field_metadata.contains_key(&quantization_path);
+
+    let record_dtype_status;
+    let record_quantization_status;
+
+    // 4. Fill model execution configuration with file-declared settings.
+    {
+        let model = prefill.models.entry(model_id.to_owned()).or_default();
+        let execution = model.execution.get_or_insert_with(Default::default);
+
+        record_dtype_status =
+            execution.model_dtype.is_none() && !dtype_status_exists;
+
+        if record_dtype_status {
+            execution.model_dtype = model_dtype;
+        }
+
+        record_quantization_status =
+            execution.quantization_method.is_none()
+                && !quantization_status_exists;
+
+        if record_quantization_status && !quantization_disabled {
+            execution.quantization_method = quantization_method;
+        }
+
+        // auto is a valid KV configuration declaration, keep it here.
+        fill(
+            &mut execution.kv_cache_dtype,
+            read(labels, &["cache_dtype", "kv_cache_dtype"]),
+        );
+
+        fill(
+            &mut execution.max_model_len,
+            read(
+                labels,
+                &["max_model_len", "max_context_length", "context_length"],
+            ),
+        );
+
+        if let Some(discovered) = checkpoint {
+            let current = model.checkpoint.get_or_insert_with(Default::default);
+
+            fill(&mut current.declared_dtype, discovered.declared_dtype);
+            fill(&mut current.quantization, discovered.quantization);
+        }
+    }
+
+    // 5. Fill engine parallelism and scheduling configuration.
+    {
+        let engine = prefill.engine.get_or_insert_with(Default::default);
+
+        fill(&mut engine.version, read(labels, &["version"]));
+
+        fill(
+            &mut engine.tp_size,
+            read(labels, &["tp_size", "tensor_parallel_size"]),
+        );
+        fill(
+            &mut engine.pp_size,
+            read(labels, &["pp_size", "pipeline_parallel_size"]),
+        );
+        fill(
+            &mut engine.dp_size,
+            read(labels, &["dp_size", "data_parallel_size"]),
+        );
+
+        fill(
+            &mut engine.attention_backend,
+            read(labels, &["attention_backend"]),
+        );
+        fill(
+            &mut engine.prefix_cache_enabled,
+            read(labels, &["enable_prefix_caching"]),
+        );
+        fill(
+            &mut engine.chunked_prefill_enabled,
+            read(labels, &["enable_chunked_prefill"]),
+        );
+        fill(
+            &mut engine.max_num_batched_tokens,
+            read(labels, &["max_num_batched_tokens"]),
+        );
+        fill(
+            &mut engine.max_running_requests,
+            read(labels, &["max_num_seqs", "max_running_requests"]),
+        );
+        fill(
+            &mut engine.chunked_prefill_size,
+            read(labels, &["chunked_prefill_size"]),
+        );
+        fill(
+            &mut engine.max_prefill_tokens,
+            read(labels, &["max_prefill_tokens"]),
+        );
+    }
+
+    // 6. Synchronize precision and quantization status, preserving disabled / missing / auto etc.
+    for (key, path, should_record) in [
+        ("prefill_model_dtype", dtype_path, record_dtype_status),
+        (
+            "quantization",
+            quantization_path,
+            record_quantization_status,
+        ),
+    ] {
+        if !should_record {
+            continue;
+        }
+
+        let Some(raw_status) = labels.get(&format!("{key}_status")) else {
+            continue;
+        };
+
+        let status = match raw_status.as_str() {
+            "disabled" => PrefillFieldStatus::Disabled,
+            "resolved" => PrefillFieldStatus::Resolved,
+            "declared" => PrefillFieldStatus::Declared,
+            "unspecified" => PrefillFieldStatus::Unspecified,
+            "missing" => PrefillFieldStatus::Missing,
+            "auto" => PrefillFieldStatus::Auto,
+            "overridden" => PrefillFieldStatus::Overridden,
+            "error" => PrefillFieldStatus::Error,
+            _ => PrefillFieldStatus::Unknown,
+        };
+
+        prefill.field_metadata.insert(
+            path,
+            PrefillFieldMetadata {
+                status,
+                source: Some(format!("labels:{key}")),
+                ..Default::default()
+            },
+        );
     }
 }
 
