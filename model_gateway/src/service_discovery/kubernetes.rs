@@ -44,6 +44,21 @@ pub const MOONCAKE_URL_ANNOTATION: &str = "xhive.io/cache-pool";
 pub const MOONCAKE_CACHE_DOMAIN_ANNOTATION: &str = "xhive.io/cache-domain";
 pub const RESOURCE_SPEC_ANNOTATION: &str = "xhive.io/resource-spec";
 
+const GPU_ALLOCATION_ANNOTATIONS: &[&str] = &[
+    "volcano.sh/vgpu-ids-new",
+    "hami.io/dcu-devices-allocated",
+    "volcano.sh/vxpu-ids-new",
+    "volcano.sh/vppu-ids-new",
+    "xhive.io/ppu-devices-allocated",
+    "hami.io/Ascend910A-devices-allocated",
+    "hami.io/Ascend910B2-devices-allocated",
+    "hami.io/Ascend910B3-devices-allocated",
+    "hami.io/Ascend910B4-devices-allocated",
+    "hami.io/Ascend910B4-1-devices-allocated",
+    "hami.io/Ascend310P-devices-allocated",
+    "hami.io/Ascend910C-devices-allocated",
+];
+
 /// Source for per-worker model_id override during Kubernetes service discovery.
 #[derive(Debug, Clone)]
 pub enum ModelIdSource {
@@ -232,7 +247,7 @@ pub struct PodInfo {
     pub restart_count: Option<i32>,
     pub mooncake_cache_domain: Option<String>,
     pub mooncake_dns_address: Option<String>,
-    /// GPU allocation declared by this pod's resource-spec annotation.
+    /// GPU specifications and device UUIDs declared by this pod's annotations.
     pub hardware: Option<PrefillHardwareSpec>,
 }
 
@@ -473,18 +488,15 @@ fn hardware_from_pod(pod: &Pod) -> Option<PrefillHardwareSpec> {
         gpu_cores: Option<u32>,
     }
 
-    let raw = annotation_value(pod, RESOURCE_SPEC_ANNOTATION)?;
-    let resource: ResourceSpec = match serde_json::from_str(raw) {
-        Ok(resource) => resource,
-        Err(error) => {
-            warn!(pod = ?pod.metadata.name, %error, "Ignoring invalid GPU resource-spec annotation");
-            return None;
-        }
-    };
-    if resource.gpu_count == 0 {
-        return None;
-    }
-    let memory_bytes = match resource.gpu_memory_mb {
+    let resource: Option<ResourceSpec> = annotation_value(pod, RESOURCE_SPEC_ANNOTATION)
+        .and_then(|raw| match serde_json::from_str(raw) {
+            Ok(resource) => Some(resource),
+            Err(error) => {
+                warn!(pod = ?pod.metadata.name, %error, "Ignoring invalid GPU resource-spec annotation");
+                None
+            }
+        });
+    let memory_bytes = match resource.as_ref().and_then(|resource| resource.gpu_memory_mb) {
         Some(mb) => match mb.checked_mul(1024 * 1024) {
             Some(bytes) => Some(bytes),
             None => {
@@ -495,16 +507,42 @@ fn hardware_from_pod(pod: &Pod) -> Option<PrefillHardwareSpec> {
         None => None,
     };
     let device = PrefillDeviceSpec {
-        gpu_model: resource.gpu_model.filter(|model| !model.trim().is_empty()),
-        gpu_cores: resource.gpu_cores,
+        gpu_model: resource
+            .as_ref()
+            .and_then(|resource| resource.gpu_model.clone())
+            .filter(|model| !model.trim().is_empty()),
+        gpu_cores: resource.as_ref().and_then(|resource| resource.gpu_cores),
         memory_bytes,
-        // The annotation does not identify devices or distributed ranks.
         node: pod.spec.as_ref().and_then(|spec| spec.node_name.clone()),
         ..Default::default()
     };
-    Some(PrefillHardwareSpec {
-        devices: vec![device; usize::from(resource.gpu_count)],
-    })
+
+    let allocation = pod.metadata.annotations.as_ref().and_then(|annotations| {
+        GPU_ALLOCATION_ANNOTATIONS
+            .iter()
+            .find_map(|key| annotations.get(*key))
+    });
+    let mut devices = Vec::new();
+    if let Some(allocation) = allocation {
+        // HAMI separates devices with ':' and containers with ';'. Only the
+        // first matching annotation is used; each record starts with its UUID.
+        for entry in allocation.split([':', ';']) {
+            let Some((uuid, _)) = entry.split_once(',') else {
+                continue;
+            };
+            let uuid = uuid.trim();
+            if !uuid.is_empty() {
+                devices.push(PrefillDeviceSpec {
+                    uuid: Some(uuid.to_owned()),
+                    ..device.clone()
+                });
+            }
+        }
+    }
+    if devices.is_empty() {
+        devices = vec![device; resource.map_or(0, |resource| usize::from(resource.gpu_count))];
+    }
+    (!devices.is_empty()).then_some(PrefillHardwareSpec { devices })
 }
 
 /// Resolve one unique KV engine ID per worker port; unlike bootstrap ports,
@@ -1265,21 +1303,31 @@ mod tests {
         let config = make_regular_config();
         let mut pod = pod_with_annotations(
             "h20",
-            &[(
-                RESOURCE_SPEC_ANNOTATION,
-                r#"{"gpuModel":"NVIDIA-NVIDIA-H20","gpuCount":2,"gpuMemoryMB":97871,"gpuCores":100,"specName":"c32m320s1g2"}"#,
-            )],
+            &[
+                (
+                    RESOURCE_SPEC_ANNOTATION,
+                    r#"{"gpuModel":"NVIDIA-NVIDIA-H20","gpuCount":2,"gpuMemoryMB":97871,"gpuCores":100,"specName":"c32m320s1g2"}"#,
+                ),
+                (
+                    "volcano.sh/vgpu-ids-new",
+                    "GPU-b578d224-aaf7-71f5-6a18-70a44b8071c2,NVIDIA,6116,100:GPU-6966bef6-4f4a-2619-43b0-40eef2d14c30,NVIDIA,6116,100:",
+                ),
+            ],
         );
         pod.spec.as_mut().unwrap().node_name = Some("node-h20".to_owned());
         let info = PodInfo::from_pod(&pod, Some(&config)).unwrap();
         let hardware = info.hardware.as_ref().unwrap();
         assert_eq!(hardware.devices.len(), 2);
-        for device in &hardware.devices {
+        let uuids = [
+            "GPU-b578d224-aaf7-71f5-6a18-70a44b8071c2",
+            "GPU-6966bef6-4f4a-2619-43b0-40eef2d14c30",
+        ];
+        for (device, uuid) in hardware.devices.iter().zip(uuids) {
             assert_eq!(device.gpu_model.as_deref(), Some("NVIDIA-NVIDIA-H20"));
             assert_eq!(device.memory_bytes, Some(102_625_181_696));
             assert_eq!(device.gpu_cores, Some(100));
             assert_eq!(device.node.as_deref(), Some("node-h20"));
-            assert!(device.uuid.is_none());
+            assert_eq!(device.uuid.as_deref(), Some(uuid));
             assert!(device.rank.is_none());
         }
         let desired = compute_desired_state(&[Arc::new(pod)], &config);
@@ -1288,6 +1336,53 @@ mod tests {
             desired.workers.values().next().unwrap().hardware,
             info.hardware
         );
+    }
+
+    #[test]
+    fn gpu_allocation_annotations_supply_uuids_without_resource_spec() {
+        for key in GPU_ALLOCATION_ANNOTATIONS {
+            let pod = pod_with_annotations(
+                "allocated",
+                &[(key, "device-0,VENDOR,6116,100:device-1,VENDOR,6116,100:")],
+            );
+            let hardware = PodInfo::from_pod(&pod, None).unwrap().hardware.unwrap();
+            assert_eq!(hardware.devices.len(), 2, "{key}");
+            assert_eq!(hardware.devices[0].uuid.as_deref(), Some("device-0"), "{key}");
+            assert_eq!(hardware.devices[1].uuid.as_deref(), Some("device-1"), "{key}");
+            assert!(hardware.devices[0].gpu_model.is_none());
+            assert!(hardware.devices[0].memory_bytes.is_none());
+        }
+    }
+
+    #[test]
+    fn gpu_allocation_keeps_all_uuids_with_a_different_resource_count() {
+        let pod = pod_with_annotations(
+            "allocated",
+            &[
+                (RESOURCE_SPEC_ANNOTATION, r#"{"gpuCount":1,"gpuCores":100}"#),
+                ("hami.io/vgpu-devices-allocated", "GPU-0,NVIDIA,6116,100:GPU-1,NVIDIA,6116,100:"),
+            ],
+        );
+        let hardware = PodInfo::from_pod(&pod, None).unwrap().hardware.unwrap();
+        assert_eq!(hardware.devices.len(), 2);
+        assert_eq!(hardware.devices[0].uuid.as_deref(), Some("GPU-0"));
+        assert_eq!(hardware.devices[1].uuid.as_deref(), Some("GPU-1"));
+        assert_eq!(hardware.devices[1].gpu_cores, Some(100));
+    }
+
+    #[test]
+    fn gpu_allocation_handles_container_separators_and_empty_records() {
+        let pod = pod_with_annotations(
+            "allocated",
+            &[(
+                "hami.io/dcu-devices-allocated",
+                ":; DCU-0 ,DCU,1024,50:;:bad-record:,DCU,1024,50:DCU-1,DCU,1024,50:;",
+            )],
+        );
+        let hardware = PodInfo::from_pod(&pod, None).unwrap().hardware.unwrap();
+        assert_eq!(hardware.devices.len(), 2);
+        assert_eq!(hardware.devices[0].uuid.as_deref(), Some("DCU-0"));
+        assert_eq!(hardware.devices[1].uuid.as_deref(), Some("DCU-1"));
     }
 
     #[test]
