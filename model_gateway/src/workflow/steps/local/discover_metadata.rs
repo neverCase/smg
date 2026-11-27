@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
+use super::model_file_metadata::is_hub_repo_id;
+
 use crate::{
     routers::grpc::client::{flat_labels, GrpcClient},
     worker::{
@@ -101,16 +103,6 @@ pub(super) struct ModelsResponse {
 #[derive(Debug, Deserialize)]
 struct VersionResponse {
     version: String,
-}
-
-pub(super) fn precision_string(value: Option<&str>) -> Option<String> {
-    let value = value?.trim().to_ascii_lowercase();
-    let value = value.strip_prefix("torch.").unwrap_or(&value);
-
-    match value {
-        "" | "auto" | "unknown" | "none" | "null" => None,
-        _ => Some(value.to_owned()),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +200,163 @@ pub async fn get_model_info(
 // Per-backend metadata fetchers
 // ---------------------------------------------------------------------------
 
+fn sglang_server_labels(info: &serde_json::Value) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    match serde_json::from_value::<ServerInfo>(info.clone()) {
+        Ok(parsed) => labels.extend(flat_labels(&parsed)),
+        Err(e) => {
+            warn!("Failed to parse SGLang ServerInfo: {e}");
+        }
+    }
+
+    let config_mappings: &[(&str, &str)] = &[
+        ("/dtype", "prefill_model_dtype"),
+        ("/quantization", "quantization"),
+        ("/kv_cache_dtype", "cache_dtype"),
+        ("/page_size", "block_size"),
+        ("/tp_size", "tensor_parallel_size"),
+        ("/pp_size", "pipeline_parallel_size"),
+        ("/dp_size", "data_parallel_size"),
+        ("/max_running_requests", "max_num_seqs"),
+        ("/revision", "model_revision"),
+        ("/attention_backend", "attention_backend"),
+        ("/ep_size", "expert_parallel_size"),
+        ("/enable_ep_moe", "enable_expert_parallel"),
+        // sglang-specific
+        ("/max_prefill_tokens", "max_prefill_tokens"),
+        ("/chunked_prefill_size", "chunked_prefill_size"),
+    ];
+
+    let selected: HashMap<&str, &serde_json::Value> = config_mappings
+        .iter()
+        .filter_map(|&(pointer, key)| info.pointer(pointer).map(|value| (key, value)))
+        .collect();
+
+    labels.extend(flat_labels(&selected));
+
+    for &(pointer, key) in config_mappings {
+        let status = match info.pointer(pointer) {
+            None => Some("missing"),
+            Some(serde_json::Value::Null) => Some("unspecified"),
+            Some(serde_json::Value::String(value)) if value.eq_ignore_ascii_case("auto") => {
+                Some("auto")
+            }
+            Some(_) => Some("declared"),
+        };
+
+        if let Some(status) = status {
+            labels.insert(format!("{key}_status"), status.to_string());
+        }
+    }
+
+    if let Some(disabled) = info
+        .pointer("/disable_radix_cache")
+        .and_then(|value| value.as_bool())
+    {
+        labels.insert("enable_prefix_caching".to_string(), (!disabled).to_string());
+        labels.insert(
+            "enable_prefix_caching_status".to_owned(),
+            "declared".to_owned(),
+        );
+    }
+
+    if let Some(size) = info
+        .pointer("/chunked_prefill_size")
+        .and_then(|value| value.as_i64())
+    {
+        let enabled = match size {
+            n if n > 0 => Some(true),
+            -1 => Some(false),
+            _ => None,
+        };
+
+        if let Some(enabled) = enabled {
+            labels.insert("enable_chunked_prefill".to_string(), enabled.to_string());
+            labels.insert(
+                "enable_chunked_prefill_status".to_owned(),
+                "declared".to_owned(),
+            );
+        }
+    }
+
+    labels
+}
+
+fn vllm_server_labels(info: &serde_json::Value) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    if !info
+        .get("vllm_config")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        debug!("vLLM server_info did not return a structured vllm_config");
+        return labels;
+    }
+    let config_mappings: &[(&str, &str)] = &[
+        ("/vllm_config/model_config/dtype", "prefill_model_dtype"),
+        ("/vllm_config/model_config/quantization", "quantization"),
+        ("/vllm_config/model_config/revision", "model_revision"),
+        ("/vllm_config/attention_config/backend", "attention_backend"),
+        (
+            "/vllm_config/parallel_config/enable_expert_parallel",
+            "enable_expert_parallel",
+        ),
+        (
+            "/vllm_config/parallel_config/expert_parallel_size",
+            "expert_parallel_size",
+        ),
+        ("/vllm_config/cache_config/cache_dtype", "cache_dtype"),
+        ("/vllm_config/cache_config/block_size", "block_size"),
+        (
+            "/vllm_config/cache_config/enable_prefix_caching",
+            "enable_prefix_caching",
+        ),
+        (
+            "/vllm_config/parallel_config/tensor_parallel_size",
+            "tensor_parallel_size",
+        ),
+        (
+            "/vllm_config/parallel_config/pipeline_parallel_size",
+            "pipeline_parallel_size",
+        ),
+        (
+            "/vllm_config/parallel_config/data_parallel_size",
+            "data_parallel_size",
+        ),
+        (
+            "/vllm_config/scheduler_config/max_num_batched_tokens",
+            "max_num_batched_tokens",
+        ),
+        ("/vllm_config/scheduler_config/max_num_seqs", "max_num_seqs"),
+        (
+            "/vllm_config/scheduler_config/enable_chunked_prefill",
+            "enable_chunked_prefill",
+        ),
+    ];
+
+    let selected: HashMap<&str, &serde_json::Value> = config_mappings
+        .iter()
+        .filter_map(|&(pointer, key)| info.pointer(pointer).map(|value| (key, value)))
+        .collect();
+
+    labels.extend(flat_labels(&selected));
+
+    for &(pointer, key) in config_mappings {
+        let status = match info.pointer(pointer) {
+            Some(serde_json::Value::Null) if key == "quantization" => "disabled",
+            Some(serde_json::Value::Null) => "unspecified",
+            Some(serde_json::Value::String(value)) if value.trim().eq_ignore_ascii_case("auto") => {
+                "auto"
+            }
+            Some(serde_json::Value::String(value)) if value.trim().is_empty() => "unspecified",
+            Some(_) => "resolved",
+            None => "missing",
+        };
+        labels.insert(format!("{key}_status"), status.to_owned());
+    }
+
+    labels
+}
+
 async fn fetch_sglang_http_metadata(
     client: &Client,
     url: &str,
@@ -223,84 +372,7 @@ async fn fetch_sglang_http_metadata(
         api_key
     )
     .await {
-        Ok(info) => {
-            match serde_json::from_value::<ServerInfo>(info.clone()) {
-                Ok(parsed) => labels.extend(flat_labels(&parsed)),
-                Err(e) => {
-                    warn!("Failed to parse SGLang ServerInfo: {e}");
-                }
-            }
-
-            let config_mappings: &[(&str, &str)] = &[
-                ("/dtype", "prefill_model_dtype"),
-                ("/quantization", "quantization"),
-                ("/kv_cache_dtype", "cache_dtype"),
-                ("/page_size", "block_size"),
-                ("/tp_size", "tensor_parallel_size"),
-                ("/pp_size", "pipeline_parallel_size"),
-                ("/dp_size", "data_parallel_size"),
-                ("/max_running_requests", "max_num_seqs"),
-
-                // sglang-specific
-                ("/max_prefill_tokens", "max_prefill_tokens"),
-                ("/chunked_prefill_size", "chunked_prefill_size"),
-            ];
-
-            let selected: HashMap<&str, &serde_json::Value> = config_mappings
-                .iter()
-                .filter_map(|&(pointer, key)| {
-                    info.pointer(pointer).map(|value| (key, value))
-                })
-                .collect();
-
-            labels.extend(flat_labels(&selected));
-
-            for &(pointer, key) in config_mappings {
-                let status = match info.pointer(pointer) {
-                    None => Some("missing"),
-                    Some(serde_json::Value::Null) => Some("unspecified"),
-                    Some(serde_json::Value::String(value))
-                    if value.eq_ignore_ascii_case("auto") =>
-                        {
-                            Some("auto")
-                        }
-                    _ => None,
-                };
-
-                if let Some(status) = status {
-                    labels.insert(format!("{key}_status"), status.to_string());
-                }
-            }
-
-            if let Some(disabled) = info
-                .pointer("/disable_radix_cache")
-                .and_then(|value| value.as_bool())
-            {
-                labels.insert(
-                    "enable_prefix_caching".to_string(),
-                    (!disabled).to_string(),
-                );
-            }
-
-            if let Some(size) = info
-                .pointer("/chunked_prefill_size")
-                .and_then(|value| value.as_i64())
-            {
-                let enabled = match size {
-                    n if n > 0 => Some(true),
-                    -1 => Some(false),
-                    _ => None,
-                };
-
-                if let Some(enabled) = enabled {
-                    labels.insert(
-                        "enable_chunked_prefill".to_string(),
-                        enabled.to_string(),
-                    );
-                }
-            }
-
-        }
+        Ok(info) => labels.extend(sglang_server_labels(&info)),
         Err(e) => {
             debug!("Cannot fetch SGLang server metadata: {e}");
         }
@@ -393,42 +465,7 @@ async fn fetch_vllm_http_metadata(
         &info_url,
         api_key
     ).await {
-        Ok(info) => {
-            let config_mappings: &[(&str, &str)] = &[
-                ("/vllm_config/model_config/dtype", "prefill_model_dtype"),
-                ("/vllm_config/model_config/quantization", "quantization"),
-                ("/vllm_config/cache_config/cache_dtype", "cache_dtype"),
-                ("/vllm_config/cache_config/block_size", "block_size"),
-                ("/vllm_config/cache_config/enable_prefix_caching", "enable_prefix_caching"),
-                ("/vllm_config/parallel_config/tensor_parallel_size", "tensor_parallel_size"),
-                ("/vllm_config/parallel_config/pipeline_parallel_size", "pipeline_parallel_size"),
-                ("/vllm_config/parallel_config/data_parallel_size", "data_parallel_size"),
-                ("/vllm_config/scheduler_config/max_num_batched_tokens", "max_num_batched_tokens"),
-                ("/vllm_config/scheduler_config/max_num_seqs", "max_num_seqs"),
-                ("/vllm_config/scheduler_config/enable_chunked_prefill", "enable_chunked_prefill"),
-            ];
-
-            let selected: HashMap<&str, &serde_json::Value> = config_mappings
-                .iter()
-                .filter_map(|&(pointer, key)| {
-                    info.pointer(pointer).map(|value| (key, value))
-                })
-                .collect();
-
-            labels.extend(flat_labels(&selected));
-
-            let status = match info.pointer("/vllm_config/model_config/quantization") {
-                Some(serde_json::Value::Null) => "disabled",
-                Some(serde_json::Value::String(value)) if !value.is_empty() => "resolved",
-                None => "missing",
-                _ => "unknown",
-            };
-
-            labels.insert(
-                "quantization_status".to_string(),
-                status.to_string(),
-            );
-        }
+        Ok(info) => labels.extend(vllm_server_labels(&info)),
         Err(e) => {
             debug!("Cannot read vLLM precision metadata from {info_url}: {e}");
         }
@@ -605,90 +642,6 @@ async fn zmq_model_labels(model: Option<&str>) -> HashMap<String, String> {
 /// own timeout so an unreachable Hub costs one wait, not the step's retries.
 const HUB_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `owner/name`, or a bare legacy `name`: no leading `/`, `.` or `~` and at
-/// most one separator, so a path meant for another host is never sent to the
-/// Hub as a repo id.
-fn is_hub_repo_id(model: &str) -> bool {
-    !model.starts_with(['/', '.', '~'])
-        && model.matches('/').count() <= 1
-        && model.split('/').all(|part| {
-            !part.is_empty()
-                && part
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        })
-}
-
-pub(super) async fn load_checkpoint_precision(
-    model: &str,
-) -> Result<openai_protocol::prefill::PrefillCheckpointSpec, String> {
-    use openai_protocol::prefill::{
-        PrefillCheckpointSpec, PrefillQuantizationSpec,
-    };
-
-    let local = std::path::Path::new(model);
-
-    let path = if local.is_dir() {
-        local.join("config.json")
-    } else if !local.exists() && is_hub_repo_id(model) {
-        tokio::time::timeout(
-            HUB_FETCH_TIMEOUT,
-            llm_tokenizer::hub::fetch_file(model, "config.json"),
-        )
-            .await
-            .map_err(|_| format!("Fetching config.json for {model} timed out"))?
-            .map_err(|e| format!("Fetching config.json for {model} failed: {e}"))?
-    } else {
-        return Err(format!("Model directory is not accessible: {model}"));
-    };
-
-    let raw = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|e| format!("Reading {} failed: {e}", path.display()))?;
-
-    let config: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("Parsing {} failed: {e}", path.display()))?;
-    
-    let declared_dtype = [
-        "/text_config/dtype",
-        "/text_config/torch_dtype",
-        "/dtype",
-        "/torch_dtype",
-    ]
-    .into_iter()
-    .find_map(|pointer| {
-        precision_string(config.pointer(pointer).and_then(|v| v.as_str()))
-    });
-
-    let quant_config = [
-        "/quantization_config",
-        "/quantization",
-        "/text_config/quantization_config",
-        "/text_config/quantization",
-        "/compression_config",
-    ]
-    .into_iter()
-    .find_map(|pointer| config.pointer(pointer).filter(|v| v.is_object()));
-
-    let quantization = quant_config.map(|q| PrefillQuantizationSpec {
-        method: precision_string(q.get("quant_method").and_then(|v| v.as_str())),
-        bits: q
-            .get("bits")
-            .or_else(|| q.get("num_bits"))
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok()),
-        group_size: q.get("group_size").and_then(|v| v.as_i64()),
-        mode: q.get("mode").and_then(|v| v.as_str()).map(str::to_owned),
-        raw_config: Some(q.clone()),
-    });
-
-    Ok(PrefillCheckpointSpec {
-        declared_dtype,
-        quantization,
-        ..Default::default()
-    })
-}
-
 /// The sampling-defaults label from one `generation_config.json`, or none.
 async fn sampling_defaults_label(path: &std::path::Path) -> HashMap<String, String> {
     let mut labels = HashMap::new();
@@ -863,6 +816,54 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vllm_labels_include_available_execution_settings_and_null_quantization_status() {
+        let labels = vllm_server_labels(&serde_json::json!({"vllm_config": {
+            "model_config": {"dtype":"torch.bfloat16", "quantization":null, "revision":"checkpoint-commit"},
+            "attention_config": {"backend":"FLASH_ATTN"},
+            "parallel_config": {"tensor_parallel_size":2, "pipeline_parallel_size":1,
+                "data_parallel_size":1, "enable_expert_parallel":false, "expert_parallel_size":1},
+            "cache_config": {"cache_dtype":"auto", "block_size":832, "enable_prefix_caching":false},
+            "scheduler_config": {"max_num_batched_tokens":8192, "max_num_seqs":256, "enable_chunked_prefill":true}
+        }}));
+        assert_eq!(labels["prefill_model_dtype"], "torch.bfloat16");
+        assert_eq!(labels["quantization_status"], "disabled");
+        assert!(!labels.contains_key("quantization"));
+        assert_eq!(labels["attention_backend"], "FLASH_ATTN");
+        assert_eq!(labels["enable_expert_parallel"], "false");
+        assert_eq!(labels["expert_parallel_size"], "1");
+        assert_eq!(labels["enable_prefix_caching"], "false");
+        assert_eq!(labels["cache_dtype_status"], "auto");
+        assert_eq!(labels["model_revision"], "checkpoint-commit");
+        assert_eq!(labels["block_size"], "832");
+    }
+
+    #[test]
+    fn sglang_labels_keep_launch_defaults_distinct_from_resolved_vllm_values() {
+        let labels = sglang_server_labels(&serde_json::json!({
+            "dtype":"auto", "quantization":null, "kv_cache_dtype":"auto",
+            "tp_size":2, "pp_size":1, "dp_size":1, "ep_size":2,
+            "attention_backend":"auto", "disable_radix_cache":true,
+            "chunked_prefill_size":-1, "max_prefill_tokens":16384,
+            "max_running_requests":512
+        }));
+        assert_eq!(labels["prefill_model_dtype_status"], "auto");
+        assert_eq!(labels["quantization_status"], "unspecified");
+        assert_eq!(labels["attention_backend_status"], "auto");
+        assert_eq!(labels["enable_prefix_caching"], "false");
+        assert_eq!(labels["enable_chunked_prefill"], "false");
+        assert_eq!(labels["expert_parallel_size"], "2");
+        assert_eq!(labels["model_revision_status"], "missing");
+        assert!(!labels.contains_key("max_num_batched_tokens"));
+    }
+
+    #[test]
+    fn vllm_text_config_does_not_produce_false_missing_or_disabled_observations() {
+        assert!(vllm_server_labels(&serde_json::json!({
+            "vllm_config":"dtype=torch.bfloat16, quantization=None"
+        })).is_empty());
+    }
+
     #[tokio::test]
     async fn zmq_labels_carry_the_local_generation_config_sampling_defaults() {
         let dir = tempfile::tempdir().unwrap();

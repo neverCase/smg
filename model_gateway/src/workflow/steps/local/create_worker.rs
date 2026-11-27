@@ -353,19 +353,14 @@ async fn fill_worker_prefill(
     model_id: &str,
     labels: &HashMap<String, String>,
 ) {
-    use openai_protocol::prefill::{
-        PrefillFieldMetadata, PrefillFieldStatus,
-    };
+    use openai_protocol::prefill::{PrefillFieldMetadata, PrefillFieldStatus};
 
-    use super::discover_metadata::{
-        load_checkpoint_precision, precision_string,
+    use super::model_file_metadata::{
+        load_model_file_metadata, merge_model_file_metadata, precision_string,
     };
 
     // read label: support string, number, boolean.
-    fn read<T: std::str::FromStr>(
-        labels: &HashMap<String, String>,
-        keys: &[&str],
-    ) -> Option<T> {
+    fn read<T: std::str::FromStr>(labels: &HashMap<String, String>, keys: &[&str]) -> Option<T> {
         keys.iter().find_map(|key| {
             let value = labels.get(*key)?.trim();
 
@@ -395,27 +390,38 @@ async fn fill_worker_prefill(
         .unwrap_or(model_id)
         .to_owned();
 
-    // 2. Read file-declared precision and quantization configurations.
-    let checkpoint = match load_checkpoint_precision(&model_source).await {
-        Ok(value) => Some(value),
-        Err(e) => {
-            debug!("Cannot read checkpoint precision for {model_source}: {e}");
-            None
-        }
-    };
+    let revision = spec
+        .prefill
+        .as_ref()
+        .and_then(|p| p.models.get(model_id))
+        .and_then(|m| m.artifact.as_ref())
+        .and_then(|a| a.revision.clone())
+        .or_else(|| labels.get("model_revision").cloned())
+        .filter(|value| !value.trim().is_empty());
+    let existing_prefill = spec
+        .prefill
+        .as_ref()
+        .and_then(|p| serde_json::to_value(p).ok())
+        .unwrap_or_default();
+
+    // 2. Read model identity, geometry, quantization and weight-storage metadata.
+    let (file_metadata, file_error) =
+        match load_model_file_metadata(&model_source, revision.as_deref()).await {
+            Ok(value) => (Some(value), None),
+            Err(e) => {
+                debug!("Cannot read model-file metadata for {model_source}: {e}");
+                (None, Some(e))
+            }
+        };
 
     // 3. Extract engine-reported precision and quantization methods.
     let model_dtype = ["prefill_model_dtype", "model_dtype", "dtype"]
         .into_iter()
-        .find_map(|key| {
-            precision_string(labels.get(key).map(String::as_str))
-        });
+        .find_map(|key| precision_string(labels.get(key).map(String::as_str)));
 
     let quantization_method = ["quantization", "prefill_quantization"]
         .into_iter()
-        .find_map(|key| {
-            precision_string(labels.get(key).map(String::as_str))
-        });
+        .find_map(|key| precision_string(labels.get(key).map(String::as_str)));
 
     let quantization_disabled = labels
         .get("quantization_status")
@@ -424,22 +430,23 @@ async fn fill_worker_prefill(
     // KV block size uses the WorkerSpec existing field.
     fill(
         &mut spec.kv_block_size,
-        read::<usize>(labels, &["page_size", "block_size"])
-            .filter(|&size| size > 0),
+        read::<usize>(labels, &["page_size", "block_size"]).filter(|&size| size > 0),
     );
 
     let prefill = spec.prefill.get_or_insert_with(Default::default);
+
+    if let Some(metadata) = file_metadata {
+        merge_model_file_metadata(prefill, model_id, metadata);
+    }
 
     // field_metadata 的路径遵循 JSON Pointer 转义规则。
     // The field_metadata path follows JSON Pointer escaping rules.
     let escaped_id = model_id.replace('~', "~0").replace('/', "~1");
     let dtype_path = format!("/models/{escaped_id}/execution/model_dtype");
-    let quantization_path =
-        format!("/models/{escaped_id}/execution/quantization_method");
+    let quantization_path = format!("/models/{escaped_id}/execution/quantization_method");
 
     let dtype_status_exists = prefill.field_metadata.contains_key(&dtype_path);
-    let quantization_status_exists =
-        prefill.field_metadata.contains_key(&quantization_path);
+    let quantization_status_exists = prefill.field_metadata.contains_key(&quantization_path);
 
     let record_dtype_status;
     let record_quantization_status;
@@ -449,16 +456,14 @@ async fn fill_worker_prefill(
         let model = prefill.models.entry(model_id.to_owned()).or_default();
         let execution = model.execution.get_or_insert_with(Default::default);
 
-        record_dtype_status =
-            execution.model_dtype.is_none() && !dtype_status_exists;
+        record_dtype_status = execution.model_dtype.is_none() && !dtype_status_exists;
 
         if record_dtype_status {
             execution.model_dtype = model_dtype;
         }
 
         record_quantization_status =
-            execution.quantization_method.is_none()
-                && !quantization_status_exists;
+            execution.quantization_method.is_none() && !quantization_status_exists;
 
         if record_quantization_status && !quantization_disabled {
             execution.quantization_method = quantization_method;
@@ -477,13 +482,6 @@ async fn fill_worker_prefill(
                 &["max_model_len", "max_context_length", "context_length"],
             ),
         );
-
-        if let Some(discovered) = checkpoint {
-            let current = model.checkpoint.get_or_insert_with(Default::default);
-
-            fill(&mut current.declared_dtype, discovered.declared_dtype);
-            fill(&mut current.quantization, discovered.quantization);
-        }
     }
 
     // 5. Fill engine parallelism and scheduling configuration.
@@ -533,6 +531,22 @@ async fn fill_worker_prefill(
             &mut engine.max_prefill_tokens,
             read(labels, &["max_prefill_tokens"]),
         );
+        let enabled: Option<bool> = read(labels, &["enable_expert_parallel"]);
+        let size: Option<u32> = read(labels, &["expert_parallel_size", "ep_size"]);
+        if enabled.is_some() || size.is_some() {
+            let parallel = engine
+                .expert_parallel_config
+                .get_or_insert_with(Default::default);
+            fill(&mut parallel.enabled, enabled);
+            fill(&mut parallel.size, size);
+            fill(
+                &mut parallel.raw_config,
+                Some(serde_json::json!({
+                    "enable_expert_parallel": enabled,
+                    "expert_parallel_size": size,
+                })),
+            );
+        }
     }
 
     // 6. Synchronize precision and quantization status, preserving disabled / missing / auto etc.
@@ -569,9 +583,101 @@ async fn fill_worker_prefill(
             PrefillFieldMetadata {
                 status,
                 source: Some(format!("labels:{key}")),
+                collected_at: Some(chrono::Utc::now().to_rfc3339()),
                 ..Default::default()
             },
         );
+    }
+
+    // Publish availability for the remaining engine observations as well.
+    let model_prefix = format!("/models/{escaped_id}");
+    for (key, path) in [
+        ("version", "/engine/version".to_owned()),
+        (
+            "max_model_len",
+            format!("{model_prefix}/execution/max_model_len"),
+        ),
+        (
+            "cache_dtype",
+            format!("{model_prefix}/execution/kv_cache_dtype"),
+        ),
+        ("attention_backend", "/engine/attention_backend".to_owned()),
+        ("tensor_parallel_size", "/engine/tp_size".to_owned()),
+        ("pipeline_parallel_size", "/engine/pp_size".to_owned()),
+        ("data_parallel_size", "/engine/dp_size".to_owned()),
+        (
+            "enable_prefix_caching",
+            "/engine/prefix_cache_enabled".to_owned(),
+        ),
+        (
+            "enable_chunked_prefill",
+            "/engine/chunked_prefill_enabled".to_owned(),
+        ),
+        (
+            "max_num_batched_tokens",
+            "/engine/max_num_batched_tokens".to_owned(),
+        ),
+        ("max_num_seqs", "/engine/max_running_requests".to_owned()),
+        (
+            "chunked_prefill_size",
+            "/engine/chunked_prefill_size".to_owned(),
+        ),
+        (
+            "max_prefill_tokens",
+            "/engine/max_prefill_tokens".to_owned(),
+        ),
+        (
+            "enable_expert_parallel",
+            "/engine/expert_parallel_config/enabled".to_owned(),
+        ),
+        (
+            "expert_parallel_size",
+            "/engine/expert_parallel_config/size".to_owned(),
+        ),
+    ] {
+        if existing_prefill
+            .pointer(&path)
+            .is_some_and(|value| !value.is_null())
+        {
+            continue;
+        }
+        let status = labels
+            .get(&format!("{key}_status"))
+            .map(String::as_str)
+            .or_else(|| labels.contains_key(key).then_some("declared"));
+        let Some(status) = status else {
+            continue;
+        };
+        let status = match status {
+            "resolved" => PrefillFieldStatus::Resolved,
+            "declared" => PrefillFieldStatus::Declared,
+            "missing" => PrefillFieldStatus::Missing,
+            "unspecified" => PrefillFieldStatus::Unspecified,
+            "auto" => PrefillFieldStatus::Auto,
+            _ => PrefillFieldStatus::Unknown,
+        };
+        prefill
+            .field_metadata
+            .entry(path)
+            .or_insert(PrefillFieldMetadata {
+                status,
+                source: Some(format!("labels:{key}")),
+                collected_at: Some(chrono::Utc::now().to_rfc3339()),
+                ..Default::default()
+            });
+    }
+    if let Some(error) = file_error {
+        for field in ["architecture", "checkpoint"] {
+            prefill
+                .field_metadata
+                .entry(format!("{model_prefix}/{field}"))
+                .or_insert(PrefillFieldMetadata {
+                    status: PrefillFieldStatus::Error,
+                    source: Some(model_source.clone()),
+                    collected_at: Some(chrono::Utc::now().to_rfc3339()),
+                    message: Some(error.clone()),
+                });
+        }
     }
 }
 

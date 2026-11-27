@@ -163,6 +163,22 @@ pub async fn fetch_file(model_id: &str, filename: &str) -> anyhow::Result<PathBu
     Ok(path)
 }
 
+/// Fetch a file from a specific model revision using the same cache and
+/// authentication settings as [`fetch_file`].
+pub async fn fetch_file_at_revision(
+    model_id: &str,
+    filename: &str,
+    revision: &str,
+) -> anyhow::Result<PathBuf> {
+    let api = build_api()?;
+    let repo = hf_hub::Repo::with_revision(
+        model_id.to_owned(),
+        hf_hub::RepoType::Model,
+        revision.to_owned(),
+    );
+    Ok(api.repo(repo).get(filename).await?)
+}
+
 /// Attempt to download a model from Hugging Face (including weights)
 /// Returns the directory it is in
 /// If ignore_weights is true, model weight files will be skipped
